@@ -26,18 +26,25 @@ const (
 )
 
 const (
+	RuntimeProviderPodman = "podman"
+	RuntimeProviderDocker = "docker"
+)
+
+const (
 	DefaultAgentIdleRetentionMinutes = 0
 	DefaultMaxIdleAgents             = 1
 )
 
 type Config struct {
-	BindAddr      string
-	DataRoot      string
-	Mode          string
-	ExecutionMode              string
-	TrustedLAN                 bool
-	AgentIdleRetentionMinutes  int
-	MaxIdleAgents              int
+	BindAddr                  string
+	DataRoot                  string
+	Mode                      string
+	ExecutionMode             string
+	RuntimeProvider           string
+	AppContainer              bool
+	TrustedLAN                bool
+	AgentIdleRetentionMinutes int
+	MaxIdleAgents             int
 }
 
 func DefaultDataRoot() string {
@@ -94,6 +101,18 @@ func (c Config) Validate() error {
 	if c.ExecutionMode == ExecutionModeLocalPi && runtime.GOOS != "linux" {
 		return fmt.Errorf("execution mode %q is experimental and currently supported only on Linux", c.ExecutionMode)
 	}
+	if c.RuntimeProvider == "" {
+		c.RuntimeProvider = RuntimeProviderPodman
+	}
+	if c.RuntimeProvider != RuntimeProviderPodman && c.RuntimeProvider != RuntimeProviderDocker {
+		return fmt.Errorf("unsupported runtime provider %q", c.RuntimeProvider)
+	}
+	if c.RuntimeProvider == RuntimeProviderDocker {
+		return fmt.Errorf("runtime provider %q is planned but unsupported; use %q", c.RuntimeProvider, RuntimeProviderPodman)
+	}
+	if c.AppContainer && c.ExecutionMode == ExecutionModeLocalPi {
+		return fmt.Errorf("app-container mode currently supports %q only; run experimental %q as a local process", ExecutionModeDryRun, ExecutionModeLocalPi)
+	}
 	if c.AgentIdleRetentionMinutes < 0 {
 		return errors.New("agent idle retention minutes must be non-negative")
 	}
@@ -104,13 +123,21 @@ func (c Config) Validate() error {
 		return errors.New("trusted LAN exposure is disabled until authentication is implemented")
 	}
 	if host, _, err := net.SplitHostPort(c.BindAddr); err == nil {
-		if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		if !isLocalBindHost(host) && !(c.AppContainer && isWildcardBindHost(host)) {
 			return fmt.Errorf("refusing non-localhost bind %q until authentication is implemented", c.BindAddr)
 		}
 	} else if !strings.HasPrefix(c.BindAddr, "127.0.0.1:") {
 		return fmt.Errorf("refusing bind %q until authentication is implemented", c.BindAddr)
 	}
 	return nil
+}
+
+func isLocalBindHost(host string) bool {
+	return host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
+func isWildcardBindHost(host string) bool {
+	return host == "0.0.0.0" || host == "::" || host == ""
 }
 
 func (c Config) AgentPolicy() agents.Policy {

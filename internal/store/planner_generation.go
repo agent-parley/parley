@@ -174,6 +174,45 @@ func (s *Store) PlannerDiagnosticsForGeneration(generationID string) []models.Pl
 	return diagnostics
 }
 
+func (s *Store) PrunePlannerDiagnosticsForSession(sessionID string, keepGenerations int) ([]models.PlannerDiagnostic, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if keepGenerations <= 0 {
+		return nil, nil
+	}
+	generations := make([]models.PlannerGeneration, 0)
+	for _, generation := range s.state.PlannerGenerations {
+		if generation.SessionID == sessionID {
+			generations = append(generations, generation)
+		}
+	}
+	sort.Slice(generations, func(i, j int) bool {
+		if generations[i].CreatedAt.Equal(generations[j].CreatedAt) {
+			return generations[i].ID > generations[j].ID
+		}
+		return generations[i].CreatedAt.After(generations[j].CreatedAt)
+	})
+	keep := map[string]bool{}
+	for i, generation := range generations {
+		if i >= keepGenerations {
+			break
+		}
+		keep[generation.ID] = true
+	}
+	removed := make([]models.PlannerDiagnostic, 0)
+	for id, diagnostic := range s.state.PlannerDiagnostics {
+		if diagnostic.SessionID == sessionID && !keep[diagnostic.GenerationID] {
+			removed = append(removed, diagnostic)
+			delete(s.state.PlannerDiagnostics, id)
+		}
+	}
+	if len(removed) == 0 {
+		return nil, nil
+	}
+	sort.Slice(removed, func(i, j int) bool { return removed[i].CreatedAt.Before(removed[j].CreatedAt) })
+	return removed, s.saveLocked()
+}
+
 func (s *Store) activePlannerGenerationLocked(sessionID string) models.PlannerGeneration {
 	if session, ok := s.state.PlannerSessions[sessionID]; ok && session.ActiveGenerationID != "" {
 		generation := s.state.PlannerGenerations[session.ActiveGenerationID]
@@ -200,6 +239,7 @@ func (s *Store) failInterruptedPlannerGenerationsLocked(now time.Time) {
 		generation.CompletedAt = &now
 		generation.UpdatedAt = now
 		s.state.PlannerGenerations[id] = generation
+		s.appendPlannerGenerationEventLocked(models.PlannerGenerationEvent{ProjectID: generation.ProjectID, SessionID: generation.SessionID, GenerationID: generation.ID, Type: models.PlannerGenerationEventResultFailed, Summary: generation.Summary, Data: map[string]any{"reason": "interrupted"}, CreatedAt: now})
 		if session, ok := s.state.PlannerSessions[generation.SessionID]; ok && session.ActiveGenerationID == generation.ID {
 			session.ActiveGenerationID = ""
 			if session.Status == models.PlannerStatusPlanning {

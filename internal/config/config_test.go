@@ -32,6 +32,17 @@ func TestValidateRejectsNonLocalBindAndTrustedLAN(t *testing.T) {
 	}
 }
 
+func TestValidateAllowsWildcardBindOnlyForDryRunAppContainer(t *testing.T) {
+	cfg := config.Config{BindAddr: "0.0.0.0:7345", DataRoot: t.TempDir(), AppContainer: true, ExecutionMode: config.ExecutionModeDryRun}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected app-container wildcard bind to validate: %v", err)
+	}
+	cfg.ExecutionMode = config.ExecutionModeLocalPi
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "app-container") {
+		t.Fatalf("expected app-container local-pi rejection, got %v", err)
+	}
+}
+
 func TestValidateRejectsDisabledManagerExecutorModes(t *testing.T) {
 	for _, mode := range []string{models.ModeManager, models.ModeExecutor} {
 		cfg := config.Config{BindAddr: "127.0.0.1:7345", DataRoot: t.TempDir(), Mode: mode}
@@ -63,6 +74,21 @@ func TestValidateRejectsUnsupportedExecutionMode(t *testing.T) {
 	cfg := config.Config{BindAddr: "127.0.0.1:7345", DataRoot: t.TempDir(), ExecutionMode: "remote"}
 	if err := cfg.Validate(); err == nil {
 		t.Fatalf("expected unsupported execution mode failure")
+	}
+}
+
+func TestValidateRuntimeProviderVocabulary(t *testing.T) {
+	valid := config.Config{BindAddr: "127.0.0.1:7345", DataRoot: t.TempDir(), RuntimeProvider: config.RuntimeProviderPodman}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("podman provider should validate: %v", err)
+	}
+	docker := config.Config{BindAddr: "127.0.0.1:7345", DataRoot: t.TempDir(), RuntimeProvider: config.RuntimeProviderDocker}
+	if err := docker.Validate(); err == nil || !strings.Contains(err.Error(), "unsupported") || !strings.Contains(err.Error(), config.RuntimeProviderPodman) {
+		t.Fatalf("docker provider should fail with clear deferred message, got %v", err)
+	}
+	missing := config.Config{BindAddr: "127.0.0.1:7345", DataRoot: t.TempDir(), RuntimeProvider: "missing"}
+	if err := missing.Validate(); err == nil || !strings.Contains(err.Error(), "unsupported runtime provider") {
+		t.Fatalf("unknown provider should fail clearly, got %v", err)
 	}
 }
 

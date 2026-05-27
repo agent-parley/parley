@@ -71,6 +71,24 @@ func TestDryRunPlannerProducesApprovalGatedDraft(t *testing.T) {
 	}
 }
 
+func TestDryRunPlannerEmitsProgressEvents(t *testing.T) {
+	var events []string
+	_, err := planner.NewDryRunRunner().Run(context.Background(), planner.Input{
+		Project: models.Project{Name: "Demo"},
+		Session: models.PlannerSession{Prompt: "Add progress"},
+		Progress: func(eventType, summary string, data map[string]any) {
+			events = append(events, eventType)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{models.PlannerGenerationEventPlannerStarted, models.PlannerGenerationEventPlannerFinished, models.PlannerGenerationEventCriticStarted, models.PlannerGenerationEventCriticFinished}
+	if strings.Join(events, ",") != strings.Join(want, ",") {
+		t.Fatalf("unexpected progress events: got %v want %v", events, want)
+	}
+}
+
 func TestLocalPiPreflightRejectsMissingWorktreeManager(t *testing.T) {
 	runner := planner.NewLocalPiRunner(nil, &scriptedRuntime{}, pi.Adapter{})
 	if err := runner.Preflight(context.Background(), planner.Input{Project: models.Project{RepoPath: t.TempDir()}, Session: models.PlannerSession{ID: "pln"}}); err == nil {

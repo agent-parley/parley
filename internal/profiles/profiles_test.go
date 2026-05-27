@@ -36,8 +36,66 @@ func TestLookupTrimsAndLabelsKnownProfiles(t *testing.T) {
 	if !ok {
 		t.Fatalf("known profile not found")
 	}
-	if profile.ID != "pi-high-context" || profile.Label == "" || profile.Role != profiles.RoleWorker || profile.Image == "" {
+	if profile.ID != "pi-high-context" || profile.Label == "" || profile.Role != profiles.RoleWorker || profile.Family != profiles.FamilyPi || profile.Image == "" {
 		t.Fatalf("unexpected profile: %+v", profile)
+	}
+}
+
+func TestPlannedNonPiProfilesAreMetadataOnly(t *testing.T) {
+	cases := []struct {
+		id     string
+		family string
+	}{
+		{"codex-worker", profiles.FamilyCodex},
+		{"codex-reviewer", profiles.FamilyCodex},
+		{"claude-code-worker", profiles.FamilyClaudeCode},
+		{"claude-code-reviewer", profiles.FamilyClaudeCode},
+		{"gemini-worker", profiles.FamilyGemini},
+		{"gemini-reviewer", profiles.FamilyGemini},
+		{"copilot-later-worker", profiles.FamilyCopilotLater},
+	}
+	for _, tc := range cases {
+		profile, ok := profiles.Lookup(tc.id)
+		if !ok {
+			t.Fatalf("planned profile %q not found", tc.id)
+		}
+		if profile.Family != tc.family || profile.ExecutionStatus == profiles.ExecutionStatusActive {
+			t.Fatalf("unexpected planned profile metadata: %+v", profile)
+		}
+		if profile.SelectableProjectDefault || profile.ReviewerOnly || profiles.IsExecutable(tc.id) {
+			t.Fatalf("planned profile must not be selectable/executable: %+v", profile)
+		}
+	}
+}
+
+func TestPlannedIDsExposePlannedProfilesOnly(t *testing.T) {
+	got := profiles.PlannedIDs()
+	wantContains := map[string]bool{"codex-worker": false, "claude-code-worker": false, "gemini-reviewer": false}
+	for _, id := range got {
+		if id == "copilot-later-worker" {
+			t.Fatalf("disabled profile should not be returned by PlannedIDs: %v", got)
+		}
+		if _, ok := wantContains[id]; ok {
+			wantContains[id] = true
+		}
+	}
+	for id, seen := range wantContains {
+		if !seen {
+			t.Fatalf("planned profile %q missing from %v", id, got)
+		}
+	}
+}
+
+func TestMetadataOnlyIDsIncludeDisabledPlaceholders(t *testing.T) {
+	got := profiles.MetadataOnlyIDs()
+	seen := false
+	for _, id := range got {
+		if id == "copilot-later-worker" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatalf("metadata-only IDs should include disabled placeholder: %v", got)
 	}
 }
 

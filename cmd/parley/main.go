@@ -45,6 +45,8 @@ func main() {
 	flag.StringVar(&cfg.DataRoot, "data-root", envDefault("PARLEY_DATA_ROOT", config.DefaultDataRoot()), "Parley data root")
 	flag.StringVar(&cfg.Mode, "mode", envDefault("PARLEY_MODE", config.ModeAllInOne), "run mode: all-in-one only; manager/executor modes are planned but disabled")
 	flag.StringVar(&cfg.ExecutionMode, "execution-mode", envDefault("PARLEY_EXECUTION_MODE", config.ExecutionModeDryRun), "attempt execution mode: dry-run or explicit experimental local-pi")
+	flag.StringVar(&cfg.RuntimeProvider, "runtime-provider", envDefault("PARLEY_RUNTIME_PROVIDER", config.RuntimeProviderPodman), "local container runtime provider: podman now; docker is planned but unsupported")
+	flag.BoolVar(&cfg.AppContainer, "app-container", envBool("PARLEY_APP_CONTAINER"), "serve from an app container; wildcard binds must be constrained by loopback host-port publishing")
 	flag.IntVar(&cfg.AgentIdleRetentionMinutes, "agent-idle-retention-minutes", idleRetentionDefault, "local agent idle retention in minutes; 0 closes agents after each task/step")
 	flag.IntVar(&cfg.MaxIdleAgents, "max-idle-agents", maxIdleDefault, "maximum local idle agent sessions to retain when idle retention is enabled")
 	flag.BoolVar(&cfg.TrustedLAN, "trusted-lan", envBool("PARLEY_TRUSTED_LAN"), "disabled until authentication is implemented; non-localhost binds are refused")
@@ -92,7 +94,7 @@ func main() {
 	defer stop()
 
 	go func() {
-		logger.Info("parley listening", "addr", cfg.BindAddr, "data_root", cfg.DataRoot, "mode", cfg.Mode, "execution_mode", cfg.ExecutionMode)
+		logger.Info("parley listening", "addr", cfg.BindAddr, "data_root", cfg.DataRoot, "mode", cfg.Mode, "execution_mode", cfg.ExecutionMode, "runtime_provider", cfg.RuntimeProvider, "app_container", cfg.AppContainer)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("server failed", "error", err)
 			stop()
@@ -111,14 +113,14 @@ func main() {
 
 func attemptRunnerForConfig(cfg config.Config) executor.Runner {
 	if cfg.ExecutionMode == config.ExecutionModeLocalPi {
-		return executor.NewLocalPiRunner(worktrees.NewLocalManager(cfg.DataRoot), containers.NewPodmanRuntime("podman"), pi.Adapter{})
+		return executor.NewLocalPiRunner(worktrees.NewLocalManager(cfg.DataRoot), containers.NewRuntime(cfg.RuntimeProvider), pi.Adapter{})
 	}
 	return executor.NewDryRunRunner()
 }
 
 func plannerRunnerForConfig(cfg config.Config) plannerexec.Runner {
 	if cfg.ExecutionMode == config.ExecutionModeLocalPi {
-		return plannerexec.NewLocalPiRunner(worktrees.NewLocalManager(cfg.DataRoot), containers.NewPodmanRuntime("podman"), pi.Adapter{})
+		return plannerexec.NewLocalPiRunner(worktrees.NewLocalManager(cfg.DataRoot), containers.NewRuntime(cfg.RuntimeProvider), pi.Adapter{})
 	}
 	return plannerexec.NewDryRunRunner()
 }

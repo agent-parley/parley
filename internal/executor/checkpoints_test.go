@@ -23,3 +23,22 @@ func TestResumeCheckpointSectionIsBoundedMetadata(t *testing.T) {
 		t.Fatalf("resume section should not imply raw logs: %s", section)
 	}
 }
+
+func TestCheckpointBodyRedactsSecretLikeMetadata(t *testing.T) {
+	body := CheckpointBody(AttemptInput{Task: models.Task{Adapter: "pi-standard"}}, "worker", "worker", "pi-standard", "completed", "Authorization: Bearer abcdefghijklmnopqrstuvwxyz", "OPENAI_API_KEY=sk-secretsecretsecretsecret", nil, []string{"token-output.md"})
+	for _, leaked := range []string{"abcdefghijklmnopqrstuvwxyz", "sk-secretsecret", "token-output.md"} {
+		if strings.Contains(body, leaked) {
+			t.Fatalf("checkpoint leaked %q in %s", leaked, body)
+		}
+	}
+	if !strings.Contains(body, "[REDACTED]") {
+		t.Fatalf("checkpoint missing redaction marker: %s", body)
+	}
+}
+
+func TestResumeCheckpointSectionRedactsSecretLikeSummary(t *testing.T) {
+	section := ResumeCheckpointSection([]Checkpoint{{Step: "worker", AttemptNumber: 2, Summary: "Authorization: Bearer abcdefghijklmnopqrstuvwxyz", Path: "checkpoints/worker.json"}})
+	if strings.Contains(section, "abcdefghijklmnopqrstuvwxyz") || !strings.Contains(section, "[REDACTED]") {
+		t.Fatalf("resume section did not redact secret-like summary: %s", section)
+	}
+}

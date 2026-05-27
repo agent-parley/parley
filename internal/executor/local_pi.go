@@ -117,15 +117,19 @@ func (r *LocalPiRunner) RunAttempt(ctx context.Context, input AttemptInput) (Att
 	if err := ValidateInvocation(workerInvocation, localPiValidationRules(scratchDir, worktreePath)); err != nil {
 		return AttemptResult{}, err
 	}
+	input.emitProgress(models.EventAttemptWorkerStarted, "Local Pi worker step started.", map[string]any{"mode": "local-pi", "profile": workerPrepared.Profile, "attempt": input.Attempt.Number})
 	workerResult, err := r.runtime.Run(ctx, workerInvocation)
 	if err != nil {
+		input.emitProgress(models.EventAttemptWorkerFinished, "Local Pi worker runtime failed.", map[string]any{"mode": "local-pi", "profile": workerPrepared.Profile, "attempt": input.Attempt.Number, "status": "failed"})
 		return AttemptResult{}, err
 	}
 	if workerResult.ExitCode != 0 {
+		input.emitProgress(models.EventAttemptWorkerFinished, "Local Pi worker step failed.", map[string]any{"mode": "local-pi", "profile": workerPrepared.Profile, "attempt": input.Attempt.Number, "status": "failed", "exit_code": workerResult.ExitCode})
 		changedFiles, diff := r.captureWorktreeState(ctx, worktreePath)
 		summary := fmt.Sprintf("Local Pi worker failed with exit code %d. Worktree was cleaned up after diagnostics were captured.", workerResult.ExitCode)
 		return localPiAttemptResult(input, workerInput, workerResult, nil, changedFiles, diff, summary), fmt.Errorf("worker exited with code %d", workerResult.ExitCode)
 	}
+	input.emitProgress(models.EventAttemptWorkerFinished, "Local Pi worker step completed.", map[string]any{"mode": "local-pi", "profile": workerPrepared.Profile, "attempt": input.Attempt.Number, "status": "completed", "exit_code": workerResult.ExitCode})
 
 	changedFiles, err := r.worktrees.ChangedFiles(ctx, worktreePath)
 	if err != nil {
@@ -149,14 +153,18 @@ func (r *LocalPiRunner) RunAttempt(ctx context.Context, input AttemptInput) (Att
 	if err := ValidateInvocation(reviewerInvocation, reviewerValidationRules(scratchDir, worktreePath)); err != nil {
 		return AttemptResult{}, err
 	}
+	input.emitProgress(models.EventAttemptReviewerStarted, "Local Pi reviewer step started.", map[string]any{"mode": "local-pi", "profile": reviewerPrepared.Profile, "attempt": input.Attempt.Number})
 	reviewerResult, err := r.runtime.Run(ctx, reviewerInvocation)
 	if err != nil {
+		input.emitProgress(models.EventAttemptReviewerFinished, "Local Pi reviewer runtime failed.", map[string]any{"mode": "local-pi", "profile": reviewerPrepared.Profile, "attempt": input.Attempt.Number, "status": "failed"})
 		return AttemptResult{}, err
 	}
 	if reviewerResult.ExitCode != 0 {
+		input.emitProgress(models.EventAttemptReviewerFinished, "Local Pi reviewer step failed.", map[string]any{"mode": "local-pi", "profile": reviewerPrepared.Profile, "attempt": input.Attempt.Number, "status": "failed", "exit_code": reviewerResult.ExitCode})
 		summary := fmt.Sprintf("Local Pi reviewer failed with exit code %d. Worker exit code: %d. Worktree was cleaned up after diagnostics were captured.", reviewerResult.ExitCode, workerResult.ExitCode)
 		return localPiAttemptResult(input, workerInput, workerResult, &reviewerResult, changedFiles, diff, summary), fmt.Errorf("reviewer exited with code %d", reviewerResult.ExitCode)
 	}
+	input.emitProgress(models.EventAttemptReviewerFinished, "Local Pi reviewer step completed.", map[string]any{"mode": "local-pi", "profile": reviewerPrepared.Profile, "attempt": input.Attempt.Number, "status": "completed", "exit_code": reviewerResult.ExitCode})
 
 	succeeded = true
 	summary := fmt.Sprintf("Local Pi execution completed in a managed worktree. Worker exit code: %d. Reviewer exit code: %d. Worktree was cleaned up after artifacts were captured.", workerResult.ExitCode, reviewerResult.ExitCode)

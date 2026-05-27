@@ -26,6 +26,7 @@ type fakeAttemptRunner struct {
 	started      chan struct{}
 	panicRun     bool
 	runErr       error
+	emitProgress bool
 
 	mu              sync.Mutex
 	preflightInputs []executor.AttemptInput
@@ -51,8 +52,14 @@ func (f *fakeAttemptRunner) RunAttempt(ctx context.Context, input executor.Attem
 	if f.block != nil {
 		<-f.block
 	}
+	if f.emitProgress {
+		input.Progress(models.EventAttemptWorkerStarted, "Fake worker started", map[string]any{"status": "running"})
+	}
 	if f.runErr != nil {
 		return executor.AttemptResult{Summary: "worker failed"}, f.runErr
+	}
+	if f.emitProgress {
+		input.Progress(models.EventAttemptWorkerFinished, "Fake worker finished", map[string]any{"status": "completed"})
 	}
 	return executor.AttemptResult{Summary: "done", Files: []executor.OutputFile{{Name: "worker-output.md", Kind: models.ArtifactKindWorkerOutput, Body: "ok"}}}, nil
 }
@@ -94,7 +101,7 @@ func waitFor(t *testing.T, check func() bool) {
 }
 
 func TestEnqueueRunsTaskThroughWorkflow(t *testing.T) {
-	runner := &fakeAttemptRunner{started: make(chan struct{}, 1)}
+	runner := &fakeAttemptRunner{started: make(chan struct{}, 1), emitProgress: true}
 	st, d := newDispatcherHarness(t, runner, 1)
 	_, run, task := testsupport.ProjectAndTask(t, st)
 
@@ -111,6 +118,9 @@ func TestEnqueueRunsTaskThroughWorkflow(t *testing.T) {
 	}
 	if !testsupport.HasEventSummary(events, "Runner slot released") {
 		t.Fatalf("missing workflow release event: %+v", events)
+	}
+	if !testsupport.HasEventType(events, models.EventAttemptWorkerStarted) || !testsupport.HasEventType(events, models.EventAttemptWorkerFinished) {
+		t.Fatalf("missing runner progress events: %+v", events)
 	}
 }
 
@@ -130,12 +140,20 @@ func TestPreflightUsesPersistedTaskAdapterAndSanitizesFailureEvent(t *testing.T)
 	if runner.lastPreflight().Task.Adapter != "pi-high-context" {
 		t.Fatalf("preflight did not use persisted adapter: %+v", runner.lastPreflight().Task)
 	}
-	events := st.EventsForRun(run.ID)
-	if len(events) != 1 || events[0].Summary != "Attempt preflight failed" || events[0].Data["reason"] != "preflight_failed" {
-		t.Fatalf("unexpected sanitized event: %+v", events)
+	if attempts := st.AttemptsForTask(task.ID); len(attempts) != 0 {
+		t.Fatalf("preflight failure should not queue an attempt: %+v", attempts)
 	}
-	if eventLeaks(events[0], "secret", "/tmp/private") {
-		t.Fatalf("event leaked raw failure details: %+v", events[0])
+	events := st.EventsForRun(run.ID)
+	if !testsupport.HasEventType(events, models.EventAttemptPreflightStarted) || !testsupport.HasEventType(events, models.EventAttemptPreflightFailed) {
+		t.Fatalf("unexpected sanitized preflight events: %+v", events)
+	}
+	for _, event := range events {
+		if event.Type == models.EventAttemptPreflightFailed && event.Data["reason"] != "preflight_failed" {
+			t.Fatalf("unexpected preflight failure event: %+v", event)
+		}
+		if eventLeaks(event, "secret", "/tmp/private") {
+			t.Fatalf("event leaked raw failure details: %+v", event)
+		}
 	}
 }
 
@@ -192,8 +210,8 @@ func TestQueuedBacklogPersistsWhenInProcessQueueIsFull(t *testing.T) {
 		t.Fatalf("third task should remain durably queued, got %+v", gotThird)
 	}
 	events := st.EventsForRun(third.RunID)
-	if len(events) != 1 || events[0].Summary != "Attempt accepted by durable dispatcher" || events[0].Data["durable"] != true {
-		t.Fatalf("unexpected durable accepted event: %+v", events)
+	if !testsupport.HasEventSummary(events, "Attempt accepted by durable dispatcher") || !testsupport.HasEventType(events, models.EventAttemptPreflightStarted) {
+		t.Fatalf("unexpected durable accepted/preflight events: %+v", events)
 	}
 	close(block)
 	waitFor(t, func() bool {

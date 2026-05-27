@@ -18,13 +18,14 @@ func TestBuildHandoffExcludesInternalArtifactsAndManagerDatabaseSidecars(t *test
 	project, run, task := testsupport.ProjectAndTask(t, st)
 	writer := artifacts.NewWriter(st)
 	if _, err := writer.WriteForAttempt(run.ID, task.ID, 1, st.AttemptDir(project.ID, run.ID, task.ID, 1), "summary.md", models.ArtifactKindSummary, "visible"); err != nil { t.Fatal(err) }
+	if _, err := writer.WriteForAttempt(run.ID, task.ID, 1, st.AttemptDir(project.ID, run.ID, task.ID, 1), "leaky-summary.md", models.ArtifactKindSummary, "Authorization: Bearer abcdefghijklmnopqrstuvwxyz"); err != nil { t.Fatal(err) }
 	if _, err := writer.WriteForAttemptWithSensitivity(run.ID, task.ID, 1, st.AttemptDir(project.ID, run.ID, task.ID, 1), "runtime/stdout.txt", models.ArtifactKindWorkerOutput, models.SensitivityInternal, "raw"); err != nil { t.Fatal(err) }
 	if _, err := writer.WriteForAttemptWithSensitivity(run.ID, task.ID, 1, st.AttemptDir(project.ID, run.ID, task.ID, 1), "checkpoints/worker.json", models.ArtifactKindCheckpoint, models.SensitivityInternal, "{}"); err != nil { t.Fatal(err) }
 
 	s := &Server{store: st}
 	handoff := s.buildHandoff(project, run, task, models.LocalExecutorID, "homelab")
 	if len(handoff.Included) != 1 || handoff.Included[0].Name != "summary.md" {
-		t.Fatalf("internal artifacts should be excluded: %+v", handoff.Included)
+		t.Fatalf("internal and secret artifacts should be excluded: %+v", handoff.Included)
 	}
 	wantExclusions := map[string]bool{"parley.db": false, "parley.db-wal": false, "parley.db-shm": false}
 	for _, exclusion := range handoff.Excluded {

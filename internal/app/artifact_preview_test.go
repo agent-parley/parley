@@ -121,3 +121,16 @@ func TestNormalArtifactsForTaskExcludesInternal(t *testing.T) {
 		t.Fatalf("unexpected visible artifacts: %+v", visible)
 	}
 }
+
+func TestNormalArtifactsForTaskExcludesSecretClassifiedArtifacts(t *testing.T) {
+	st := testsupport.OpenStore(t)
+	_, run, task := testsupport.ProjectAndTask(t, st)
+	writer := artifacts.NewWriter(st)
+	if _, err := writer.WriteForAttempt(run.ID, task.ID, 1, st.AttemptDir(task.ProjectID, run.ID, task.ID, 1), "summary.md", models.ArtifactKindSummary, "visible"); err != nil { t.Fatal(err) }
+	if _, err := writer.WriteForAttempt(run.ID, task.ID, 1, st.AttemptDir(task.ProjectID, run.ID, task.ID, 1), "leaky-summary.md", models.ArtifactKindSummary, "Authorization: Bearer abcdefghijklmnopqrstuvwxyz"); err != nil { t.Fatal(err) }
+	s := &Server{store: st}
+	visible := s.normalArtifactsForTask(task.ID)
+	if len(visible) != 1 || artifactName(visible[0].Path) != "summary.md" || visible[0].Sensitivity != models.SensitivityNormal {
+		t.Fatalf("unexpected visible artifacts: %+v", visible)
+	}
+}

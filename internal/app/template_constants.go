@@ -1,6 +1,9 @@
 package app
 
-import "github.com/agent-parley/parley/internal/models"
+import (
+	"github.com/agent-parley/parley/internal/config"
+	"github.com/agent-parley/parley/internal/models"
+)
 
 func templateConstants() map[string]string {
 	return map[string]string{
@@ -24,5 +27,8 @@ func templateConstants() map[string]string {
 		"HandoffStatusRecorded":    models.HandoffStatusRecorded,
 		"SensitivityNormal":        models.SensitivityNormal,
 		"PlannerStatusPlanning":    models.PlannerStatusPlanning,
+		"ExecutionModeLocalPi":     config.ExecutionModeLocalPi,
+		"QueuePolicyManual":        models.QueuePolicyManual,
+		"QueuePolicyAutoWhenReady": models.QueuePolicyAutoWhenReady,
 	}
 }

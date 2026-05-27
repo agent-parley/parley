@@ -49,3 +49,12 @@ func HasEventSummary(events []models.Event, summary string) bool {
 	}
 	return false
 }
+
+func HasEventType(events []models.Event, eventType string) bool {
+	for _, event := range events {
+		if event.Type == eventType {
+			return true
+		}
+	}
+	return false
+}

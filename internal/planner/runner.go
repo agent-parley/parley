@@ -43,6 +43,7 @@ type Input struct {
 	Project  models.Project
 	Session  models.PlannerSession
 	Messages []models.PlannerMessage
+	Progress func(eventType, summary string, data map[string]any)
 }
 
 type Draft struct {
@@ -73,6 +74,13 @@ type Result struct {
 	Diagnostics    []Diagnostic
 }
 
+func (input Input) emitProgress(eventType, summary string, data map[string]any) {
+	if input.Progress == nil {
+		return
+	}
+	input.Progress(eventType, summary, data)
+}
+
 type DryRunRunner struct{}
 
 func NewDryRunRunner() DryRunRunner { return DryRunRunner{} }
@@ -83,6 +91,7 @@ func (DryRunRunner) Run(ctx context.Context, input Input) (Result, error) {
 		return Result{}, ctx.Err()
 	default:
 	}
+	input.emitProgress(models.PlannerGenerationEventPlannerStarted, "Dry-run planner pass started.", map[string]any{"mode": ModeDryRun, "profile": profiles.ProfilePlanner})
 	draft := Draft{
 		Title:      fallback(input.Session.DraftTitle, summarize(input.Session.Prompt)),
 		Objective:  fallback(input.Session.DraftObjective, input.Session.Prompt),
@@ -102,6 +111,9 @@ func (DryRunRunner) Run(ctx context.Context, input Input) (Result, error) {
 	if context := strings.TrimSpace(input.Project.AgentContext); context != "" {
 		draft.Assumptions = append(draft.Assumptions, "Project context was included in the planning prompt.")
 	}
+	input.emitProgress(models.PlannerGenerationEventPlannerFinished, "Dry-run planner pass produced a draft.", map[string]any{"mode": ModeDryRun, "profile": profiles.ProfilePlanner, "status": "completed"})
+	input.emitProgress(models.PlannerGenerationEventCriticStarted, "Dry-run critic pass started.", map[string]any{"mode": ModeDryRun, "profile": profiles.ProfileCritic})
+	input.emitProgress(models.PlannerGenerationEventCriticFinished, "Dry-run critic pass completed.", map[string]any{"mode": ModeDryRun, "profile": profiles.ProfileCritic, "status": "completed"})
 	return Result{
 		Mode:           ModeDryRun,
 		PlannerProfile: profiles.ProfilePlanner,
@@ -214,8 +226,10 @@ func (r *LocalPiRunner) Run(ctx context.Context, input Input) (Result, error) {
 	if err := ValidatePlannerInvocation(plannerInvocation, scratchDir, worktreeDir, profiles.PlannerIDs()); err != nil {
 		return Result{}, err
 	}
+	input.emitProgress(models.PlannerGenerationEventPlannerStarted, "Local Pi planner agent started.", map[string]any{"mode": ModeLocalPi, "profile": plannerPrepared.Profile})
 	plannerResult, err := r.runtime.Run(ctx, plannerInvocation)
 	if err != nil {
+		input.emitProgress(models.PlannerGenerationEventPlannerFinished, "Local Pi planner runtime failed before approval.", map[string]any{"mode": ModeLocalPi, "profile": plannerPrepared.Profile, "status": "failed"})
 		return withDiagnostics(Result{Mode: ModeLocalPi, PlannerProfile: plannerPrepared.Profile, CriticProfile: profiles.ProfileCritic, Summary: "Local Pi planner runtime failed before approval."}, diagnostics), err
 	}
 	plannerOutput := readFileString(plannerResult.StdoutPath)
@@ -224,12 +238,15 @@ func (r *LocalPiRunner) Run(ctx context.Context, input Input) (Result, error) {
 		Diagnostic{Name: "planner-stderr.txt", Kind: models.PlannerDiagnosticKindRuntimeLog, Body: readFileString(plannerResult.StderrPath)},
 	)
 	if plannerResult.ExitCode != 0 {
+		input.emitProgress(models.PlannerGenerationEventPlannerFinished, "Local Pi planner exited before approval.", map[string]any{"mode": ModeLocalPi, "profile": plannerPrepared.Profile, "status": "failed", "exit_code": plannerResult.ExitCode})
 		return withDiagnostics(Result{Mode: ModeLocalPi, PlannerProfile: profiles.ProfilePlanner, CriticProfile: profiles.ProfileCritic, PlannerMessage: fmt.Sprintf("Local Pi planner exited with code %d.", plannerResult.ExitCode), Summary: "Local Pi planner failed before approval."}, diagnostics), fmt.Errorf("planner exited with code %d", plannerResult.ExitCode)
 	}
 	draft, plannerMessage, parseErr := draftFromPlannerOutput(input.Session, plannerOutput)
 	if parseErr != nil {
+		input.emitProgress(models.PlannerGenerationEventPlannerFinished, "Local Pi planner output could not be parsed before approval.", map[string]any{"mode": ModeLocalPi, "profile": plannerPrepared.Profile, "status": "failed", "exit_code": plannerResult.ExitCode})
 		return withDiagnostics(Result{Mode: ModeLocalPi, PlannerProfile: profiles.ProfilePlanner, CriticProfile: profiles.ProfileCritic, PlannerMessage: plannerMessage, Summary: "Local Pi planner produced invalid draft JSON before approval."}, diagnostics), fmt.Errorf("invalid planner JSON: %w", parseErr)
 	}
+	input.emitProgress(models.PlannerGenerationEventPlannerFinished, "Local Pi planner produced a draft.", map[string]any{"mode": ModeLocalPi, "profile": plannerPrepared.Profile, "status": "completed", "exit_code": plannerResult.ExitCode})
 
 	criticInput := criticInputBody(input, draft, plannerOutput)
 	diagnostics = append(diagnostics, Diagnostic{Name: CriticInputFile, Kind: models.PlannerDiagnosticKindInput, Body: criticInput})
@@ -245,8 +262,10 @@ func (r *LocalPiRunner) Run(ctx context.Context, input Input) (Result, error) {
 	if err := ValidatePlannerInvocation(criticInvocation, scratchDir, worktreeDir, profiles.CriticIDs()); err != nil {
 		return Result{}, err
 	}
+	input.emitProgress(models.PlannerGenerationEventCriticStarted, "Local Pi critic agent started.", map[string]any{"mode": ModeLocalPi, "profile": criticPrepared.Profile})
 	criticResult, err := r.runtime.Run(ctx, criticInvocation)
 	if err != nil {
+		input.emitProgress(models.PlannerGenerationEventCriticFinished, "Local Pi critic runtime failed before approval.", map[string]any{"mode": ModeLocalPi, "profile": criticPrepared.Profile, "status": "failed"})
 		return withDiagnostics(Result{Mode: ModeLocalPi, PlannerProfile: plannerPrepared.Profile, CriticProfile: criticPrepared.Profile, Draft: draft, PlannerMessage: plannerMessage, Summary: "Local Pi critic runtime failed before approval."}, diagnostics), err
 	}
 	criticOutput := readFileString(criticResult.StdoutPath)
@@ -255,12 +274,15 @@ func (r *LocalPiRunner) Run(ctx context.Context, input Input) (Result, error) {
 		Diagnostic{Name: "critic-stderr.txt", Kind: models.PlannerDiagnosticKindRuntimeLog, Body: readFileString(criticResult.StderrPath)},
 	)
 	if criticResult.ExitCode != 0 {
+		input.emitProgress(models.PlannerGenerationEventCriticFinished, "Local Pi critic exited before approval.", map[string]any{"mode": ModeLocalPi, "profile": criticPrepared.Profile, "status": "failed", "exit_code": criticResult.ExitCode})
 		return withDiagnostics(Result{Mode: ModeLocalPi, PlannerProfile: profiles.ProfilePlanner, CriticProfile: profiles.ProfileCritic, Draft: draft, PlannerMessage: plannerMessage, CriticMessage: fmt.Sprintf("Local Pi critic exited with code %d.", criticResult.ExitCode), Summary: "Local Pi critic failed before approval."}, diagnostics), fmt.Errorf("critic exited with code %d", criticResult.ExitCode)
 	}
 	criticMessage, addedRisks, parseErr := criticFromOutput(criticOutput)
 	if parseErr != nil {
+		input.emitProgress(models.PlannerGenerationEventCriticFinished, "Local Pi critic output could not be parsed before approval.", map[string]any{"mode": ModeLocalPi, "profile": criticPrepared.Profile, "status": "failed", "exit_code": criticResult.ExitCode})
 		return withDiagnostics(Result{Mode: ModeLocalPi, PlannerProfile: plannerPrepared.Profile, CriticProfile: criticPrepared.Profile, Draft: draft, PlannerMessage: plannerMessage, CriticMessage: criticMessage, Summary: "Local Pi critic produced invalid critique JSON before approval."}, diagnostics), fmt.Errorf("invalid critic JSON: %w", parseErr)
 	}
+	input.emitProgress(models.PlannerGenerationEventCriticFinished, "Local Pi critic reviewed the draft.", map[string]any{"mode": ModeLocalPi, "profile": criticPrepared.Profile, "status": "completed", "exit_code": criticResult.ExitCode})
 	if len(addedRisks) > 0 {
 		draft.Risks = appendUnique(draft.Risks, addedRisks...)
 	}

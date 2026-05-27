@@ -2,12 +2,27 @@ package executor_test
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/agent-parley/parley/internal/executor"
 	"github.com/agent-parley/parley/internal/models"
 )
+
+func TestDryRunEmitsAttemptProgress(t *testing.T) {
+	var events []string
+	_, err := executor.NewDryRunRunner().RunAttempt(context.Background(), executor.AttemptInput{Attempt: models.Attempt{Number: 1}, Progress: func(eventType, summary string, data map[string]any) {
+		events = append(events, eventType)
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{models.EventAttemptWorkerStarted, models.EventAttemptWorkerFinished, models.EventAttemptReviewerStarted, models.EventAttemptReviewerFinished}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("unexpected progress events: got %v want %v", events, want)
+	}
+}
 
 func TestDryRunWritesInternalCheckpointsAndUsesResumeMetadata(t *testing.T) {
 	result, err := executor.NewDryRunRunner().RunAttempt(context.Background(), executor.AttemptInput{

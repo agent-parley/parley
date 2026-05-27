@@ -49,6 +49,23 @@ func TestWriterPreservesInternalSensitivity(t *testing.T) {
 	}
 }
 
+func TestWriterClassifiesSecretLikeNormalArtifactAsSecret(t *testing.T) {
+	st := testsupport.OpenStore(t)
+	_, run, task := testsupport.ProjectAndTask(t, st)
+	writer := artifacts.NewWriter(st)
+	artifact, err := writer.WriteForAttempt(run.ID, task.ID, 1, st.AttemptDir(task.ProjectID, run.ID, task.ID, 1), "summary.md", models.ArtifactKindSummary, "Authorization: Bearer abcdefghijklmnopqrstuvwxyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifact.Sensitivity != models.SensitivitySecret {
+		t.Fatalf("expected secret sensitivity, got %+v", artifact)
+	}
+	stored, ok := st.GetArtifact(artifact.ID)
+	if !ok || stored.Sensitivity != models.SensitivitySecret {
+		t.Fatalf("secret artifact not persisted: %+v ok=%v", stored, ok)
+	}
+}
+
 func TestWriterRejectsAbsoluteArtifactNameAndOutsideDir(t *testing.T) {
 	st := testsupport.OpenStore(t)
 	_, run, task := testsupport.ProjectAndTask(t, st)

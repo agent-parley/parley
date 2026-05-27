@@ -21,9 +21,14 @@ func (DryRunRunner) RunAttempt(ctx context.Context, input AttemptInput) (Attempt
 	if runnerName == "" {
 		runnerName = input.Runner.ID
 	}
+	workerProfile := profileOrDefault(input.Task.Adapter, "pi-standard")
+	input.emitProgress(models.EventAttemptWorkerStarted, "Dry-run worker step started.", map[string]any{"mode": "dry-run", "profile": workerProfile, "attempt": input.Attempt.Number})
 	workerInput := fmt.Sprintf("# Worker input\n\n%s\n\n%sThis dry-run prototype is labeled with simulated runner record %q. It does not launch Pi, Git, worktrees, containers, remote processes, or remote runners yet.\n", input.Task.Objective, ResumeCheckpointSection(input.ResumeCheckpoints), runnerName)
-	workerCheckpoint := CheckpointBody(input, "worker", roleOrDefault(input.Task.Role, "worker"), profileOrDefault(input.Task.Adapter, "pi-standard"), "completed", "Dry-run worker step completed without changing repository files.", "Review placeholder outputs and decide whether to accept or request a fix.", nil, []string{"worker-output.md", "summary.md"})
+	workerCheckpoint := CheckpointBody(input, "worker", roleOrDefault(input.Task.Role, "worker"), workerProfile, "completed", "Dry-run worker step completed without changing repository files.", "Review placeholder outputs and decide whether to accept or request a fix.", nil, []string{"worker-output.md", "summary.md"})
+	input.emitProgress(models.EventAttemptWorkerFinished, "Dry-run worker step completed.", map[string]any{"mode": "dry-run", "profile": workerProfile, "attempt": input.Attempt.Number, "status": "completed"})
+	input.emitProgress(models.EventAttemptReviewerStarted, "Dry-run reviewer step started.", map[string]any{"mode": "dry-run", "profile": "pi-reviewer", "attempt": input.Attempt.Number})
 	reviewerCheckpoint := CheckpointBody(input, "reviewer", "reviewer", "pi-reviewer", "completed", "Dry-run reviewer step completed with no findings.", "Final review can accept the task or request a fix.", nil, []string{"review.md", "findings.json"})
+	input.emitProgress(models.EventAttemptReviewerFinished, "Dry-run reviewer step completed.", map[string]any{"mode": "dry-run", "profile": "pi-reviewer", "attempt": input.Attempt.Number, "status": "completed"})
 	files := []OutputFile{
 		{Name: "worker-input.md", Kind: models.ArtifactKindWorkerInput, Sensitivity: models.SensitivityInternal, Body: workerInput},
 		{Name: "worker-output.md", Kind: models.ArtifactKindWorkerOutput, Body: fmt.Sprintf("# Prototype worker output\n\nDry-run completed locally using simulated runner record %q. Resume checkpoints available: %d. Pi/container/remote runner execution is scaffolded but not enabled in this prototype.\n", runnerName, len(input.ResumeCheckpoints))},
