@@ -53,8 +53,9 @@ func (d *Dispatcher) Enqueue(ctx context.Context, taskID string) error {
 		return err
 	}
 	if runner, ok := d.runner.(executor.PreflightRunner); ok {
+		d.emitEventForTask(taskID, models.EventAttemptPreflightStarted, "Attempt preflight started", map[string]any{"runner": input.Runner.ID})
 		if err := runner.Preflight(ctx, input); err != nil {
-			d.emitForTask(taskID, "Attempt preflight failed", map[string]any{"reason": "preflight_failed"})
+			d.emitEventForTask(taskID, models.EventAttemptPreflightFailed, "Attempt preflight failed", map[string]any{"reason": "preflight_failed"})
 			return err
 		}
 	}
@@ -182,9 +183,13 @@ func (d *Dispatcher) forget(attemptID string) {
 }
 
 func (d *Dispatcher) emitForTask(taskID, summary string, data map[string]any) {
+	d.emitEventForTask(taskID, models.EventTaskStateChanged, summary, data)
+}
+
+func (d *Dispatcher) emitEventForTask(taskID, eventType, summary string, data map[string]any) {
 	task, ok := d.store.GetTask(taskID)
 	if !ok {
 		return
 	}
-	_, _ = d.store.AppendEvent(models.Event{RunID: task.RunID, TaskID: task.ID, Type: models.EventTaskStateChanged, ActorKind: models.ActorKindManager, ActorID: models.ActorKindManager, Summary: summary, Data: data})
+	_, _ = d.store.AppendEvent(models.Event{RunID: task.RunID, TaskID: task.ID, Type: eventType, ActorKind: models.ActorKindManager, ActorID: models.ActorKindManager, Summary: summary, Data: data})
 }

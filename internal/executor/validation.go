@@ -42,6 +42,9 @@ func ValidateInvocation(invocation containers.Invocation, rules InvocationValida
 			return err
 		}
 	}
+	// Concrete invocation env is still governed by profile prefix allowlists.
+	// Repo-sourced secret references are validated separately by secretpolicy
+	// before any future resolver may map env:VAR_NAME references to values.
 	for key := range invocation.Env {
 		if !validEnvKey(key) {
 			return fmt.Errorf("invalid environment key %q", key)

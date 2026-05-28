@@ -38,6 +38,20 @@ const (
 )
 
 const (
+	PlannerGenerationEventStarted          = "planner_generation.started"
+	PlannerGenerationEventPreflightStarted = "planner_generation.preflight_started"
+	PlannerGenerationEventPreflightFailed  = "planner_generation.preflight_failed"
+	PlannerGenerationEventPlannerStarted   = "planner_generation.planner_started"
+	PlannerGenerationEventPlannerFinished  = "planner_generation.planner_finished"
+	PlannerGenerationEventCriticStarted    = "planner_generation.critic_started"
+	PlannerGenerationEventCriticFinished   = "planner_generation.critic_finished"
+	PlannerGenerationEventDiagnosticsSaved = "planner_generation.diagnostics_saved"
+	PlannerGenerationEventResultApplied    = "planner_generation.result_applied"
+	PlannerGenerationEventResultDiscarded  = "planner_generation.result_discarded"
+	PlannerGenerationEventResultFailed     = "planner_generation.result_failed"
+)
+
+const (
 	RunStatusAwaitingApproval = "AWAITING_APPROVAL"
 	RunStatusQueued           = "QUEUED"
 	RunStatusRunning          = "RUNNING"
@@ -89,21 +103,27 @@ const (
 )
 
 const (
-	EventPlannerPromptReceived = "planner.prompt_received"
-	EventPlannerDraftCreated   = "planner.draft_created"
-	EventPlannerSessionStarted = "planner.session_started"
-	EventTaskPlanCreated       = "task_plan.created"
-	EventTaskContractCreated   = "task_contract.created"
-	EventLeaseGranted          = "lease.granted"
-	EventLeaseReleased         = "lease.released"
-	EventLeaseExpired          = "lease.expired"
-	EventTaskStarted           = "task.started"
-	EventArtifactCreated       = "artifact.created"
-	EventReviewCompleted       = "review.completed"
-	EventTaskCompleted         = "task.completed"
-	EventTaskStateChanged      = "task.state_changed"
-	EventHandoffApproved       = "handoff.approved"
-	EventHandoffCompleted      = "handoff.completed"
+	EventPlannerPromptReceived   = "planner.prompt_received"
+	EventPlannerDraftCreated     = "planner.draft_created"
+	EventPlannerSessionStarted   = "planner.session_started"
+	EventTaskPlanCreated         = "task_plan.created"
+	EventTaskContractCreated     = "task_contract.created"
+	EventLeaseGranted            = "lease.granted"
+	EventLeaseReleased           = "lease.released"
+	EventLeaseExpired            = "lease.expired"
+	EventTaskStarted             = "task.started"
+	EventAttemptPreflightStarted = "attempt.preflight_started"
+	EventAttemptPreflightFailed  = "attempt.preflight_failed"
+	EventAttemptWorkerStarted    = "attempt.worker_started"
+	EventAttemptWorkerFinished   = "attempt.worker_finished"
+	EventAttemptReviewerStarted  = "attempt.reviewer_started"
+	EventAttemptReviewerFinished = "attempt.reviewer_finished"
+	EventArtifactCreated         = "artifact.created"
+	EventReviewCompleted         = "review.completed"
+	EventTaskCompleted           = "task.completed"
+	EventTaskStateChanged        = "task.state_changed"
+	EventHandoffApproved         = "handoff.approved"
+	EventHandoffCompleted        = "handoff.completed"
 )
 
 const (
@@ -131,4 +151,9 @@ const (
 	SensitivityNormal = "normal"
 	SensitivityInternal = "internal"
 	SensitivitySecret = "secret"
+)
+
+const (
+	QueuePolicyManual        = "manual"
+	QueuePolicyAutoWhenReady = "auto_when_ready"
 )

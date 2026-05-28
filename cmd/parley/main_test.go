@@ -5,6 +5,13 @@ import (
 	"testing"
 )
 
+func TestEnvDefaultReadsRuntimeProviderEnv(t *testing.T) {
+	t.Setenv("PARLEY_RUNTIME_PROVIDER", "podman")
+	if got := envDefault("PARLEY_RUNTIME_PROVIDER", "fallback"); got != "podman" {
+		t.Fatalf("envDefault runtime provider=%q, want podman", got)
+	}
+}
+
 func TestEnvIntStrictUsesFallbackForEmptyEnv(t *testing.T) {
 	t.Setenv("PARLEY_TEST_INT", "")
 	got, err := envIntStrict("PARLEY_TEST_INT", 7)

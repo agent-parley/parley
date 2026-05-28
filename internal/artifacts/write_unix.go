@@ -13,12 +13,11 @@ import (
 	"time"
 
 	"github.com/agent-parley/parley/internal/models"
+	"github.com/agent-parley/parley/internal/secretpolicy"
 )
 
 func (w *Writer) WriteForAttemptWithSensitivity(runID, taskID string, attemptNumber int, dir, name, kind, sensitivity, body string) (models.Artifact, error) {
-	if sensitivity == "" {
-		sensitivity = models.SensitivityNormal
-	}
+	sensitivity = secretpolicy.ClassifyArtifact(name, kind, sensitivity, body)
 	root, err := filepath.EvalSymlinks(w.store.DataRoot())
 	if err != nil {
 		return models.Artifact{}, err

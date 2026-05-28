@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/agent-parley/parley/internal/models"
+	"github.com/agent-parley/parley/internal/secretpolicy"
 	parleysync "github.com/agent-parley/parley/internal/sync"
 )
 
@@ -166,7 +167,7 @@ func (s *Server) normalArtifactsForTask(taskID string) []models.Artifact {
 	artifacts := s.store.ArtifactsForTask(taskID)
 	visible := make([]models.Artifact, 0, len(artifacts))
 	for _, artifact := range artifacts {
-		if artifact.Sensitivity == "" || artifact.Sensitivity == models.SensitivityNormal {
+		if secretpolicy.IsPublicPreviewSensitivity(artifact.Sensitivity) {
 			visible = append(visible, artifact)
 		}
 	}
@@ -185,7 +186,7 @@ func (s *Server) buildHandoff(project models.Project, run models.Run, task model
 		if err != nil || strings.HasPrefix(rel, "..") {
 			rel = filepath.Base(artifact.Path)
 		}
-		if artifact.Sensitivity != "" && artifact.Sensitivity != models.SensitivityNormal {
+		if !secretpolicy.IsHandoffSafeSensitivity(artifact.Sensitivity) {
 			continue
 		}
 		items = append(items, models.HandoffItem{Kind: artifact.Kind, Name: artifactName(artifact.Path), RelativePath: rel, Sensitivity: artifact.Sensitivity, SHA256: artifact.SHA256})

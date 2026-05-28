@@ -18,6 +18,8 @@ type PreflightRunner interface {
 	Preflight(ctx context.Context, input AttemptInput) error
 }
 
+type ProgressFunc func(eventType, summary string, data map[string]any)
+
 type AttemptInput struct {
 	Project  models.Project
 	Run      models.Run
@@ -27,6 +29,13 @@ type AttemptInput struct {
 	Lease             models.Lease
 	ArtifactDir       string
 	ResumeCheckpoints []Checkpoint
+	Progress          ProgressFunc
+}
+
+func (input AttemptInput) emitProgress(eventType, summary string, data map[string]any) {
+	if input.Progress != nil {
+		input.Progress(eventType, summary, data)
+	}
 }
 
 // Checkpoint is compact internal resume context from a prior task step.

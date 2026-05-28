@@ -8,7 +8,7 @@
 
 Parley coordinates AI coding agents that **discuss, divide, review, and deliver** software work through an inspectable workflow.
 
-The planned v1 app is a **Go manager/control-plane backend** with a responsive browser UI. It is local-first and currently runs as a local server process; app-container serving is planned for a later execution-foundation phase. The design is intended to orchestrate agent runners on the machine/container host where each runner is running.
+The planned v1 app is a **Go manager/control-plane backend** with a responsive browser UI. It is local-first and currently runs as a local server process, with a supported dry-run app-container serving path for the web/control plane. The design is intended to orchestrate agent runners on the machine/container host where each runner is running.
 
 Instead of asking one model to do everything in one pass, Parley gives a task to a small council of agents. They deliberate on the approach, split the work, run bounded tasks, review each other’s output, and produce artifacts for final approval.
 
@@ -22,7 +22,7 @@ The current prototype is local-only and dry-run by default, with an explicit exp
 - **Frontend:** responsive web UI, not a TUI-first product and not a heavy SPA in the first slice.
 - **Backend/control plane:** Go.
 - **Execution:** all-in-one local manager/runner first; guarded local worktree/container execution is experimental and opt-in while real remote runners remain later.
-- **Deployment:** local server process first; app-container mode with explicit data/repo mounts is future execution-foundation work.
+- **Deployment:** local server process first; app-container serving is supported for dry-run web/control-plane use with explicit data/repo mounts.
 - **First agent profile:** Pi, with integration boundaries kept generic for future agents.
 - **Manager/runner:** `local` all-in-one first; architecture should support one manager registering multiple authenticated runners later, such as a homelab box and a powerful workstation.
 - **Repo strategy:** one monorepo first, with clear manager/runner package boundaries and optional separate binaries/modes later.
@@ -161,7 +161,31 @@ PARLEY_DATA_ROOT=/path/to/parley-data \
   go run ./cmd/parley
 ```
 
-Dry-run is the default execution mode. The guarded local Pi execution path is experimental, currently Linux-only, requires Podman plus a configured Pi-compatible runner image to already be available locally, and must be selected explicitly. Its dispatcher stays bounded in-process; queued attempts are persisted with a hardcoded prototype backlog cap of 100 and recover on startup, while interrupted running attempts are failed and retryable. Capacity-related pre-start failures stay queued/deferred; unrecoverable setup failures fail the queued attempt with sanitized UI events. Repeated restarts can repeat recovery activity events; this is safe pre-alpha observability noise, not repeated execution.
+### App-container serving
+
+Parley also ships an OCI app-container serving path for local dry-run use. This serves the web/control plane only; it is not a public Pi runner image, remote runner mode, or container-execution backend.
+
+```bash
+podman build -t parley-app:local -f Containerfile .
+```
+
+```bash
+podman volume create parley-data
+podman run --rm \
+  -p 127.0.0.1:7345:7345 \
+  -v parley-data:/data:Z \
+  -v "$PWD:/workspace/repo:ro,Z" \
+  parley-app:local
+```
+
+Then open `http://127.0.0.1:7345` and register mounted repos by their in-container paths, such as `/workspace/repo`. The container defaults to `PARLEY_APP_CONTAINER=true`, `PARLEY_EXECUTION_MODE=dry-run`, and `--bind 0.0.0.0:7345` so container-internal serving works with port publishing.
+
+> [!warning]
+> App-container mode relies on the container runtime's host-port binding for local-only access. Publish the host port to loopback exactly as shown (`-p 127.0.0.1:7345:7345`). Do **not** use broad publishing such as `-p 7345:7345` or `-p 0.0.0.0:7345:7345`; that can expose this unauthenticated prototype beyond localhost. Parley's Host-header allowlist is defense-in-depth, not a network access-control boundary.
+
+Authenticated LAN exposure remains disabled. The server still rejects non-local Host headers in app-container mode, so access by container DNS name, service name, or raw LAN host/IP is intentionally unsupported. `/healthz` returns `ok` for external local health checks; the distroless image does not include curl/wget or an in-container `HEALTHCHECK`.
+
+Dry-run is the default execution mode. The guarded local Pi execution path is experimental, currently Linux-only, requires Podman plus a configured Pi-compatible runner image to already be available locally, and must be selected explicitly. `PARLEY_RUNTIME_PROVIDER` / `--runtime-provider` introduces runtime-provider vocabulary: `podman` is the only active provider today, while `docker` is accepted as a planned name but fails clearly as unsupported instead of silently falling back. Its dispatcher stays bounded in-process; queued attempts are persisted with a hardcoded prototype backlog cap of 100 and recover on startup, while interrupted running attempts are failed and retryable. Capacity-related pre-start failures stay queued/deferred; unrecoverable setup failures fail the queued attempt with sanitized UI events. Repeated restarts can repeat recovery activity events; this is safe pre-alpha observability noise, not repeated execution.
 
 The built-in profile image name is a placeholder until a public Pi runner image is published. For local smoke validation, point `PARLEY_PI_IMAGE` at a local image that provides a `pi --headless --input <file>` command.
 
@@ -173,6 +197,28 @@ PARLEY_EXECUTION_MODE=local-pi \
 ```
 
 The prototype stores state in SQLite at `<data-root>/parley.db`. If an older `<data-root>/state.json` exists and every persisted SQLite table is empty, Parley imports it once, applies normal startup repairs/defaults, and leaves the JSON file in place as a backup.
+
+### Repo-local non-secret settings
+
+A repository may include `.parley/settings.toml` to suggest non-secret project defaults at registration time. These settings are advisory defaults only; existing project settings keep precedence after registration and approval gates still control execution. `queue_policy = "manual"` is the default; `queue_policy = "auto_when_ready"` only queues durable local attempts after explicit task approval or fix-ready gates, using the same local dispatcher as the manual button.
+
+```toml
+runtime_provider = "podman"
+default_agent_profile = "pi-standard"
+workflow_template = "standard"
+queue_policy = "manual"
+review_profiles = ["pi-reviewer"]
+```
+
+Supported keys are intentionally narrow: `runtime_provider`, `container_backend`, `default_agent_profile`, `workflow_template`, `queue_policy`, and `review_profiles`. Secrets, auth provider config, secret-file references, socket paths, path overrides, container/network/privileged flags, remote runner settings, sync/handoff, and memory export settings are rejected. `docker` remains planned but unsupported and fails clearly if selected. Queue policy does not add cron, GitHub polling, remote scheduling, Docker, auth, sync/handoff, or approval bypass.
+
+### Secret/auth safety contract
+
+Parley has a central safety contract for future repo-sourced credentials, but this prototype does not load or execute auth providers yet. Secret references are names only: `env:VAR_NAME` is the only supported source shape, and the referenced variable must match the selected profile's env-prefix allowlist, look credential-intended (`TOKEN`, `API_KEY`, `SECRET`, `CREDENTIAL`, `PASSWORD`, etc.), and not be a Parley process/config variable such as `PARLEY_BIND` or `PARLEY_DATA_ROOT`. Inline tokens, repo-local secret files, broad env inheritance, keychain references, socket paths, and container/network overrides are rejected or deferred. Secret-like diagnostics, checkpoints, and normal artifact bodies are redacted or classified away from normal preview/handoff paths; approval gates and dry-run/local-pi boundaries are unchanged.
+
+### Metadata-only agent registry
+
+The profile registry can now name future agent families without enabling them. Pi remains the only active execution family. Codex, Claude Code, Gemini, and Copilot entries are visible as planned/disabled metadata for roadmap and UI language only; they are not selectable project defaults, are not included in local-pi invocation allowlists, and have no images, adapters, auth resolution, remote execution, or queue behavior.
 
 ## Validation
 
@@ -200,6 +246,7 @@ Example direction:
 ```toml
 [server]
 bind = "127.0.0.1:7345"
+# app_container = false # explicit container serving mode; dry-run only
 # trusted_lan = false  # disabled until authentication is implemented
 
 [data]
@@ -216,6 +263,8 @@ max_idle_agents = 1       # guardrail for future idle-agent reuse
 
 [execution]
 mode = "dry-run" # explicit local-pi is experimental and opt-in
+runtime_provider = "podman" # docker is planned but unsupported
+queue_policy = "manual" # auto_when_ready still requires explicit approval gates
 worktree_isolation = true
 approval_required = true
 ```
@@ -309,7 +358,7 @@ Next:
 - [x] Add runner slot placeholder for task attempts
 - [x] Add sync manifest/ignore-policy placeholders
 - [x] Establish responsive web shell
-- [ ] Establish supported app-container serving path
+- [x] Establish supported dry-run app-container serving path
 
 ### Phase 1 — Planning and deliberation
 
@@ -331,6 +380,7 @@ Next:
 - [x] SQLite persistence foundation
 - [x] Real worktree manager
 - [x] Podman runner scaffold
+- [x] Runtime provider vocabulary and backend seam
 - [x] Prepared invocation validation
 - [x] Behavior-focused pre-alpha test baseline
 - [x] Durable queued-attempt recovery

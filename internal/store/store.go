@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/agent-parley/parley/internal/models"
+	"github.com/agent-parley/parley/internal/reposettings"
 )
 
 const (
@@ -37,9 +38,10 @@ type state struct {
 	WorkflowTemplates map[string]models.WorkflowTemplate `json:"workflow_templates"`
 	PlannerSessions    map[string]models.PlannerSession    `json:"planner_sessions"`
 	PlannerMessages    map[string]models.PlannerMessage    `json:"planner_messages"`
-	PlannerGenerations map[string]models.PlannerGeneration `json:"planner_generations"`
-	PlannerDiagnostics map[string]models.PlannerDiagnostic `json:"planner_diagnostics"`
-	Runs               map[string]models.Run              `json:"runs"`
+	PlannerGenerations      map[string]models.PlannerGeneration      `json:"planner_generations"`
+	PlannerDiagnostics      map[string]models.PlannerDiagnostic      `json:"planner_diagnostics"`
+	PlannerGenerationEvents map[string]models.PlannerGenerationEvent `json:"planner_generation_events"`
+	Runs                    map[string]models.Run                    `json:"runs"`
 	Tasks             map[string]models.Task             `json:"tasks"`
 	Attempts          map[string]models.Attempt          `json:"attempts"`
 	Handoffs          map[string]models.Handoff          `json:"handoffs"`
@@ -55,9 +57,10 @@ func newState() state {
 		WorkflowTemplates: map[string]models.WorkflowTemplate{},
 		PlannerSessions:    map[string]models.PlannerSession{},
 		PlannerMessages:    map[string]models.PlannerMessage{},
-		PlannerGenerations: map[string]models.PlannerGeneration{},
-		PlannerDiagnostics: map[string]models.PlannerDiagnostic{},
-		Runs:               map[string]models.Run{},
+		PlannerGenerations:      map[string]models.PlannerGeneration{},
+		PlannerDiagnostics:      map[string]models.PlannerDiagnostic{},
+		PlannerGenerationEvents: map[string]models.PlannerGenerationEvent{},
+		Runs:                    map[string]models.Run{},
 		Tasks:             map[string]models.Task{},
 		Attempts:          map[string]models.Attempt{},
 		Handoffs:          map[string]models.Handoff{},
@@ -87,6 +90,9 @@ func (s *Store) ensureStateMapsLocked() {
 	}
 	if s.state.PlannerDiagnostics == nil {
 		s.state.PlannerDiagnostics = map[string]models.PlannerDiagnostic{}
+	}
+	if s.state.PlannerGenerationEvents == nil {
+		s.state.PlannerGenerationEvents = map[string]models.PlannerGenerationEvent{}
 	}
 	if s.state.Runs == nil {
 		s.state.Runs = map[string]models.Run{}
@@ -238,6 +244,7 @@ func (s *Store) CreateProject(name, description, repoPath, defaultBranch string)
 		DefaultExecutorID:   models.LocalExecutorID,
 		AgentContext:        strings.TrimSpace(description),
 		DefaultAgentProfile: "pi-standard",
+		QueuePolicy:         models.QueuePolicyManual,
 		ReviewLoopCount:     1,
 		RetryCount:          1,
 		CreatedAt:           now,
@@ -251,6 +258,13 @@ func (s *Store) CreateProject(name, description, repoPath, defaultBranch string)
 	}
 	templates := defaultWorkflowTemplates(project.ID, now)
 	project.DefaultWorkflowTemplateID = templates[0].ID
+	if settings, ok, err := reposettings.Load(canonicalRepoPath); err != nil {
+		return models.Project{}, err
+	} else if ok {
+		if err := applyRepoSettingsDefaults(&project, templates, settings); err != nil {
+			return models.Project{}, &reposettings.Error{Path: settings.Path, Err: err}
+		}
+	}
 	s.state.Projects[project.ID] = project
 	for _, template := range templates {
 		s.state.WorkflowTemplates[template.ID] = template
@@ -266,6 +280,7 @@ func (s *Store) UpdateProjectSettings(project models.Project) error {
 		return fmt.Errorf("project not found")
 	}
 	project.CreatedAt = current.CreatedAt
+	project.QueuePolicy = normalizeQueuePolicy(project.QueuePolicy)
 	project.UpdatedAt = time.Now().UTC()
 	s.state.Projects[project.ID] = project
 	return s.saveLocked()
@@ -904,21 +919,21 @@ func (s *Store) ensurePrototypeExecutorsLocked() {
 	defaults := []models.Executor{
 		{
 			ID: models.LocalExecutorID, Name: "Local all-in-one runner", Endpoint: "in-process", Status: models.ExecutorStatusOnline, Kind: models.ExecutorKindLocal,
-			Description: "Runs manager and local runner together for the prototype.", ResourceClass: "local-machine", ContainerRuntime: "Podman preferred", RepoAvailability: "Project folders mounted locally", MaxSlots: 1,
-			Capabilities: []string{"Manager + runner", "Podman preferred", "Pi agent planned", "Dry-run prototype"}, AgentProfiles: []string{"Pi standard", "Pi high-context", "Read-only scout"},
-			Notes: "Only this runner performs actual prototype actions today.", LastSeenAt: now,
+			Description: "Runs manager and local runner together for the prototype.", ResourceClass: "local-machine", ContainerRuntime: "Podman active; Docker planned but unsupported", RepoAvailability: "Project folders mounted locally", MaxSlots: 1,
+			Capabilities: []string{"Manager + runner", "Podman active", "Runtime provider seam", "Metadata-only agent registry", "Dry-run prototype"}, AgentProfiles: []string{"pi-standard", "pi-high-context", "pi-readonly-scout", "codex-worker", "claude-code-worker", "gemini-worker"},
+			Notes: "Only Pi profiles perform prototype actions today. Codex, Claude Code, Gemini, and Copilot entries are planned registry metadata only; non-Pi adapters are disabled. Docker is vocabulary only until a runtime implementation is added.", LastSeenAt: now,
 		},
 		{
 			ID: "homelab", Name: "Homelab runner", Endpoint: "https://homelab.runner.local", Status: models.ExecutorStatusOnline, Kind: models.ExecutorKindRemote,
 			Description: "Mock always-on runner for larger background jobs and long reviews.", ResourceClass: "medium", ContainerRuntime: "Podman planned", RepoAvailability: "Repo must be cloned by runner", MaxSlots: 2,
-			Capabilities: []string{"Remote runner preview", "Worktrees planned", "Safe handoff preview"}, AgentProfiles: []string{"Pi standard", "Pi reviewer"},
-			Notes: "Prototype card only; no network calls are made.", LastSeenAt: now.Add(-2 * time.Minute),
+			Capabilities: []string{"Remote runner preview", "Worktrees planned", "Safe handoff preview", "Non-Pi metadata only"}, AgentProfiles: []string{"pi-standard", "pi-reviewer", "codex-reviewer", "claude-code-reviewer"},
+			Notes: "Prototype card only; no network calls are made and non-Pi adapters are disabled.", LastSeenAt: now.Add(-2 * time.Minute),
 		},
 		{
 			ID: "workstation", Name: "Workstation runner", Endpoint: "ssh://workstation.example", Status: models.ExecutorStatusOffline, Kind: models.ExecutorKindRemote,
-			Description: "Mock high-power workstation for future parallel workers.", ResourceClass: "high", ContainerRuntime: "Docker fallback planned", RepoAvailability: "Repo availability unknown", MaxSlots: 4,
-			Capabilities: []string{"Remote runner preview", "Parallel workers planned", "Optional GPU support"}, AgentProfiles: []string{"Pi high-context", "Critic", "Fresh reviewer"},
-			Notes: "Shown to make offline/remote state tangible.", LastSeenAt: now.Add(-6 * time.Hour),
+			Description: "Mock high-power workstation for future parallel workers.", ResourceClass: "high", ContainerRuntime: "Docker planned but unsupported", RepoAvailability: "Repo availability unknown", MaxSlots: 4,
+			Capabilities: []string{"Remote runner preview", "Parallel workers planned", "Optional GPU support", "Metadata-only agent registry"}, AgentProfiles: []string{"pi-high-context", "pi-critic", "pi-reviewer", "gemini-worker", "copilot-later-worker"},
+			Notes: "Shown to make offline/remote state tangible; Docker and non-Pi execution are not executable yet.", LastSeenAt: now.Add(-6 * time.Hour),
 		},
 	}
 	for _, executor := range defaults {
@@ -1007,6 +1022,10 @@ func (s *Store) ensureProjectDefaultsLocked() {
 			project.AgentContext = project.Description
 			changed = true
 		}
+		if normalized := normalizeQueuePolicy(project.QueuePolicy); normalized != project.QueuePolicy {
+			project.QueuePolicy = normalized
+			changed = true
+		}
 		templates := s.workflowTemplatesForProjectLocked(project.ID)
 		if len(templates) == 0 {
 			for _, template := range defaultWorkflowTemplates(project.ID, now) {
@@ -1036,6 +1055,69 @@ func (s *Store) workflowTemplatesForProjectLocked(projectID string) []models.Wor
 	}
 	sort.Slice(templates, func(i, j int) bool { return templates[i].CreatedAt.Before(templates[j].CreatedAt) })
 	return templates
+}
+
+func applyRepoSettingsDefaults(project *models.Project, templates []models.WorkflowTemplate, settings reposettings.Settings) error {
+	snapshot := reposettings.Snapshot(settings)
+	if settings.DefaultAgentProfile != "" {
+		project.DefaultAgentProfile = settings.DefaultAgentProfile
+		snapshot.Applied = append(snapshot.Applied, "default_agent_profile")
+	}
+	if settings.WorkflowTemplate != "" {
+		template, ok := matchWorkflowTemplate(templates, settings.WorkflowTemplate)
+		if !ok {
+			return fmt.Errorf("workflow_template %q does not match a known workflow template", settings.WorkflowTemplate)
+		}
+		project.DefaultWorkflowTemplateID = template.ID
+		snapshot.Applied = append(snapshot.Applied, "workflow_template")
+	}
+	if settings.QueuePolicy != "" {
+		project.QueuePolicy = normalizeQueuePolicy(settings.QueuePolicy)
+		snapshot.Applied = append(snapshot.Applied, "queue_policy")
+	}
+	project.QueuePolicy = normalizeQueuePolicy(project.QueuePolicy)
+	if project.QueuePolicy == "" {
+		project.QueuePolicy = models.QueuePolicyManual
+	}
+	if project.QueuePolicy != settings.QueuePolicy && settings.QueuePolicy != "" {
+		return fmt.Errorf("queue_policy %q is unsupported", settings.QueuePolicy)
+	}
+	project.RepoSettings = snapshot
+	return nil
+}
+
+func matchWorkflowTemplate(templates []models.WorkflowTemplate, value string) (models.WorkflowTemplate, bool) {
+	value = normalizeWorkflowTemplateKey(value)
+	for _, template := range templates {
+		candidates := []string{
+			template.ID,
+			template.Name,
+			strings.TrimPrefix(template.ID, template.ProjectID+"_"),
+		}
+		for _, candidate := range candidates {
+			if normalizeWorkflowTemplateKey(candidate) == value {
+				return template, true
+			}
+		}
+	}
+	return models.WorkflowTemplate{}, false
+}
+
+func normalizeWorkflowTemplateKey(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, "-", "")
+	value = strings.ReplaceAll(value, "_", "")
+	value = strings.ReplaceAll(value, " ", "")
+	return value
+}
+
+func normalizeQueuePolicy(policy string) string {
+	switch strings.TrimSpace(policy) {
+	case models.QueuePolicyAutoWhenReady:
+		return models.QueuePolicyAutoWhenReady
+	default:
+		return models.QueuePolicyManual
+	}
 }
 
 func defaultWorkflowTemplates(projectID string, now time.Time) []models.WorkflowTemplate {

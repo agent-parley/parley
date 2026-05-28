@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/agent-parley/parley/internal/secretpolicy"
 )
 
 type checkpointDocument struct {
@@ -36,8 +38,8 @@ func CheckpointBody(input AttemptInput, step, role, profile, status, summary, ne
 		SchemaVersion: 1,
 		ProjectID: input.Project.ID, RunID: input.Run.ID, TaskID: input.Task.ID, AttemptID: input.Attempt.ID, AttemptNumber: input.Attempt.Number,
 		Step: step, Role: role, Profile: profile,
-		Summary: strings.TrimSpace(summary), Status: strings.TrimSpace(status), ExitCode: exitCode, Artifacts: artifactNames,
-		NextAction: strings.TrimSpace(nextAction), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Summary: secretpolicy.Redact(strings.TrimSpace(summary)), Status: strings.TrimSpace(status), ExitCode: exitCode, Artifacts: redactStrings(artifactNames),
+		NextAction: secretpolicy.Redact(strings.TrimSpace(nextAction)), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -56,7 +58,7 @@ func ResumeCheckpointSection(checkpoints []Checkpoint) string {
 		b.WriteString(fmt.Sprintf("- Attempt %d %s checkpoint", checkpoint.AttemptNumber, checkpoint.Step))
 		if checkpoint.Summary != "" {
 			b.WriteString(": ")
-			b.WriteString(checkpoint.Summary)
+			b.WriteString(secretpolicy.Redact(checkpoint.Summary))
 		}
 		if checkpoint.Path != "" {
 			b.WriteString(fmt.Sprintf(" (`%s`)", checkpoint.Path))
@@ -65,6 +67,22 @@ func ResumeCheckpointSection(checkpoints []Checkpoint) string {
 	}
 	b.WriteString("\n")
 	return b.String()
+}
+
+func redactStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	redacted := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if secretpolicy.ContainsSecretLike(value) {
+			redacted = append(redacted, "[REDACTED]")
+			continue
+		}
+		redacted = append(redacted, secretpolicy.Redact(value))
+	}
+	return redacted
 }
 
 func safeStep(step string) string {

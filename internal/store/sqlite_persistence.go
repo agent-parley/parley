@@ -33,6 +33,7 @@ func (s *Store) loadSQLiteState() error {
 	if err := loadMap(s.db, "planner_messages", loaded.PlannerMessages); err != nil { return err }
 	if err := loadMap(s.db, "planner_generations", loaded.PlannerGenerations); err != nil { return err }
 	if err := loadMap(s.db, "planner_diagnostics", loaded.PlannerDiagnostics); err != nil { return err }
+	if err := loadMap(s.db, "planner_generation_events", loaded.PlannerGenerationEvents); err != nil { return err }
 	if err := loadMap(s.db, "runs", loaded.Runs); err != nil { return err }
 	if err := loadMap(s.db, "tasks", loaded.Tasks); err != nil { return err }
 	if err := loadMap(s.db, "attempts", loaded.Attempts); err != nil { return err }
@@ -62,7 +63,7 @@ func (s *Store) sqliteIsEmpty() (bool, error) {
 }
 
 func persistedTables() []string {
-	return []string{"executors", "projects", "workflow_templates", "planner_sessions", "planner_messages", "planner_generations", "planner_diagnostics", "runs", "tasks", "attempts", "handoffs", "leases", "artifacts", "events"}
+	return []string{"executors", "projects", "workflow_templates", "planner_sessions", "planner_messages", "planner_generations", "planner_diagnostics", "planner_generation_events", "runs", "tasks", "attempts", "handoffs", "leases", "artifacts", "events"}
 }
 
 func loadMap[T any](db *sql.DB, table string, dst map[string]T) error {
@@ -122,7 +123,7 @@ func (s *Store) saveSQLiteSnapshotLocked() error {
 }
 
 func saveSnapshotTx(tx *sql.Tx, st state) error {
-	for _, table := range []string{"events", "artifacts", "leases", "handoffs", "attempts", "tasks", "runs", "planner_diagnostics", "planner_generations", "planner_messages", "planner_sessions", "workflow_templates", "projects", "executors"} {
+	for _, table := range []string{"events", "artifacts", "leases", "handoffs", "attempts", "tasks", "runs", "planner_generation_events", "planner_diagnostics", "planner_generations", "planner_messages", "planner_sessions", "workflow_templates", "projects", "executors"} {
 		if _, err := tx.Exec("DELETE FROM " + table); err != nil {
 			return err
 		}
@@ -134,6 +135,7 @@ func saveSnapshotTx(tx *sql.Tx, st state) error {
 	for _, value := range st.PlannerMessages { if err := insertPlannerMessage(tx, value); err != nil { return err } }
 	for _, value := range st.PlannerGenerations { if err := insertPlannerGeneration(tx, value); err != nil { return err } }
 	for _, value := range st.PlannerDiagnostics { if err := insertPlannerDiagnostic(tx, value); err != nil { return err } }
+	for _, value := range st.PlannerGenerationEvents { if err := insertPlannerGenerationEvent(tx, value); err != nil { return err } }
 	for _, value := range st.Runs { if err := insertRun(tx, value); err != nil { return err } }
 	for _, value := range st.Tasks { if err := insertTask(tx, value); err != nil { return err } }
 	for _, value := range st.Attempts { if err := insertAttempt(tx, value); err != nil { return err } }
@@ -199,6 +201,11 @@ func insertPlannerGeneration(tx *sql.Tx, value models.PlannerGeneration) error {
 func insertPlannerDiagnostic(tx *sql.Tx, value models.PlannerDiagnostic) error {
 	body, err := encodeBody(value); if err != nil { return err }
 	_, err = tx.Exec(`INSERT INTO planner_diagnostics(id, project_id, session_id, generation_id, kind, sensitivity, created_at, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, value.ID, value.ProjectID, value.SessionID, value.GenerationID, value.Kind, value.Sensitivity, timeText(value.CreatedAt), body)
+	return err
+}
+func insertPlannerGenerationEvent(tx *sql.Tx, value models.PlannerGenerationEvent) error {
+	body, err := encodeBody(value); if err != nil { return err }
+	_, err = tx.Exec(`INSERT INTO planner_generation_events(id, project_id, session_id, generation_id, sequence, type, created_at, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, value.ID, value.ProjectID, value.SessionID, value.GenerationID, value.Sequence, value.Type, timeText(value.CreatedAt), body)
 	return err
 }
 func insertRun(tx *sql.Tx, value models.Run) error {

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -14,6 +15,26 @@ func eventDetail(event models.Event) string {
 		return ""
 	}
 	return summary
+}
+
+func eventMeta(event models.Event) string {
+	if len(event.Data) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, 4)
+	if value, ok := event.Data["attempt"]; ok && fmt.Sprint(value) != "" && fmt.Sprint(value) != "0" {
+		parts = append(parts, "Attempt "+fmt.Sprint(value))
+	}
+	if value, ok := event.Data["status"]; ok && strings.TrimSpace(fmt.Sprint(value)) != "" {
+		parts = append(parts, strings.TrimSpace(fmt.Sprint(value)))
+	}
+	if value, ok := event.Data["exit_code"]; ok {
+		parts = append(parts, "exit "+fmt.Sprint(value))
+	}
+	if value, ok := event.Data["profile"]; ok && strings.TrimSpace(fmt.Sprint(value)) != "" {
+		parts = append(parts, agentProfileLabel(fmt.Sprint(value)))
+	}
+	return strings.Join(parts, " · ")
 }
 
 func eventLabel(kind string) string {
@@ -33,7 +54,19 @@ func eventLabel(kind string) string {
 	case models.EventLeaseExpired:
 		return "Runner slot expired"
 	case models.EventTaskStarted:
+		return "Attempt started"
+	case models.EventAttemptPreflightStarted:
+		return "Attempt preflight started"
+	case models.EventAttemptPreflightFailed:
+		return "Attempt preflight failed"
+	case models.EventAttemptWorkerStarted:
 		return "Worker started"
+	case models.EventAttemptWorkerFinished:
+		return "Worker finished"
+	case models.EventAttemptReviewerStarted:
+		return "Reviewer started"
+	case models.EventAttemptReviewerFinished:
+		return "Reviewer finished"
 	case models.EventArtifactCreated:
 		return "Outputs saved"
 	case models.EventReviewCompleted:
@@ -50,6 +83,35 @@ func eventLabel(kind string) string {
 		label := strings.ReplaceAll(kind, "_", " ")
 		label = strings.ReplaceAll(label, ".", " · ")
 		return label
+	}
+}
+
+func plannerGenerationEventLabel(kind string) string {
+	switch kind {
+	case models.PlannerGenerationEventStarted:
+		return "Generation started"
+	case models.PlannerGenerationEventPreflightStarted:
+		return "Readiness check started"
+	case models.PlannerGenerationEventPreflightFailed:
+		return "Readiness check failed"
+	case models.PlannerGenerationEventPlannerStarted:
+		return "Planner started"
+	case models.PlannerGenerationEventPlannerFinished:
+		return "Planner finished"
+	case models.PlannerGenerationEventCriticStarted:
+		return "Critic started"
+	case models.PlannerGenerationEventCriticFinished:
+		return "Critic finished"
+	case models.PlannerGenerationEventDiagnosticsSaved:
+		return "Diagnostics saved"
+	case models.PlannerGenerationEventResultApplied:
+		return "Draft updated"
+	case models.PlannerGenerationEventResultDiscarded:
+		return "Result discarded"
+	case models.PlannerGenerationEventResultFailed:
+		return "Generation failed"
+	default:
+		return eventLabel(kind)
 	}
 }
 

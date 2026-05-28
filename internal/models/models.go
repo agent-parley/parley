@@ -30,12 +30,25 @@ type Project struct {
 	DefaultBranch             string    `json:"default_branch"`
 	DefaultExecutorID         string    `json:"default_executor_id"`
 	AgentContext              string    `json:"agent_context"`
-	DefaultAgentProfile       string    `json:"default_agent_profile"`
-	DefaultWorkflowTemplateID string    `json:"default_workflow_template_id"`
-	ReviewLoopCount           int       `json:"review_loop_count"`
+	DefaultAgentProfile       string                `json:"default_agent_profile"`
+	DefaultWorkflowTemplateID string                `json:"default_workflow_template_id"`
+	QueuePolicy               string                `json:"queue_policy,omitempty"`
+	RepoSettings              *RepoSettingsSnapshot `json:"repo_settings,omitempty"`
+	ReviewLoopCount           int                   `json:"review_loop_count"`
 	RetryCount                int       `json:"retry_count"`
 	CreatedAt                 time.Time `json:"created_at"`
 	UpdatedAt                 time.Time `json:"updated_at"`
+}
+
+type RepoSettingsSnapshot struct {
+	Path                string   `json:"path"`
+	DefaultAgentProfile string   `json:"default_agent_profile,omitempty"`
+	WorkflowTemplate    string   `json:"workflow_template,omitempty"`
+	QueuePolicy         string   `json:"queue_policy,omitempty"`
+	ReviewProfiles      []string `json:"review_profiles,omitempty"`
+	RuntimeProvider     string   `json:"runtime_provider,omitempty"`
+	Applied             []string `json:"applied,omitempty"`
+	Warnings            []string `json:"warnings,omitempty"`
 }
 
 type WorkflowTemplate struct {
@@ -124,6 +137,18 @@ type PlannerDiagnostic struct {
 	SizeBytes    int64     `json:"size_bytes"`
 	SHA256       string    `json:"sha256"`
 	CreatedAt    time.Time `json:"created_at"`
+}
+
+type PlannerGenerationEvent struct {
+	ID           string         `json:"id"`
+	ProjectID    string         `json:"project_id"`
+	SessionID    string         `json:"session_id"`
+	GenerationID string         `json:"generation_id"`
+	Sequence     int            `json:"sequence"`
+	Type         string         `json:"type"`
+	Summary      string         `json:"summary"`
+	Data         map[string]any `json:"data,omitempty"`
+	CreatedAt    time.Time      `json:"created_at"`
 }
 
 type Run struct {

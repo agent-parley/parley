@@ -6,9 +6,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent-parley/parley/internal/config"
 	"github.com/agent-parley/parley/internal/models"
@@ -170,6 +172,163 @@ func TestPlannerAgentRunUpdatesDraftWithoutCreatingTask(t *testing.T) {
 	}
 }
 
+func TestPlannerAgentRunPersistsGenerationEvents(t *testing.T) {
+	st := testsupport.OpenStore(t)
+	project := createPlanningProject(t, st)
+	session, err := st.CreatePlannerSession(project.ID, "Add live planner progress")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{cfg: config.Config{ExecutionMode: config.ExecutionModeDryRun}, store: st, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), plannerRunner: plannerexec.NewDryRunRunner(), csrfToken: "test"}
+	req := httptest.NewRequest(http.MethodPost, "/projects/"+project.ID+"/planner/"+session.ID+"/run-agents", strings.NewReader("csrf_token=test"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	s.projectRoutes(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("unexpected status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	generation := waitForPlannerGeneration(t, st, session.ID, models.PlannerGenerationStatusCompleted)
+	events := waitForPlannerGenerationEvents(t, st, session.ID, []string{models.PlannerGenerationEventStarted, models.PlannerGenerationEventPlannerStarted, models.PlannerGenerationEventPlannerFinished, models.PlannerGenerationEventCriticStarted, models.PlannerGenerationEventCriticFinished, models.PlannerGenerationEventDiagnosticsSaved, models.PlannerGenerationEventResultApplied})
+	if len(st.RunsForProject(project.ID)) != 0 {
+		t.Fatalf("generation events must not create a task before approval")
+	}
+	generationEvents := st.PlannerGenerationEventsForGeneration(generation.ID)
+	if len(generationEvents) != len(events) || generationEvents[0].Sequence != 1 {
+		t.Fatalf("unexpected generation event ordering: %+v", generationEvents)
+	}
+	activityReq := httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/planner/"+session.ID+"/activity", nil)
+	activityRec := httptest.NewRecorder()
+	s.projectRoutes(activityRec, activityReq)
+	if activityRec.Code != http.StatusOK || !strings.Contains(activityRec.Body.String(), "Generation progress") || !strings.Contains(activityRec.Body.String(), "Draft updated") {
+		t.Fatalf("expected activity fragment, code=%d body=%q", activityRec.Code, activityRec.Body.String())
+	}
+}
+
+func TestPlannerSessionShowsLocalPiWarningAndLiveActivitySemantics(t *testing.T) {
+	st := testsupport.OpenStore(t)
+	project := createPlanningProject(t, st)
+	session, err := st.CreatePlannerSession(project.ID, "Add explicit local-pi progress")
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, _, err := st.BeginPlannerGeneration(session.ID, plannerexec.ModeLocalPi, profiles.ProfilePlanner, profiles.ProfileCritic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AppendPlannerGenerationEvent(models.PlannerGenerationEvent{ProjectID: project.ID, SessionID: session.ID, GenerationID: generation.ID, Type: models.PlannerGenerationEventStarted, Summary: "started"}); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{cfg: config.Config{ExecutionMode: config.ExecutionModeLocalPi}, store: st, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), csrfToken: "test"}
+	req := httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/planner/"+session.ID, nil)
+	rec := httptest.NewRecorder()
+	s.projectRoutes(rec, req)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.Contains(body, "Experimental local-pi mode") || !strings.Contains(body, "runs real local Pi agents before approval") {
+		t.Fatalf("expected local-pi warning near generation action, code=%d body=%q", rec.Code, body)
+	}
+	if !strings.Contains(body, `role="status" aria-live="polite"`) || !strings.Contains(body, "Progress updates paused; retrying") {
+		t.Fatalf("expected live activity accessibility and retry hint, body=%q", body)
+	}
+}
+
+func TestPlannerDiagnosticBodyIsRedactedAndCapped(t *testing.T) {
+	body := "OPENAI_API_KEY=sk-secretsecretsecretsecret\nAuthorization: Bearer abcdefghijklmnopqrstuvwxyz\n" + strings.Repeat("x", maxPlannerDiagnosticBytes)
+	prepared := string(preparePlannerDiagnosticBody(body))
+	if len(prepared) > maxPlannerDiagnosticBytes {
+		t.Fatalf("expected diagnostic body to be capped at %d bytes, got %d", maxPlannerDiagnosticBytes, len(prepared))
+	}
+	if !utf8.ValidString(prepared) {
+		t.Fatalf("expected truncated diagnostic body to remain valid UTF-8")
+	}
+	if strings.Contains(prepared, "sk-secretsecret") || strings.Contains(prepared, "abcdefghijklmnopqrstuvwxyz") || strings.Contains(prepared, "[REDACTED] abc") {
+		t.Fatalf("expected secret-like values to be redacted: %q", prepared[:200])
+	}
+	if !strings.Contains(prepared, "redacted secret-like values") || !strings.Contains(prepared, "truncated this diagnostic") {
+		t.Fatalf("expected redaction and truncation notes, got %q", prepared[:200])
+	}
+	multibyte := string(preparePlannerDiagnosticBody(strings.Repeat("🙂", maxPlannerDiagnosticBytes)))
+	if len(multibyte) > maxPlannerDiagnosticBytes || !utf8.ValidString(multibyte) || !strings.Contains(multibyte, "truncated this diagnostic") {
+		t.Fatalf("expected multibyte diagnostic truncation to preserve valid UTF-8, len=%d valid=%v", len(multibyte), utf8.ValidString(multibyte))
+	}
+}
+
+func TestPlannerDiagnosticDuplicateNamesUseUniqueFiles(t *testing.T) {
+	st := testsupport.OpenStore(t)
+	project := createPlanningProject(t, st)
+	session, err := st.CreatePlannerSession(project.ID, "Keep duplicate planner diagnostics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, _, err := st.BeginPlannerGeneration(session.ID, plannerexec.ModeDryRun, profiles.ProfilePlanner, profiles.ProfileCritic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{store: st, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	if err := s.writePlannerDiagnostic(generation, plannerexec.Diagnostic{Name: "planner-output.txt", Kind: models.PlannerDiagnosticKindOutput, Body: "first body"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writePlannerDiagnostic(generation, plannerexec.Diagnostic{Name: "planner-output.txt", Kind: models.PlannerDiagnosticKindOutput, Body: "second body"}); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics := st.PlannerDiagnosticsForGeneration(generation.ID)
+	if len(diagnostics) != 2 {
+		t.Fatalf("expected duplicate-name diagnostics to persist separately, got %+v", diagnostics)
+	}
+	if diagnostics[0].Path == diagnostics[1].Path {
+		t.Fatalf("expected duplicate-name diagnostics to use unique paths, got %+v", diagnostics)
+	}
+	bodies := map[string]bool{}
+	for _, diagnostic := range diagnostics {
+		data, err := os.ReadFile(diagnostic.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bodies[string(data)] = true
+	}
+	if !bodies["first body"] || !bodies["second body"] {
+		t.Fatalf("expected both diagnostic bodies to be retained, got %+v", bodies)
+	}
+}
+
+func TestPlannerDiagnosticPruningRemovesOldFiles(t *testing.T) {
+	st := testsupport.OpenStore(t)
+	project := createPlanningProject(t, st)
+	session, err := st.CreatePlannerSession(project.ID, "Prune old planner diagnostics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{store: st, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	oldestPath := ""
+	for i := 0; i < plannerDiagnosticGenerationsToKeep+1; i++ {
+		generation, startedSession, err := st.BeginPlannerGeneration(session.ID, plannerexec.ModeDryRun, profiles.ProfilePlanner, profiles.ProfileCritic)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.writePlannerDiagnostic(generation, plannerexec.Diagnostic{Name: "trace.txt", Kind: models.PlannerDiagnosticKindTrace, Body: "diagnostic body"}); err != nil {
+			t.Fatal(err)
+		}
+		diagnostics := st.PlannerDiagnosticsForGeneration(generation.ID)
+		if len(diagnostics) != 1 {
+			t.Fatalf("expected one diagnostic for generation, got %+v", diagnostics)
+		}
+		if i == 0 {
+			oldestPath = diagnostics[0].Path
+		}
+		startedSession.AgentStatus = models.PlannerAgentStatusCompleted
+		startedSession.AgentSummary = "done"
+		if _, _, _, err := st.CompletePlannerGeneration(generation.ID, startedSession, models.PlannerGenerationStatusCompleted, "done", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.prunePlannerDiagnostics(session.ID)
+	if _, err := os.Stat(oldestPath); !os.IsNotExist(err) {
+		t.Fatalf("expected oldest diagnostic file to be removed, stat err=%v", err)
+	}
+	if diagnostics := st.PlannerDiagnosticsForSession(session.ID); len(diagnostics) != plannerDiagnosticGenerationsToKeep {
+		t.Fatalf("expected retained diagnostics to match policy, got %+v", diagnostics)
+	}
+}
+
 func TestPlannerAgentRunDoesNotOverwriteApprovedSession(t *testing.T) {
 	st := testsupport.OpenStore(t)
 	project := createPlanningProject(t, st)
@@ -196,6 +355,7 @@ func TestPlannerAgentRunDoesNotOverwriteApprovedSession(t *testing.T) {
 	if !waitForPlannerMessage(t, st, session.ID, "planner", "result discarded") {
 		t.Fatalf("expected stale-result discard message")
 	}
+	_ = waitForPlannerGenerationEvents(t, st, session.ID, []string{models.PlannerGenerationEventResultDiscarded})
 }
 
 func TestPlannerAgentRunDoesNotOverwriteDismissedSession(t *testing.T) {
@@ -266,7 +426,7 @@ func TestPlannerAgentRunMarksSessionFailedOnPlannerRunError(t *testing.T) {
 	project := createPlanningProject(t, st)
 	session, err := st.CreatePlannerSession(project.ID, "Add agent planning")
 	if err != nil { t.Fatal(err) }
-	runner := &fakePlannerRunner{result: plannerexec.Result{Mode: plannerexec.ModeLocalPi, PlannerProfile: profiles.ProfilePlanner, CriticProfile: profiles.ProfileCritic, PlannerMessage: "Planner produced invalid JSON.", Summary: "Planner output failed to parse.", Diagnostics: []plannerexec.Diagnostic{{Name: "planner-stdout.txt", Kind: models.PlannerDiagnosticKindOutput, Body: "raw planner output"}}}, err: context.DeadlineExceeded}
+	runner := &fakePlannerRunner{result: plannerexec.Result{Mode: plannerexec.ModeLocalPi, PlannerProfile: profiles.ProfilePlanner, CriticProfile: profiles.ProfileCritic, PlannerMessage: "Planner produced invalid JSON.", Summary: "Planner output failed to parse.", Diagnostics: []plannerexec.Diagnostic{{Name: "planner-stdout.txt", Kind: models.PlannerDiagnosticKindOutput, Body: "raw planner output\nOPENAI_API_KEY=sk-secretsecretsecretsecret"}}}, err: context.DeadlineExceeded}
 	s := &Server{cfg: config.Config{ExecutionMode: config.ExecutionModeLocalPi}, store: st, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), plannerRunner: runner, csrfToken: "test"}
 	req := httptest.NewRequest(http.MethodPost, "/projects/"+project.ID+"/planner/"+session.ID+"/run-agents", strings.NewReader("csrf_token=test"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -300,8 +460,8 @@ func TestPlannerAgentRunMarksSessionFailedOnPlannerRunError(t *testing.T) {
 	diagReq := httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/planner/"+session.ID+"/diagnostics/"+outputDiagnostic.ID, nil)
 	diagRec := httptest.NewRecorder()
 	s.projectRoutes(diagRec, diagReq)
-	if diagRec.Code != http.StatusOK || !strings.Contains(diagRec.Body.String(), "raw planner output") {
-		t.Fatalf("expected planner diagnostic preview, code=%d body=%q", diagRec.Code, diagRec.Body.String())
+	if diagRec.Code != http.StatusOK || !strings.Contains(diagRec.Body.String(), "raw planner output") || strings.Contains(diagRec.Body.String(), "sk-secretsecret") || !strings.Contains(diagRec.Body.String(), "[REDACTED]") {
+		t.Fatalf("expected redacted planner diagnostic preview, code=%d body=%q", diagRec.Code, diagRec.Body.String())
 	}
 	otherSession, err := st.CreatePlannerSession(project.ID, "Other planner session")
 	if err != nil {
@@ -373,6 +533,34 @@ func waitForPlannerDiagnostics(t testing.TB, st *store.Store, sessionID string, 
 	}
 	t.Fatalf("planner diagnostics did not reach expected count: %+v", diagnostics)
 	return nil
+}
+
+func waitForPlannerGenerationEvents(t testing.TB, st *store.Store, sessionID string, expected []string) []models.PlannerGenerationEvent {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var events []models.PlannerGenerationEvent
+	for time.Now().Before(deadline) {
+		events = st.PlannerGenerationEventsForSession(sessionID)
+		if hasPlannerGenerationEventTypes(events, expected) {
+			return events
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("planner generation events missing %v: %+v", expected, events)
+	return nil
+}
+
+func hasPlannerGenerationEventTypes(events []models.PlannerGenerationEvent, expected []string) bool {
+	seen := map[string]bool{}
+	for _, event := range events {
+		seen[event.Type] = true
+	}
+	for _, eventType := range expected {
+		if !seen[eventType] {
+			return false
+		}
+	}
+	return true
 }
 
 func waitForPlannerMessage(t testing.TB, st *store.Store, sessionID, role, body string) bool {

@@ -37,6 +37,7 @@ func applyMigrations(db *sql.DB) error {
 	}{
 		{version: 1, sql: sqliteMigration1},
 		{version: 2, sql: sqliteMigration2},
+		{version: 3, sql: sqliteMigration3},
 	}
 	for _, migration := range migrations {
 		var exists int
@@ -210,4 +211,20 @@ CREATE TABLE planner_diagnostics (
 );
 CREATE INDEX idx_planner_diagnostics_session ON planner_diagnostics(session_id, created_at);
 CREATE INDEX idx_planner_diagnostics_generation ON planner_diagnostics(generation_id, created_at);
+`
+
+const sqliteMigration3 = `
+CREATE TABLE planner_generation_events (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  generation_id TEXT NOT NULL DEFAULT '',
+  sequence INTEGER NOT NULL DEFAULT 0,
+  type TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL,
+  UNIQUE(generation_id, sequence)
+);
+CREATE INDEX idx_planner_generation_events_session ON planner_generation_events(session_id, created_at);
+CREATE INDEX idx_planner_generation_events_generation ON planner_generation_events(generation_id, sequence);
 `

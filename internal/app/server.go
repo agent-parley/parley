@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent-parley/parley/internal/artifacts"
 	"github.com/agent-parley/parley/internal/config"
@@ -23,10 +24,16 @@ import (
 	"github.com/agent-parley/parley/internal/pathsafe"
 	plannerexec "github.com/agent-parley/parley/internal/planner"
 	"github.com/agent-parley/parley/internal/profiles"
+	"github.com/agent-parley/parley/internal/reposettings"
+	"github.com/agent-parley/parley/internal/secretpolicy"
 	"github.com/agent-parley/parley/internal/store"
 )
 
-const plannerGenerationTimeout = 15 * time.Minute
+const (
+	plannerGenerationTimeout          = 15 * time.Minute
+	plannerDiagnosticGenerationsToKeep = 5
+	maxPlannerDiagnosticBytes         = 128 * 1024
+)
 
 type Dependencies struct {
 	Config config.Config
@@ -53,6 +60,7 @@ func New(deps Dependencies) http.Handler {
 	}
 	s := &Server{cfg: deps.Config, store: deps.Store, logger: deps.Logger, artifacts: artifactWriter, dispatcher: deps.Dispatcher, plannerRunner: deps.PlannerRunner, csrfToken: newCSRFToken()}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", s.healthz)
 	mux.HandleFunc("/", s.home)
 	mux.HandleFunc("/projects", s.projects)
 	mux.HandleFunc("/projects/", s.projectRoutes)
@@ -63,6 +71,15 @@ func New(deps Dependencies) http.Handler {
 	mux.HandleFunc("/artifacts/", s.artifact)
 	mux.HandleFunc("/static/app.css", s.css)
 	return withSecurityHeaders(withHostAllowlist(withRequestSafety(mux, s.csrfToken), deps.Config.BindAddr))
+}
+
+func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte("ok\n"))
 }
 
 func (s *Server) home(w http.ResponseWriter, r *http.Request) {
@@ -98,6 +115,15 @@ func (s *Server) projects(w http.ResponseWriter, r *http.Request) {
 		}
 		project, err := s.store.CreateProject(r.FormValue("name"), r.FormValue("description"), repoPath, r.FormValue("default_branch"))
 		if err != nil {
+			if reposettings.IsError(err) {
+				s.render(w, "Projects", projectsTemplate, map[string]any{
+					"Executor": s.store.LocalExecutor(),
+					"Projects": s.store.ListProjects(),
+					"DataRoot": s.cfg.DataRoot,
+					"Error": err.Error(),
+				})
+				return
+			}
 			s.serverError(w, err)
 			return
 		}
@@ -181,6 +207,12 @@ func (s *Server) projectSettings(w http.ResponseWriter, r *http.Request, project
 			s.render(w, "Project settings", projectSettingsTemplate, s.projectSettingsData(project, fmt.Sprintf("unsupported agent profile %q", project.DefaultAgentProfile)))
 			return
 		}
+		project.QueuePolicy = strings.TrimSpace(r.FormValue("queue_policy"))
+		if !isAllowedQueuePolicy(project.QueuePolicy) {
+			s.render(w, "Project settings", projectSettingsTemplate, s.projectSettingsData(project, fmt.Sprintf("unsupported queue policy %q", project.QueuePolicy)))
+			return
+		}
+		project.QueuePolicy = normalizeProjectQueuePolicy(project.QueuePolicy)
 		project.DefaultWorkflowTemplateID = strings.TrimSpace(r.FormValue("workflow_template"))
 		project.ReviewLoopCount = parseSmallInt(r.FormValue("review_loops"), 1)
 		project.RetryCount = parseSmallInt(r.FormValue("retry_count"), 1)
@@ -195,7 +227,8 @@ func (s *Server) projectSettings(w http.ResponseWriter, r *http.Request, project
 }
 
 func (s *Server) projectSettingsData(project models.Project, errorMessage string) map[string]any {
-	data := map[string]any{"Project": project, "Templates": s.store.WorkflowTemplatesForProject(project.ID), "Executor": s.store.LocalExecutor(), "Runners": s.store.ListExecutors(), "ExecutionRunnerID": project.DefaultExecutorID, "AgentProfiles": profiles.WorkerDefaultIDs()}
+	project.QueuePolicy = normalizeProjectQueuePolicy(project.QueuePolicy)
+	data := map[string]any{"Project": project, "Templates": s.store.WorkflowTemplatesForProject(project.ID), "Executor": s.store.LocalExecutor(), "Runners": s.store.ListExecutors(), "ExecutionRunnerID": project.DefaultExecutorID, "AgentProfiles": profiles.WorkerDefaultIDs(), "QueuePolicies": []string{models.QueuePolicyManual, models.QueuePolicyAutoWhenReady}}
 	if errorMessage != "" {
 		data["Error"] = errorMessage
 	}
@@ -204,6 +237,22 @@ func (s *Server) projectSettingsData(project models.Project, errorMessage string
 
 func isAllowedAgentProfile(profile string) bool {
 	return profiles.IsWorkerDefault(profile)
+}
+
+func isAllowedQueuePolicy(policy string) bool {
+	switch strings.TrimSpace(policy) {
+	case "", models.QueuePolicyManual, models.QueuePolicyAutoWhenReady:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeProjectQueuePolicy(policy string) string {
+	if strings.TrimSpace(policy) == models.QueuePolicyAutoWhenReady {
+		return models.QueuePolicyAutoWhenReady
+	}
+	return models.QueuePolicyManual
 }
 
 func (s *Server) workflowTemplate(w http.ResponseWriter, r *http.Request, project models.Project, templateID string) {
@@ -262,7 +311,12 @@ func (s *Server) planner(w http.ResponseWriter, r *http.Request, project models.
 	if len(parts) == 1 && r.Method == http.MethodGet {
 		generations := s.store.PlannerGenerationsForSession(session.ID)
 		diagnostics := s.store.PlannerDiagnosticsForSession(session.ID)
-		s.render(w, session.Title, plannerSessionTemplate, map[string]any{"Project": project, "Session": session, "Messages": s.store.PlannerMessages(session.ID), "Executor": s.store.LocalExecutor(), "Generations": generations, "GenerationViews": plannerGenerationViews(generations, diagnostics), "GenerationRunning": plannerGenerationRunning(generations)})
+		generationRunning := plannerGenerationRunning(generations)
+		s.render(w, session.Title, plannerSessionTemplate, map[string]any{"Project": project, "Session": session, "Messages": s.store.PlannerMessages(session.ID), "Executor": s.store.LocalExecutor(), "Generations": generations, "GenerationViews": plannerGenerationViews(generations, diagnostics), "GenerationEvents": s.store.PlannerGenerationEventsForSession(session.ID), "GenerationRunning": generationRunning})
+		return
+	}
+	if len(parts) == 2 && parts[1] == "activity" && r.Method == http.MethodGet {
+		s.plannerGenerationActivity(w, r, project, session)
 		return
 	}
 	if len(parts) == 3 && parts[1] == "diagnostics" && r.Method == http.MethodGet {
@@ -274,6 +328,16 @@ func (s *Server) planner(w http.ResponseWriter, r *http.Request, project models.
 		return
 	}
 	http.NotFound(w, r)
+}
+
+func (s *Server) plannerGenerationActivity(w http.ResponseWriter, r *http.Request, project models.Project, session models.PlannerSession) {
+	current, ok := s.store.GetPlannerSession(session.ID)
+	if !ok || current.ProjectID != project.ID {
+		http.NotFound(w, r)
+		return
+	}
+	generations := s.store.PlannerGenerationsForSession(current.ID)
+	s.renderPlannerGenerationActivity(w, map[string]any{"Project": project, "Session": current, "GenerationEvents": s.store.PlannerGenerationEventsForSession(current.ID), "GenerationRunning": plannerGenerationRunning(generations)})
 }
 
 func (s *Server) plannerStart(w http.ResponseWriter, r *http.Request, project models.Project) {
@@ -366,9 +430,12 @@ func (s *Server) runPlannerAgents(_ context.Context, project models.Project, ses
 		}
 		return err
 	}
+	s.emitPlannerGenerationEvent(generation, models.PlannerGenerationEventStarted, "Planner/critic generation started before task approval.", map[string]any{"mode": generation.Mode})
 	messages := s.store.PlannerMessages(session.ID)
-	input := plannerexec.Input{Project: project, Session: startedSession, Messages: messages}
-	if _, err := s.store.AppendPlannerMessage(session.ID, "planner", fmt.Sprintf("Planner/critic generation %s started in %s mode. Refresh this page to inspect progress; task creation and worker execution remain approval-gated.", generation.ID, generation.Mode)); err != nil && s.logger != nil {
+	input := plannerexec.Input{Project: project, Session: startedSession, Messages: messages, Progress: func(eventType, summary string, data map[string]any) {
+		s.emitPlannerGenerationEvent(generation, eventType, summary, data)
+	}}
+	if _, err := s.store.AppendPlannerMessage(session.ID, "planner", fmt.Sprintf("Planner/critic generation %s started in %s mode. Progress updates are shown below; task creation and worker execution remain approval-gated.", generation.ID, generation.Mode)); err != nil && s.logger != nil {
 		s.logger.Error("failed to append planner generation start message", "generation_id", generation.ID, "session_id", session.ID, "error", err)
 	}
 	go func() {
@@ -386,7 +453,9 @@ func (s *Server) runPlannerGeneration(ctx context.Context, generation models.Pla
 	var result plannerexec.Result
 	var runErr error
 	if preflight, ok := runner.(plannerexec.PreflightRunner); ok {
+		s.emitPlannerGenerationEvent(generation, models.PlannerGenerationEventPreflightStarted, "Planner/critic readiness check started.", nil)
 		if err := preflight.Preflight(ctx, input); err != nil {
+			s.emitPlannerGenerationEvent(generation, models.PlannerGenerationEventPreflightFailed, "Planner/critic readiness check failed before approval.", nil)
 			result = plannerexec.Result{Mode: plannerModeForConfig(s.cfg), PlannerProfile: profiles.ProfilePlanner, CriticProfile: profiles.ProfileCritic, Summary: "Planner/critic readiness check failed before approval.", Diagnostics: []plannerexec.Diagnostic{{Name: "preflight-error.txt", Kind: models.PlannerDiagnosticKindError, Body: err.Error()}}}
 			runErr = fmt.Errorf("planner preflight failed: %w", err)
 		} else {
@@ -413,17 +482,28 @@ func (s *Server) runPlannerGeneration(ctx context.Context, generation models.Pla
 			result.Summary = strings.TrimSpace(result.Summary) + " " + diagnostic
 		}
 	}
-	s.writePlannerDiagnostics(generation, result.Diagnostics)
+	diagnosticsSaved := s.writePlannerDiagnostics(generation, result.Diagnostics)
+	if diagnosticsSaved > 0 {
+		s.emitPlannerGenerationEvent(generation, models.PlannerGenerationEventDiagnosticsSaved, fmt.Sprintf("Saved %d internal planner diagnostic file(s).", diagnosticsSaved), map[string]any{"count": diagnosticsSaved})
+	}
 	updated := applyPlannerExecutionResult(input.Session, result, agentStatus, plannerModeForConfig(s.cfg))
 	stored, completedGeneration, applied, err := s.store.CompletePlannerGeneration(generation.ID, updated, status, updated.AgentSummary, diagnostic)
 	if err != nil {
+		s.emitPlannerGenerationEvent(generation, models.PlannerGenerationEventResultFailed, "Planner/critic generation could not record its final state.", map[string]any{"status": models.PlannerGenerationStatusFailed})
 		return err
 	}
+	s.prunePlannerDiagnostics(generation.SessionID)
 	if !applied {
+		s.emitPlannerGenerationEvent(completedGeneration, models.PlannerGenerationEventResultDiscarded, completedGeneration.Summary, map[string]any{"status": completedGeneration.Status})
 		if _, err := s.store.AppendPlannerMessage(input.Session.ID, "planner", completedGeneration.Summary); err != nil {
 			return err
 		}
 		return nil
+	}
+	if status == models.PlannerGenerationStatusFailed {
+		s.emitPlannerGenerationEvent(completedGeneration, models.PlannerGenerationEventResultFailed, completedGeneration.Summary, map[string]any{"status": completedGeneration.Status})
+	} else {
+		s.emitPlannerGenerationEvent(completedGeneration, models.PlannerGenerationEventResultApplied, completedGeneration.Summary, map[string]any{"status": completedGeneration.Status})
 	}
 	if agentStatus == models.PlannerAgentStatusCompleted {
 		if _, err := s.store.AppendPlannerMessage(input.Session.ID, "planner", plannerDraftSnapshot(stored)); err != nil {
@@ -453,15 +533,21 @@ func plannerDraftSnapshot(session models.PlannerSession) string {
 	return fmt.Sprintf("Generated planner draft snapshot:\nTitle: %s\nObjective: %s\nFocus: %s\nBoundaries: %s\nDone when: %s\nAssumptions: %s\nRisks: %s\nGraph: %s", session.DraftTitle, session.DraftObjective, session.DraftFocus, session.DraftBoundaries, session.DraftDoneWhen, strings.Join(session.Assumptions, "; "), strings.Join(session.Risks, "; "), strings.Join(session.GraphPreview, " → "))
 }
 
-func (s *Server) writePlannerDiagnostics(generation models.PlannerGeneration, diagnostics []plannerexec.Diagnostic) {
+func (s *Server) writePlannerDiagnostics(generation models.PlannerGeneration, diagnostics []plannerexec.Diagnostic) int {
+	saved := 0
 	for _, diagnostic := range diagnostics {
 		if strings.TrimSpace(diagnostic.Body) == "" {
 			continue
 		}
-		if err := s.writePlannerDiagnostic(generation, diagnostic); err != nil && s.logger != nil {
-			s.logger.Error("failed to save planner diagnostic", "generation_id", generation.ID, "error", err)
+		if err := s.writePlannerDiagnostic(generation, diagnostic); err != nil {
+			if s.logger != nil {
+				s.logger.Error("failed to save planner diagnostic", "generation_id", generation.ID, "error", err)
+			}
+			continue
 		}
+		saved++
 	}
+	return saved
 }
 
 func (s *Server) writePlannerDiagnostic(generation models.PlannerGeneration, diagnostic plannerexec.Diagnostic) error {
@@ -480,7 +566,7 @@ func (s *Server) writePlannerDiagnostic(generation models.PlannerGeneration, dia
 	if err := pathsafe.MkdirAllNoSymlink(absDir, 0o700); err != nil {
 		return err
 	}
-	name := plannerDiagnosticFileName(diagnostic.Name, diagnostic.Kind)
+	name := s.uniquePlannerDiagnosticFileName(generation.ID, absDir, plannerDiagnosticFileName(diagnostic.Name, diagnostic.Kind))
 	path := filepath.Join(absDir, name)
 	absPath, err := filepath.Abs(path)
 	if err != nil {
@@ -489,13 +575,117 @@ func (s *Server) writePlannerDiagnostic(generation models.PlannerGeneration, dia
 	if rel, err := filepath.Rel(root, absPath); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("planner diagnostic path is outside the data root")
 	}
-	body := []byte(diagnostic.Body)
+	body := preparePlannerDiagnosticBody(diagnostic.Body)
 	if err := pathsafe.WriteFileNoFollow(absPath, body, 0o600); err != nil {
 		return err
 	}
 	sum := sha256.Sum256(body)
 	_, err = s.store.SavePlannerDiagnostic(models.PlannerDiagnostic{ProjectID: generation.ProjectID, SessionID: generation.SessionID, GenerationID: generation.ID, Kind: firstNonEmpty(diagnostic.Kind, models.PlannerDiagnosticKindTrace), Path: absPath, MediaType: "text/plain; charset=utf-8", Sensitivity: models.SensitivityInternal, SizeBytes: int64(len(body)), SHA256: hex.EncodeToString(sum[:]), CreatedAt: time.Now().UTC()})
 	return err
+}
+
+func (s *Server) prunePlannerDiagnostics(sessionID string) {
+	removed, err := s.store.PrunePlannerDiagnosticsForSession(sessionID, plannerDiagnosticGenerationsToKeep)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Error("failed to prune planner diagnostics", "session_id", sessionID, "error", err)
+		}
+		return
+	}
+	for _, diagnostic := range removed {
+		s.removePlannerDiagnosticFile(diagnostic)
+	}
+}
+
+func (s *Server) removePlannerDiagnosticFile(diagnostic models.PlannerDiagnostic) {
+	root, err := filepath.Abs(s.store.DataRoot())
+	if err != nil {
+		return
+	}
+	path, err := filepath.Abs(diagnostic.Path)
+	if err != nil {
+		return
+	}
+	if rel, err := filepath.Rel(root, path); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) && s.logger != nil {
+		s.logger.Error("failed to remove pruned planner diagnostic", "diagnostic_id", diagnostic.ID, "path", diagnostic.Path, "error", err)
+	}
+	_ = os.Remove(filepath.Dir(path))
+}
+
+func preparePlannerDiagnosticBody(body string) []byte {
+	body = strings.ToValidUTF8(body, "�")
+	redactedBody := redactPlannerDiagnosticSecrets(body)
+	if redactedBody != body {
+		body = "[Parley redacted secret-like values from this diagnostic before saving.]\n\n" + redactedBody
+	} else {
+		body = redactedBody
+	}
+	data := []byte(body)
+	if len(data) <= maxPlannerDiagnosticBytes {
+		return data
+	}
+	note := []byte(fmt.Sprintf("\n\n[Parley truncated this diagnostic to %d bytes before saving.]", maxPlannerDiagnosticBytes))
+	keep := maxPlannerDiagnosticBytes - len(note)
+	if keep < 0 {
+		keep = maxPlannerDiagnosticBytes
+		note = nil
+	}
+	keep = utf8SafePrefixLength(data, keep)
+	trimmed := make([]byte, 0, keep+len(note))
+	trimmed = append(trimmed, data[:keep]...)
+	trimmed = append(trimmed, note...)
+	return trimmed
+}
+
+func utf8SafePrefixLength(data []byte, max int) int {
+	if max >= len(data) {
+		return len(data)
+	}
+	if max <= 0 {
+		return 0
+	}
+	for max > 0 && !utf8.Valid(data[:max]) {
+		max--
+	}
+	return max
+}
+
+func redactPlannerDiagnosticSecrets(body string) string {
+	return secretpolicy.Redact(body)
+}
+
+func (s *Server) uniquePlannerDiagnosticFileName(generationID, dir, name string) string {
+	existing := map[string]bool{}
+	for _, diagnostic := range s.store.PlannerDiagnosticsForGeneration(generationID) {
+		if diagnostic.Path != "" {
+			existing[filepath.Base(diagnostic.Path)] = true
+		}
+	}
+	if plannerDiagnosticNameAvailable(dir, existing, name) {
+		return name
+	}
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	if stem == "" {
+		stem = "planner-diagnostic"
+	}
+	for i := 2; ; i++ {
+		candidate := fmt.Sprintf("%s-%d%s", stem, i, ext)
+		if plannerDiagnosticNameAvailable(dir, existing, candidate) {
+			return candidate
+		}
+	}
+}
+
+func plannerDiagnosticNameAvailable(dir string, existing map[string]bool, name string) bool {
+	if existing[name] {
+		return false
+	}
+	_, err := os.Lstat(filepath.Join(dir, name))
+	return errors.Is(err, os.ErrNotExist)
 }
 
 func plannerDiagnosticFileName(name, kind string) string {
@@ -673,7 +863,7 @@ func (s *Server) taskRoutes(w http.ResponseWriter, r *http.Request) {
 	project, _ := s.store.GetProject(task.ProjectID)
 	if len(parts) == 1 && r.Method == http.MethodGet {
 		artifacts := s.store.ArtifactsForTask(task.ID)
-		events := s.store.EventsForRun(run.ID)
+		events := taskEvents(s.store.EventsForRun(run.ID), task.ID)
 		attempts := attemptTimeline(task, s.store.AttemptsForTask(task.ID), artifacts)
 		s.render(w, task.Title, taskTemplate, map[string]any{
 			"Task": task,
@@ -681,6 +871,7 @@ func (s *Server) taskRoutes(w http.ResponseWriter, r *http.Request) {
 			"Project": project,
 			"Artifacts": artifacts,
 			"Events": events,
+			"TaskActivityActive": taskActivityActive(task),
 			"Attempts": attempts,
 			"Handoffs": s.store.HandoffsForTask(task.ID),
 			"RunnerNames": s.runnerNames(),
@@ -688,6 +879,14 @@ func (s *Server) taskRoutes(w http.ResponseWriter, r *http.Request) {
 			"DiffArtifacts": visibleDiffArtifacts(artifacts),
 			"Diagnostics": internalDiagnosticArtifacts(artifacts),
 		})
+		return
+	}
+	if len(parts) == 2 && parts[1] == "activity" {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		s.renderTaskActivity(w, map[string]any{"Task": task, "Run": run, "Events": taskEvents(s.store.EventsForRun(run.ID), task.ID), "TaskActivityActive": taskActivityActive(task)})
 		return
 	}
 	if len(parts) == 3 && parts[1] == "diagnostics" {
@@ -723,7 +922,18 @@ func (s *Server) taskRoutes(w http.ResponseWriter, r *http.Request) {
 				s.serverError(w, err)
 				return
 			}
-			s.emit(updatedRun.ID, updatedTask.ID, models.EventTaskStateChanged, models.ActorKindUser, models.ActorKindUser, "Fix requested; queue the next attempt when ready", map[string]any{"assigned_runner": updatedTask.AssignedExecutorID})
+			summary := "Fix requested; queue the next attempt when ready"
+			if normalizeProjectQueuePolicy(project.QueuePolicy) == models.QueuePolicyAutoWhenReady {
+				summary = "Fix requested; auto-queue will be attempted"
+			}
+			s.emit(updatedRun.ID, updatedTask.ID, models.EventTaskStateChanged, models.ActorKindUser, models.ActorKindUser, summary, map[string]any{"assigned_runner": updatedTask.AssignedExecutorID, "queue_policy": normalizeProjectQueuePolicy(project.QueuePolicy)})
+			if normalizeProjectQueuePolicy(project.QueuePolicy) == models.QueuePolicyAutoWhenReady {
+				if err := s.dispatcher.Enqueue(r.Context(), updatedTask.ID); err != nil {
+					s.logAttemptQueueError(updatedTask.ID, err)
+					s.renderTask(w, updatedTask.ID, "Fix was requested, but the next attempt could not be auto-queued. Use Queue fix attempt to retry.")
+					return
+				}
+			}
 		case "resume-fix":
 			if err := s.dispatcher.Enqueue(r.Context(), task.ID); err != nil {
 				s.logAttemptQueueError(task.ID, err)
@@ -754,10 +964,11 @@ func (s *Server) renderTask(w http.ResponseWriter, taskID, errorMessage string) 
 	}
 	run, _ := s.store.GetRun(task.RunID)
 	project, _ := s.store.GetProject(task.ProjectID)
+	project.QueuePolicy = normalizeProjectQueuePolicy(project.QueuePolicy)
 	artifacts := s.store.ArtifactsForTask(task.ID)
-	events := s.store.EventsForRun(run.ID)
+	events := taskEvents(s.store.EventsForRun(run.ID), task.ID)
 	attempts := attemptTimeline(task, s.store.AttemptsForTask(task.ID), artifacts)
-	data := map[string]any{"Task": task, "Run": run, "Project": project, "Artifacts": artifacts, "Events": events, "Attempts": attempts, "Handoffs": s.store.HandoffsForTask(task.ID), "RunnerNames": s.runnerNames(), "Chain": chainForTask(task, artifacts, events), "DiffArtifacts": visibleDiffArtifacts(artifacts), "Diagnostics": internalDiagnosticArtifacts(artifacts)}
+	data := map[string]any{"Task": task, "Run": run, "Project": project, "Artifacts": artifacts, "Events": events, "TaskActivityActive": taskActivityActive(task), "Attempts": attempts, "Handoffs": s.store.HandoffsForTask(task.ID), "RunnerNames": s.runnerNames(), "Chain": chainForTask(task, artifacts, events), "DiffArtifacts": visibleDiffArtifacts(artifacts), "Diagnostics": internalDiagnosticArtifacts(artifacts)}
 	if errorMessage != "" {
 		data["Error"] = errorMessage
 	}
@@ -785,7 +996,7 @@ func (s *Server) artifact(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if artifact.Sensitivity != "" && artifact.Sensitivity != models.SensitivityNormal {
+	if !secretpolicy.IsPublicPreviewSensitivity(artifact.Sensitivity) {
 		http.Error(w, "artifact is not available for browser preview", http.StatusForbidden)
 		return
 	}
@@ -939,16 +1150,46 @@ func (s *Server) emit(runID, taskID, typ, actorKind, actorID, summary string, da
 	}
 }
 
+func (s *Server) emitPlannerGenerationEvent(generation models.PlannerGeneration, typ, summary string, data map[string]any) {
+	_, err := s.store.AppendPlannerGenerationEvent(models.PlannerGenerationEvent{ProjectID: generation.ProjectID, SessionID: generation.SessionID, GenerationID: generation.ID, Type: typ, Summary: summary, Data: data})
+	if err != nil && s.logger != nil {
+		s.logger.Error("failed to append planner generation event", "generation_id", generation.ID, "type", typ, "error", err)
+	}
+}
+
 func (s *Server) render(w http.ResponseWriter, title, body string, data map[string]any) {
-	base := template.Must(template.New("base").Funcs(template.FuncMap{"since": since, "statusLabel": statusLabel, "artifactName": artifactName, "artifactLabel": artifactLabel, "agentProfileLabel": agentProfileLabel, "shortStep": shortStep, "eventLabel": eventLabel, "eventDetail": eventDetail}).Parse(layoutTemplate + body))
+	base := template.Must(template.New("base").Funcs(templateFuncs()).Parse(layoutTemplate + plannerGenerationActivityTemplate + taskActivityTemplate + body))
 	data["Title"] = title
 	data["Now"] = time.Now().UTC()
 	data["CSRFToken"] = s.csrfToken
+	data["ExecutionMode"] = s.cfg.ExecutionMode
 	data["K"] = templateConstants()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := base.ExecuteTemplate(w, "layout", data); err != nil {
 		s.logger.Error("render failed", "error", err)
 	}
+}
+
+func (s *Server) renderPlannerGenerationActivity(w http.ResponseWriter, data map[string]any) {
+	fragment := template.Must(template.New("planner-fragment").Funcs(templateFuncs()).Parse(plannerGenerationActivityTemplate))
+	data["Now"] = time.Now().UTC()
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := fragment.ExecuteTemplate(w, "planner-generation-activity", data); err != nil {
+		s.logger.Error("render planner generation activity failed", "error", err)
+	}
+}
+
+func (s *Server) renderTaskActivity(w http.ResponseWriter, data map[string]any) {
+	fragment := template.Must(template.New("task-activity-fragment").Funcs(templateFuncs()).Parse(taskActivityTemplate))
+	data["Now"] = time.Now().UTC()
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := fragment.ExecuteTemplate(w, "task-activity", data); err != nil {
+		s.logger.Error("render task activity failed", "error", err)
+	}
+}
+
+func templateFuncs() template.FuncMap {
+	return template.FuncMap{"since": since, "statusLabel": statusLabel, "artifactName": artifactName, "artifactLabel": artifactLabel, "agentProfileLabel": agentProfileLabel, "shortStep": shortStep, "eventLabel": eventLabel, "eventDetail": eventDetail, "eventMeta": eventMeta, "plannerGenerationEventLabel": plannerGenerationEventLabel}
 }
 
 func (s *Server) badRequest(w http.ResponseWriter, err error) { http.Error(w, err.Error(), http.StatusBadRequest) }
@@ -1038,6 +1279,20 @@ func plannerGenerationRunning(generations []models.PlannerGeneration) bool {
 	return false
 }
 
+func taskActivityActive(task models.Task) bool {
+	return task.Status == models.TaskStatusQueued || task.Status == models.TaskStatusRunning
+}
+
+func taskEvents(events []models.Event, taskID string) []models.Event {
+	filtered := make([]models.Event, 0, len(events))
+	for _, event := range events {
+		if event.TaskID == taskID {
+			filtered = append(filtered, event)
+		}
+	}
+	return filtered
+}
+
 func parseSmallInt(value string, fallback int) int {
 	parsed, err := strconv.Atoi(strings.TrimSpace(value))
 	if err != nil || parsed < 0 {
@@ -1057,7 +1312,7 @@ type attemptView struct {
 func visibleDiffArtifacts(artifacts []models.Artifact) []models.Artifact {
 	visible := make([]models.Artifact, 0)
 	for _, artifact := range artifacts {
-		if artifact.Sensitivity != "" && artifact.Sensitivity != models.SensitivityNormal {
+		if !secretpolicy.IsPublicPreviewSensitivity(artifact.Sensitivity) {
 			continue
 		}
 		if artifact.Kind != models.ArtifactKindDiff && artifact.Kind != models.ArtifactKindChangedFiles {

@@ -6,7 +6,7 @@ const runnersTemplate = `{{define "content"}}
 <section class="hero">
   <div>
     <h1>Runners</h1>
-    <p>Prototype runner registry. Only the local runner executes today; remote runners are modeled for scheduling and handoff UX.</p>
+    <p>Prototype runner registry. Only active Pi profiles execute today; non-Pi families are planned metadata and remote runners are modeled for scheduling and handoff UX.</p>
   </div>
   <span class="status large">{{len .Runners}} runners</span>
 </section>
@@ -38,12 +38,13 @@ const runnerDetailTemplate = `{{define "content"}}
 <section class="capability-grid">
   <div class="capability-card"><strong>Run slots</strong><span>{{.ActiveSlots}} / {{.Runner.MaxSlots}}</span><small>Prototype slot accounting</small></div>
   <div class="capability-card"><strong>Resource class</strong><span>{{.Runner.ResourceClass}}</span><small>Scheduling hint</small></div>
-  <div class="capability-card"><strong>Container runtime</strong><span>{{.Runner.ContainerRuntime}}</span><small>Podman-first direction</small></div>
+  <div class="capability-card"><strong>Container runtime</strong><span>{{.Runner.ContainerRuntime}}</span><small>Provider seam; Docker is not executable yet</small></div>
   <div class="capability-card"><strong>Repo availability</strong><span>{{.Runner.RepoAvailability}}</span><small>No remote mounts</small></div>
 </section>
 <section class="grid two">
   <div class="card">
     <h2>Agent profiles</h2>
+    <p class="hint">Active execution remains Pi-only. Codex, Claude Code, Gemini, and Copilot entries are planned/disabled registry metadata, not executable choices.</p>
     <div class="pill-list">{{range .Runner.AgentProfiles}}<span>{{agentProfileLabel .}}</span>{{end}}</div>
   </div>
   <div class="card">

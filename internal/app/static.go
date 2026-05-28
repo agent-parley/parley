@@ -53,8 +53,12 @@ button:disabled, button[aria-disabled="true"] { cursor: not-allowed; opacity: .5
 .actions p { margin: .25rem 0 0; }
 .list, .events { list-style: none; padding: 0; margin: 0; display: grid; gap: .65rem; }
 .list li, .events li { border-top: 1px solid var(--line); padding-top: .65rem; display: grid; gap: .2rem; }
-.list small, .events span, dd { color: var(--muted); overflow-wrap: anywhere; }
+.list small, .events span, .events small, dd { color: var(--muted); overflow-wrap: anywhere; }
 .planner-shell { align-items: start; }
+.planner-activity { margin-top: 1rem; border: 1px solid var(--line); border-radius: .9rem; padding: .85rem; background: rgba(2,6,23,.32); }
+.planner-activity .section-head { margin-bottom: .65rem; }
+.task-activity { display: grid; gap: .65rem; }
+.task-activity h2 { margin: 0; }
 .chat-panel { display: grid; gap: .85rem; }
 .bubble { border-radius: 1rem; padding: .85rem; display: grid; gap: .3rem; max-width: 92%; }
 .bubble.agent, .bubble.planner { background: rgba(139, 92, 246, .12); border: 1px solid rgba(139, 92, 246, .35); }

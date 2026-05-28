@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/agent-parley/parley/internal/config"
 	"github.com/agent-parley/parley/internal/pathsafe"
 )
 
@@ -38,6 +39,25 @@ type Result struct {
 
 type Runtime interface {
 	Run(ctx context.Context, invocation Invocation) (Result, error)
+}
+
+func NewRuntime(provider string) Runtime {
+	switch strings.TrimSpace(provider) {
+	case "", config.RuntimeProviderPodman:
+		return NewPodmanRuntime("podman")
+	case config.RuntimeProviderDocker:
+		return UnsupportedRuntime{Provider: config.RuntimeProviderDocker}
+	default:
+		return UnsupportedRuntime{Provider: provider}
+	}
+}
+
+type UnsupportedRuntime struct {
+	Provider string
+}
+
+func (r UnsupportedRuntime) Run(ctx context.Context, invocation Invocation) (Result, error) {
+	return Result{}, fmt.Errorf("runtime provider %q is unsupported", r.Provider)
 }
 
 type PodmanRuntime struct {

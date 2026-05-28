@@ -81,7 +81,14 @@ func (s *WorkflowService) runAttemptSafely(ctx context.Context, started store.St
 			result = executor.AttemptResult{Summary: "Attempt failed after a runner panic."}
 		}
 	}()
-	return s.runner.RunAttempt(ctx, executor.AttemptInput{Project: started.Project, Run: started.Run, Task: started.Task, Attempt: started.Attempt, Runner: started.Runner, Lease: started.Lease, ArtifactDir: attemptDir, ResumeCheckpoints: resumeCheckpoints})
+	progress := func(eventType, summary string, data map[string]any) {
+		progressData := map[string]any{"attempt": started.Attempt.Number}
+		for key, value := range data {
+			progressData[key] = value
+		}
+		s.emit(started.Run.ID, started.Task.ID, started.Runner.ID, started.Lease.ID, eventType, models.ActorKindRunner, summary, progressData)
+	}
+	return s.runner.RunAttempt(ctx, executor.AttemptInput{Project: started.Project, Run: started.Run, Task: started.Task, Attempt: started.Attempt, Runner: started.Runner, Lease: started.Lease, ArtifactDir: attemptDir, ResumeCheckpoints: resumeCheckpoints, Progress: progress})
 }
 
 func (s *WorkflowService) resumeCheckpoints(taskID string, beforeAttemptNumber int) []executor.Checkpoint {
