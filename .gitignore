@@ -1,0 +1,25 @@
+# Local runtime data
+.parley-data/
+.parley-smoke-dryrun/
+state.json
+parley.db*
+
+# Local Pi agent harness data
+.pi/
+
+# Go outputs
+/bin/
+/dist/
+*.test
+coverage.out
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+docs/
+plans/
+
+# Project-local planning scratch files
+plan.md
+progress.md
