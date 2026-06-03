@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <script type="module" src="/assets/datastar.min.js"></script>
+  <style>{{template "styles" .}}</style>
+</head>
+<body>
+  <main>
+    <header><h1>Parley</h1><p>Local-first manager control plane.</p></header>
+    <section class="card">
+      <h2>New run</h2>
+      <form method="post" action="/runs">
+        <input type="hidden" name="_csrf" value="{{.CSRF}}">
+        <label for="idea">Software idea</label>
+        <textarea id="idea" name="idea" required rows="5" placeholder="Describe the change you want Parley to drive through the workflow."></textarea>
+        <button type="submit">Start run</button>
+      </form>
+    </section>
+    <section class="card">
+      <h2>Runs</h2>
+      {{if .Runs}}
+      <ul class="run-list">
+        {{range .Runs}}
+        <li><a href="/runs/{{.ID}}"><strong>{{short .ID}}</strong></a> <span class="pill {{statusClass .Status}}">{{.Status}}</span><br><span>{{.Idea}}</span></li>
+        {{end}}
+      </ul>
+      {{else}}
+      <p>No runs yet.</p>
+      {{end}}
+    </section>
+  </main>
+</body>
+</html>

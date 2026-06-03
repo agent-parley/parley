@@ -1,0 +1,13 @@
+<section id="stage-statuses" class="card">
+  <h2>Stages</h2>
+  <ol class="stages">
+    {{range .Stages}}
+    <li>
+      <strong>{{.StageType}}</strong>
+      {{if .Adapter}}<span class="muted">adapter: {{.Adapter}}</span>{{else}}<span class="muted">actor: harness</span>{{end}}
+      <span class="pill {{statusClass .Status}}">{{.Status}}</span>
+      <br><small>{{.ID}}</small>
+    </li>
+    {{end}}
+  </ol>
+</section>

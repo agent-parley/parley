@@ -1,0 +1,12 @@
+<section id="artifacts" class="card">
+  <h2>Artifacts</h2>
+  {{if .Artifacts}}
+  <ul>
+    {{range .Artifacts}}
+    <li><a href="/artifacts/{{.ID}}">{{short .ID}}</a> <span class="muted">{{.Kind}} · {{.MediaType}}</span></li>
+    {{end}}
+  </ul>
+  {{else}}
+  <p>No artifacts yet.</p>
+  {{end}}
+</section>
