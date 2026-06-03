@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -16,6 +17,9 @@ import (
 type Server struct {
 	server   *http.Server
 	listener net.Listener
+
+	mu     sync.Mutex
+	active bool
 }
 
 func Listen() (*Server, string, error) {
@@ -54,6 +58,12 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
+	if !s.reserveSession() {
+		http.Error(w, "runner session already active", http.StatusConflict)
+		return
+	}
+	defer s.releaseSession()
+
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: []string{"localhost:*", "127.0.0.1:*"}})
 	if err != nil {
 		return
@@ -62,4 +72,20 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	_ = runner.New(sess)
 	sess.Start(context.Background())
 	<-sess.Done()
+}
+
+func (s *Server) reserveSession() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active {
+		return false
+	}
+	s.active = true
+	return true
+}
+
+func (s *Server) releaseSession() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.active = false
 }

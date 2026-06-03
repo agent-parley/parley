@@ -1,0 +1,12 @@
+<section id="event-log" class="card">
+  <h2>Event log</h2>
+  {{if .Events}}
+  <ol class="events">
+    {{range .Events}}
+    <li><span class="seq">#{{.Sequence}}</span> <strong>{{.Type}}</strong> <span class="muted">{{.Actor.Kind}}/{{.Actor.ID}}</span><br>{{.Summary}}</li>
+    {{end}}
+  </ol>
+  {{else}}
+  <p>No events yet.</p>
+  {{end}}
+</section>

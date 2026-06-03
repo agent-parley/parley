@@ -42,8 +42,8 @@ type HelloPayload struct {
 }
 
 type ReadyPayload struct {
-	RunnerID      string       `json:"runner_id"`
-	Capabilities  Capabilities `json:"capabilities"`
+	RunnerID     string       `json:"runner_id"`
+	Capabilities Capabilities `json:"capabilities"`
 }
 
 type Capabilities struct {

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <script type="module" src="/assets/datastar.min.js"></script>
+  <style>{{template "styles" .}}</style>
+</head>
+<body data-on:load="@get('/runs/{{.Bundle.Run.ID}}/events', {openWhenHidden: true})">
+  <main>
+    <nav><a href="/">← Runs</a></nav>
+    {{template "run_summary.html" .Bundle}}
+    {{template "stage_statuses.html" .Bundle}}
+    {{template "event_log.html" .Bundle}}
+    {{template "artifacts.html" .Bundle}}
+  </main>
+</body>
+</html>

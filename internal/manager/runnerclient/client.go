@@ -35,13 +35,15 @@ type Client struct {
 	cmd      *exec.Cmd
 	runnerID string
 	ready    protocol.ReadyPayload
+	pongCh   chan struct{}
 
-	mu       sync.RWMutex
-	onEvent  EventHandler
-	onReport ReportHandler
-	onResult ResultHandler
-	onLog    LogHandler
-	waiters  map[string]*dispatchWaiter
+	mu            sync.RWMutex
+	onEvent       EventHandler
+	onReport      ReportHandler
+	onResult      ResultHandler
+	onLog         LogHandler
+	reportWaiters map[string]*dispatchWaiter
+	resultWaiters map[string]*dispatchWaiter
 }
 
 type dispatchWaiter struct {
@@ -113,7 +115,7 @@ func Dial(ctx context.Context, url, runnerID string) (*Client, error) {
 		}
 		return nil, fmt.Errorf("dial runner websocket: %w", err)
 	}
-	c := &Client{session: protocol.NewSession(conn), runnerID: runnerID, waiters: map[string]*dispatchWaiter{}}
+	c := &Client{session: protocol.NewSession(conn), runnerID: runnerID, pongCh: make(chan struct{}, 1), reportWaiters: map[string]*dispatchWaiter{}, resultWaiters: map[string]*dispatchWaiter{}}
 	readyCh := make(chan protocol.ReadyPayload, 1)
 	c.session.Handle(protocol.TypeReady, func(ctx context.Context, msg protocol.Message) error {
 		ready, err := protocol.DecodePayload[protocol.ReadyPayload](msg)
@@ -126,7 +128,13 @@ func Dial(ctx context.Context, url, runnerID string) (*Client, error) {
 		}
 		return nil
 	})
-	c.session.Handle(protocol.TypePong, func(context.Context, protocol.Message) error { return nil })
+	c.session.Handle(protocol.TypePong, func(context.Context, protocol.Message) error {
+		select {
+		case c.pongCh <- struct{}{}:
+		default:
+		}
+		return nil
+	})
 	c.session.Handle(protocol.TypeEvent, c.handleEvent)
 	c.session.Handle(protocol.TypeReport, c.handleReport)
 	c.session.Handle(protocol.TypeResult, c.handleResult)
@@ -161,13 +169,16 @@ func (c *Client) SetHandlers(onEvent EventHandler, onReport ReportHandler, onRes
 
 func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.Report, error) {
 	waiter := &dispatchWaiter{reportCh: make(chan report.Report, 1), resultCh: make(chan protocol.ResultPayload, 1)}
-	key := disp.StageID
+	reportKey := disp.StageID
+	resultKey := resultWaiterKey(disp.RunID, disp.TaskID, disp.AttemptID)
 	c.mu.Lock()
-	c.waiters[key] = waiter
+	c.reportWaiters[reportKey] = waiter
+	c.resultWaiters[resultKey] = waiter
 	c.mu.Unlock()
 	defer func() {
 		c.mu.Lock()
-		delete(c.waiters, key)
+		delete(c.reportWaiters, reportKey)
+		delete(c.resultWaiters, resultKey)
 		c.mu.Unlock()
 	}()
 
@@ -205,7 +216,24 @@ func (c *Client) Cancel(ctx context.Context, runID, taskID string) error {
 }
 
 func (c *Client) Ping(ctx context.Context) error {
-	return c.send(ctx, protocol.TypePing, map[string]any{})
+	for {
+		select {
+		case <-c.pongCh:
+			continue
+		default:
+		}
+		if err := c.send(ctx, protocol.TypePing, map[string]any{}); err != nil {
+			return err
+		}
+		select {
+		case <-c.pongCh:
+			return nil
+		case <-c.session.Done():
+			return protocol.ErrSessionClosed
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 func (c *Client) Close(ctx context.Context) error {
@@ -251,7 +279,7 @@ func (c *Client) handleReport(ctx context.Context, msg protocol.Message) error {
 		return err
 	}
 	c.mu.RLock()
-	waiter := c.waiters[rep.StageID]
+	waiter := c.reportWaiters[rep.StageID]
 	handler := c.onReport
 	c.mu.RUnlock()
 	if waiter != nil {
@@ -272,11 +300,7 @@ func (c *Client) handleResult(ctx context.Context, msg protocol.Message) error {
 		return err
 	}
 	c.mu.RLock()
-	var waiter *dispatchWaiter
-	for _, candidate := range c.waiters {
-		waiter = candidate
-		break
-	}
+	waiter := c.resultWaiters[resultWaiterKey(result.RunID, result.TaskID, result.AttemptID)]
 	handler := c.onResult
 	c.mu.RUnlock()
 	if waiter != nil {
@@ -365,6 +389,10 @@ func parseReady(line string) (string, error) {
 		return "", fmt.Errorf("runner READY url %q is not a localhost session URL", url)
 	}
 	return url, nil
+}
+
+func resultWaiterKey(runID, taskID, attemptID string) string {
+	return runID + "/" + taskID + "/" + attemptID
 }
 
 func copyPrefixed(dst io.Writer, src io.Reader, prefix string) {

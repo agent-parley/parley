@@ -1,0 +1,6 @@
+<section id="run-summary" class="card">
+  <h1>Run {{short .Run.ID}}</h1>
+  <p class="idea">{{.Run.Idea}}</p>
+  <p>Status: <span class="pill {{statusClass .Run.Status}}">{{.Run.Status}}</span></p>
+  <p><small>Run ID: {{.Run.ID}}</small></p>
+</section>

@@ -1,0 +1,21 @@
+{{define "styles"}}
+:root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+body { margin: 0; background: #111827; color: #e5e7eb; }
+main { width: min(960px, calc(100vw - 32px)); margin: 32px auto; }
+a { color: #93c5fd; }
+.card { background: #1f2937; border: 1px solid #374151; border-radius: 12px; padding: 20px; margin: 16px 0; box-shadow: 0 10px 30px rgba(0,0,0,.18); }
+textarea, button { width: 100%; box-sizing: border-box; border-radius: 8px; border: 1px solid #4b5563; padding: 12px; font: inherit; }
+textarea { background: #111827; color: #f9fafb; margin: 8px 0 12px; }
+button { background: #2563eb; color: white; border: 0; cursor: pointer; font-weight: 700; }
+button:hover { background: #1d4ed8; }
+.run-list, .events { padding-left: 20px; }
+.run-list li, .events li, .stages li { margin: 12px 0; }
+.pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: .85rem; font-weight: 700; margin-left: 8px; }
+.status-completed { background: #065f46; color: #d1fae5; }
+.status-running { background: #1e40af; color: #dbeafe; }
+.status-failed { background: #7f1d1d; color: #fee2e2; }
+.status-pending { background: #4b5563; color: #f3f4f6; }
+.muted, small { color: #9ca3af; }
+.seq { color: #fbbf24; font-variant-numeric: tabular-nums; }
+.idea { white-space: pre-wrap; }
+{{end}}
