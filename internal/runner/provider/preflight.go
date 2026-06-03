@@ -141,9 +141,6 @@ func Preflight(inv PreparedInvocation, policy PreflightPolicy) error {
 		if lexical && !real {
 			continue
 		}
-		if !real {
-			errs = append(errs, fmt.Errorf("%w: %s", ErrPathOutsideRegisteredRoots, prefix))
-		}
 	}
 
 	return errors.Join(errs...)

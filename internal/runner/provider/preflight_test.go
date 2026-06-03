@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -132,6 +133,20 @@ func TestPreflightRejectsUnsafeInvocation(t *testing.T) {
 				t.Fatalf("Preflight() error = %v, want errors.Is(..., %v)", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestPreflightReportsOutsideRootOnce(t *testing.T) {
+	fixture := newPreflightFixture(t)
+	inv := fixture.invocation()
+	inv.Mounts[0].Host = fixture.outside
+
+	err := Preflight(inv, fixture.policy())
+	if !errors.Is(err, ErrPathOutsideRegisteredRoots) {
+		t.Fatalf("Preflight() error = %v, want outside-root sentinel", err)
+	}
+	if got := strings.Count(err.Error(), ErrPathOutsideRegisteredRoots.Error()); got != 1 {
+		t.Fatalf("outside-root error count = %d, want 1; error = %v", got, err)
 	}
 }
 
