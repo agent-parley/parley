@@ -7,6 +7,19 @@ import (
 	"github.com/agent-parley/parley/internal/shared/protocol"
 )
 
+func TestMergeEnvOverridesAndPreservesInheritedValues(t *testing.T) {
+	got := mergeEnv([]string{"A=1", "PARLEY_ADAPTER=noop", "B=2"}, []string{"PARLEY_ADAPTER=container_sample", "PARLEY_DATA_DIR=/tmp/parley"})
+	want := []string{"A=1", "PARLEY_ADAPTER=container_sample", "B=2", "PARLEY_DATA_DIR=/tmp/parley"}
+	if len(got) != len(want) {
+		t.Fatalf("mergeEnv len = %d, want %d: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("mergeEnv[%d] = %q, want %q (all %#v)", i, got[i], want[i], got)
+		}
+	}
+}
+
 func TestHandleResultRoutesByRunTaskAttempt(t *testing.T) {
 	first := &dispatchWaiter{resultCh: make(chan protocol.ResultPayload, 1)}
 	second := &dispatchWaiter{resultCh: make(chan protocol.ResultPayload, 1)}

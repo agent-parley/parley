@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/coder/websocket"
@@ -79,7 +80,7 @@ func (r *Runner) handleDispatch(ctx context.Context, msg protocol.Message) error
 	}
 
 	taskCtx, cancel := context.WithCancel(context.Background())
-	key := activeKey(disp.RunID, disp.TaskID)
+	key := activeKey(disp.RunID, disp.TaskID, disp.AttemptID)
 	r.mu.Lock()
 	r.active[key] = cancel
 	r.mu.Unlock()
@@ -115,9 +116,21 @@ func (r *Runner) handleCancel(ctx context.Context, msg protocol.Message) error {
 		return err
 	}
 	r.mu.Lock()
-	cancel := r.active[activeKey(payload.RunID, payload.TaskID)]
+	var cancels []context.CancelFunc
+	if payload.AttemptID != "" {
+		if cancel := r.active[activeKey(payload.RunID, payload.TaskID, payload.AttemptID)]; cancel != nil {
+			cancels = append(cancels, cancel)
+		}
+	} else {
+		prefix := activePrefix(payload.RunID, payload.TaskID)
+		for key, cancel := range r.active {
+			if strings.HasPrefix(key, prefix) {
+				cancels = append(cancels, cancel)
+			}
+		}
+	}
 	r.mu.Unlock()
-	if cancel != nil {
+	for _, cancel := range cancels {
 		cancel()
 	}
 	return nil
@@ -131,8 +144,12 @@ func (r *Runner) send(ctx context.Context, typ string, payload any) error {
 	return r.session.Send(ctx, msg)
 }
 
-func activeKey(runID, taskID string) string {
-	return runID + "/" + taskID
+func activeKey(runID, taskID, attemptID string) string {
+	return activePrefix(runID, taskID) + attemptID
+}
+
+func activePrefix(runID, taskID string) string {
+	return runID + "/" + taskID + "/"
 }
 
 type sessionSink struct {
@@ -141,6 +158,15 @@ type sessionSink struct {
 }
 
 func (s sessionSink) Emit(ctx context.Context, ev event.Event) error {
+	if ev.RunID == "" {
+		ev.RunID = s.disp.RunID
+	}
+	if ev.TaskID == "" {
+		ev.TaskID = s.disp.TaskID
+	}
+	if ev.AttemptID == "" {
+		ev.AttemptID = s.disp.AttemptID
+	}
 	msg, err := protocol.NewMessage(protocol.TypeEvent, ev)
 	if err != nil {
 		return err

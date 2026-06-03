@@ -54,8 +54,9 @@ type Capabilities struct {
 type DispatchPayload = contract.Dispatch
 
 type CancelPayload struct {
-	RunID  string `json:"run_id"`
-	TaskID string `json:"task_id"`
+	RunID     string `json:"run_id"`
+	TaskID    string `json:"task_id"`
+	AttemptID string `json:"attempt_id,omitempty"`
 }
 
 type EventPayload = event.Event

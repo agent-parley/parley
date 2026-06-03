@@ -66,6 +66,10 @@ func ResolveRunnerBinary() (string, error) {
 }
 
 func StartChild(ctx context.Context, runnerBin string) (*Client, error) {
+	return StartChildWithEnv(ctx, runnerBin, nil)
+}
+
+func StartChildWithEnv(ctx context.Context, runnerBin string, env []string) (*Client, error) {
 	if runnerBin == "" {
 		var err error
 		runnerBin, err = ResolveRunnerBinary()
@@ -74,6 +78,9 @@ func StartChild(ctx context.Context, runnerBin string) (*Client, error) {
 		}
 	}
 	cmd := exec.Command(runnerBin)
+	if len(env) > 0 {
+		cmd.Env = mergeEnv(os.Environ(), env)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("runner stdout pipe: %w", err)
@@ -159,6 +166,37 @@ func Dial(ctx context.Context, url, runnerID string) (*Client, error) {
 	return c, nil
 }
 
+func mergeEnv(base, overrides []string) []string {
+	positions := map[string]int{}
+	merged := append([]string{}, base...)
+	for i, value := range merged {
+		if key := envKey(value); key != "" {
+			positions[key] = i
+		}
+	}
+	for _, value := range overrides {
+		key := envKey(value)
+		if key == "" {
+			continue
+		}
+		if pos, ok := positions[key]; ok {
+			merged[pos] = value
+			continue
+		}
+		positions[key] = len(merged)
+		merged = append(merged, value)
+	}
+	return merged
+}
+
+func envKey(value string) string {
+	key, _, ok := strings.Cut(value, "=")
+	if !ok {
+		return ""
+	}
+	return key
+}
+
 func (c *Client) Ready() protocol.ReadyPayload { return c.ready }
 
 func (c *Client) SetHandlers(onEvent EventHandler, onArtifact ArtifactHandler, onReport ReportHandler, onResult ResultHandler, onLog LogHandler) {
@@ -194,7 +232,7 @@ func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.R
 	select {
 	case rep = <-waiter.reportCh:
 	case <-ctx.Done():
-		_ = c.Cancel(context.Background(), disp.RunID, disp.TaskID)
+		_ = c.CancelAttempt(context.Background(), disp.RunID, disp.TaskID, disp.AttemptID)
 		return report.Report{}, ctx.Err()
 	case <-c.session.Done():
 		return report.Report{}, protocol.ErrSessionClosed
@@ -216,7 +254,11 @@ func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.R
 }
 
 func (c *Client) Cancel(ctx context.Context, runID, taskID string) error {
-	return c.send(ctx, protocol.TypeCancel, protocol.CancelPayload{RunID: runID, TaskID: taskID})
+	return c.CancelAttempt(ctx, runID, taskID, "")
+}
+
+func (c *Client) CancelAttempt(ctx context.Context, runID, taskID, attemptID string) error {
+	return c.send(ctx, protocol.TypeCancel, protocol.CancelPayload{RunID: runID, TaskID: taskID, AttemptID: attemptID})
 }
 
 func (c *Client) Ping(ctx context.Context) error {

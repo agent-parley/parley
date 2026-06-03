@@ -16,6 +16,7 @@ type Config struct {
 	Addr      string
 	DataDir   string
 	RunnerBin string
+	Adapter   string
 }
 
 type App struct {
@@ -32,6 +33,9 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	if cfg.DataDir == "" {
 		cfg.DataDir = ".parley-data"
 	}
+	if cfg.Adapter == "" {
+		cfg.Adapter = "noop"
+	}
 
 	st, err := store.Open(ctx, cfg.DataDir)
 	if err != nil {
@@ -43,7 +47,10 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		return nil, err
 	}
 	hub := managerhttp.NewHub()
-	runner, err := runnerclient.StartChild(ctx, cfg.RunnerBin)
+	runner, err := runnerclient.StartChildWithEnv(ctx, cfg.RunnerBin, []string{
+		"PARLEY_ADAPTER=" + cfg.Adapter,
+		"PARLEY_DATA_DIR=" + cfg.DataDir,
+	})
 	if err != nil {
 		_ = st.Close()
 		return nil, err
@@ -53,7 +60,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		_ = st.Close()
 		return nil, err
 	}
-	engine := orchestrator.NewEngine(st, runner, renderer, hub)
+	engine := orchestrator.NewEngineWithOptions(st, runner, renderer, hub, orchestrator.EngineOptions{ImplementationAdapter: cfg.Adapter})
 	runner.SetHandlers(engine.HandleRunnerEvent, engine.HandleRunnerArtifact, engine.HandleRunnerReport, engine.HandleRunnerResult, engine.HandleRunnerLog)
 	httpServer := managerhttp.NewServer(cfg.Addr, st, engine, hub, renderer)
 	return &App{cfg: cfg, store: st, runner: runner, http: httpServer}, nil

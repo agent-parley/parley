@@ -15,7 +15,7 @@ import (
 
 type Runner interface {
 	Dispatch(context.Context, contract.Dispatch) (report.Report, error)
-	Cancel(context.Context, string, string) error
+	CancelAttempt(context.Context, string, string, string) error
 }
 
 type FragmentRenderer interface {
@@ -27,15 +27,28 @@ type Broadcaster interface {
 }
 
 type Engine struct {
-	store     *store.Store
-	runner    Runner
-	renderer  FragmentRenderer
-	broadcast Broadcaster
-	graph     Graph
+	store                 *store.Store
+	runner                Runner
+	renderer              FragmentRenderer
+	broadcast             Broadcaster
+	graph                 Graph
+	implementationAdapter string
+}
+
+type EngineOptions struct {
+	ImplementationAdapter string
 }
 
 func NewEngine(st *store.Store, runner Runner, renderer FragmentRenderer, broadcast Broadcaster) *Engine {
-	return &Engine{store: st, runner: runner, renderer: renderer, broadcast: broadcast, graph: NewGraph()}
+	return NewEngineWithOptions(st, runner, renderer, broadcast, EngineOptions{})
+}
+
+func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRenderer, broadcast Broadcaster, opts EngineOptions) *Engine {
+	implementationAdapter := opts.ImplementationAdapter
+	if implementationAdapter == "" {
+		implementationAdapter = "noop"
+	}
+	return &Engine{store: st, runner: runner, renderer: renderer, broadcast: broadcast, graph: NewGraph(), implementationAdapter: implementationAdapter}
 }
 
 func (e *Engine) StartRun(ctx context.Context, idea string) (string, error) {
@@ -58,7 +71,7 @@ func (e *Engine) CancelRun(ctx context.Context, runID string) error {
 	if err != nil {
 		return err
 	}
-	return e.runner.Cancel(ctx, wr.Run.ID, wr.Task.ID)
+	return e.runner.CancelAttempt(ctx, wr.Run.ID, wr.Task.ID, wr.Attempt.ID)
 }
 
 func (e *Engine) HandleRunnerEvent(ctx context.Context, ev event.Event) error {
@@ -93,13 +106,14 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 		return err
 	}
 
+	implementationAdapter := e.implementationAdapter
 	disp := contract.Dispatch{
 		RunID:     wr.Run.ID,
 		TaskID:    wr.Task.ID,
 		AttemptID: wr.Attempt.ID,
 		StageID:   wr.ImplementationStage.ID,
 		StageType: contract.StageTypeImplementation,
-		Adapter:   "noop",
+		Adapter:   implementationAdapter,
 		Input:     map[string]any{"idea": wr.Run.Idea},
 	}
 	implementationReport, err := e.runner.Dispatch(ctx, disp)
@@ -111,7 +125,7 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 			AttemptID:     wr.Attempt.ID,
 			StageID:       wr.ImplementationStage.ID,
 			StageType:     contract.StageTypeImplementation,
-			Actor:         report.Actor{Kind: report.ActorKindAgent, ID: "noop"},
+			Actor:         report.Actor{Kind: report.ActorKindAgent, ID: implementationAdapter},
 			Status:        report.StatusFailed,
 			Summary:       "dispatch failed",
 			Payload:       map[string]any{},

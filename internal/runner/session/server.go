@@ -11,23 +11,36 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/agent-parley/parley/internal/runner"
+	"github.com/agent-parley/parley/internal/runner/adapter"
 	"github.com/agent-parley/parley/internal/shared/protocol"
 )
 
 type Server struct {
 	server   *http.Server
 	listener net.Listener
+	adapters []adapter.AgentAdapter
 
 	mu     sync.Mutex
 	active bool
 }
 
-func Listen() (*Server, string, error) {
+type Option func(*Server)
+
+func WithAdapters(adapters ...adapter.AgentAdapter) Option {
+	return func(s *Server) {
+		s.adapters = append(s.adapters, adapters...)
+	}
+}
+
+func Listen(opts ...Option) (*Server, string, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, "", fmt.Errorf("listen runner session: %w", err)
 	}
 	s := &Server{listener: ln}
+	for _, opt := range opts {
+		opt(s)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/session", s.handleSession)
 	s.server = &http.Server{Handler: mux}
@@ -69,7 +82,10 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sess := protocol.NewSession(conn)
-	_ = runner.New(sess)
+	run := runner.New(sess)
+	for _, a := range s.adapters {
+		run.Register(a)
+	}
 	sess.Start(context.Background())
 	<-sess.Done()
 }
