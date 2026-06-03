@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	managerhttp "github.com/agent-parley/parley/internal/manager/http"
@@ -60,7 +61,12 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		_ = st.Close()
 		return nil, err
 	}
-	engine := orchestrator.NewEngineWithOptions(st, runner, renderer, hub, orchestrator.EngineOptions{ImplementationAdapter: cfg.Adapter})
+	engine := orchestrator.NewEngineWithOptions(st, runner, renderer, hub, orchestrator.EngineOptions{
+		ImplementationAdapter: cfg.Adapter,
+		ValidationAdapter:     "validation",
+		DataRoot:              cfg.DataDir,
+		ProjectID:             getenv("PARLEY_PROJECT_ID", "default"),
+	})
 	runner.SetHandlers(engine.HandleRunnerEvent, engine.HandleRunnerArtifact, engine.HandleRunnerReport, engine.HandleRunnerResult, engine.HandleRunnerLog)
 	httpServer := managerhttp.NewServer(cfg.Addr, st, engine, hub, renderer)
 	return &App{cfg: cfg, store: st, runner: runner, http: httpServer}, nil
@@ -83,6 +89,13 @@ func (a *App) Run(ctx context.Context) error {
 		_ = a.close(shutdownCtx)
 		return err
 	}
+}
+
+func getenv(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func (a *App) close(ctx context.Context) error {

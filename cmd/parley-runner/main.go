@@ -36,13 +36,14 @@ func main() {
 }
 
 func configuredAdapters() ([]adapter.AgentAdapter, error) {
+	validation := validationAdapter()
 	switch name := os.Getenv("PARLEY_ADAPTER"); name {
 	case "", "noop":
-		return nil, nil
+		return []adapter.AgentAdapter{validation}, nil
 	case "container_sample":
-		return []adapter.AgentAdapter{containerSampleAdapter()}, nil
+		return []adapter.AgentAdapter{containerSampleAdapter(), validation}, nil
 	case "pi":
-		return []adapter.AgentAdapter{piAdapter()}, nil
+		return []adapter.AgentAdapter{piAdapter(), validation}, nil
 	default:
 		return nil, fmt.Errorf("unsupported PARLEY_ADAPTER %q", name)
 	}
@@ -91,6 +92,55 @@ func containerSampleAdapter() adapter.AgentAdapter {
 		ReferenceRoot:  referenceRoot,
 		AgentStateRoot: agentStateRoot,
 		Image:          os.Getenv("PARLEY_CONTAINER_IMAGE"),
+	})
+}
+
+func validationAdapter() adapter.AgentAdapter {
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "."
+	}
+	dataRoot := cleanPath(getenv("PARLEY_DATA_DIR", ".parley-data"))
+	sourceRepo := cleanPath(getenv("PARLEY_SOURCE_REPO", cwd))
+	artifactDir := cleanOptionalPath(os.Getenv("PARLEY_ARTIFACT_DIR"))
+	referenceRoot := cleanOptionalPath(os.Getenv("PARLEY_REFERENCE_ROOT"))
+	if referenceRoot == "" && pathExists("/project/reference") {
+		referenceRoot = "/project/reference"
+	}
+	agentStateRoot := cleanOptionalPath(os.Getenv("PARLEY_AGENT_STATE_ROOT"))
+
+	artifactRoots := []string{dataRoot}
+	if artifactDir != "" {
+		artifactRoots = append(artifactRoots, artifactDir)
+	}
+	referenceRoots := []string{}
+	if referenceRoot != "" {
+		referenceRoots = append(referenceRoots, referenceRoot)
+	}
+
+	podman := provider.NewPodman(provider.PreflightPolicy{
+		RepoRoots:       []string{sourceRepo},
+		WorktreeRoots:   []string{dataRoot},
+		ArtifactRoots:   artifactRoots,
+		ReferenceRoots:  referenceRoots,
+		AgentStateRoot:  agentStateRoot,
+		AllowedNetworks: parseNetworks(os.Getenv("PARLEY_VALIDATION_ALLOWED_NETWORKS")),
+	})
+	if executable := getenv("PARLEY_PODMAN_EXECUTABLE", os.Getenv("PARLEY_PODMAN")); executable != "" {
+		podman.Executable = executable
+	}
+
+	return adapter.NewValidation(adapter.ValidationOptions{
+		Provider:       podman,
+		DataRoot:       dataRoot,
+		ProjectID:      getenv("PARLEY_PROJECT_ID", "default"),
+		SourceRepo:     sourceRepo,
+		ArtifactDir:    artifactDir,
+		ReferenceRoot:  referenceRoot,
+		AgentStateRoot: agentStateRoot,
+		Image:          getenv("PARLEY_VALIDATION_IMAGE", os.Getenv("PARLEY_CONTAINER_IMAGE")),
+		Command:        getenv("PARLEY_VALIDATION_CMD", ""),
+		Network:        validationNetworkFromEnv(),
 	})
 }
 
@@ -153,6 +203,16 @@ func getenv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func validationNetworkFromEnv() provider.Network {
+	if network := os.Getenv("PARLEY_VALIDATION_NETWORK"); network != "" {
+		return provider.Network(network)
+	}
+	if os.Getenv("PARLEY_VALIDATION_ALLOW_FULL_EGRESS") == "1" {
+		return provider.NetworkBridge
+	}
+	return provider.NetworkNone
 }
 
 func piNetworkFromEnv() provider.Network {

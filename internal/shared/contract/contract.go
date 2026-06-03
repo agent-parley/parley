@@ -2,8 +2,11 @@ package contract
 
 // Stage type names are protocol-visible and must remain stable.
 const (
+	StageTypeIdeaIntake     = "idea_intake"
 	StageTypeImplementation = "implementation"
 	StageTypeValidation     = "validation"
+	StageTypeCommit         = "commit"
+	StageTypePRReady        = "pr_ready"
 )
 
 // Dispatch is the Manager -> Runner input for an adapter stage.
@@ -17,7 +20,7 @@ type Dispatch struct {
 	Input     map[string]any `json:"input"`
 }
 
-// TaskInput is the minimal user-submitted task shape for M1.
+// TaskInput is the minimal user-submitted task shape.
 type TaskInput struct {
 	Idea string `json:"idea"`
 }

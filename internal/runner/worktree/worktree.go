@@ -34,6 +34,35 @@ type Worktree struct {
 	TaskID     string
 }
 
+// Path returns the canonical harness path for a task worktree.
+func Path(opts CreateOptions) string {
+	path := filepath.Join(opts.DataRoot, "projects", opts.ProjectID, "worktrees", opts.RunID, opts.TaskID)
+	if opts.AttemptID != "" {
+		path = filepath.Join(path, opts.AttemptID)
+	}
+	return path
+}
+
+// Locate returns the existing worktree path for a run/task. It prefers the
+// attempt-scoped path used by newer adapters, then falls back to the original
+// run/task path used by the M2 sample adapter.
+func Locate(dataRoot, projectID, runID, taskID, attemptID string) (string, error) {
+	if projectID == "" {
+		projectID = "default"
+	}
+	if attemptID != "" {
+		attemptPath := Path(CreateOptions{DataRoot: dataRoot, ProjectID: projectID, RunID: runID, TaskID: taskID, AttemptID: attemptID})
+		if isGitWorktree(attemptPath) {
+			return attemptPath, nil
+		}
+	}
+	legacyPath := Path(CreateOptions{DataRoot: dataRoot, ProjectID: projectID, RunID: runID, TaskID: taskID})
+	if isGitWorktree(legacyPath) {
+		return legacyPath, nil
+	}
+	return "", fmt.Errorf("worktree not found for run %s task %s", runID, taskID)
+}
+
 // Create creates a real git worktree for one task attempt.
 func Create(ctx context.Context, opts CreateOptions) (Worktree, error) {
 	if opts.DataRoot == "" {
@@ -54,10 +83,7 @@ func Create(ctx context.Context, opts CreateOptions) (Worktree, error) {
 		baseRef = "HEAD"
 	}
 
-	path := filepath.Join(opts.DataRoot, "projects", opts.ProjectID, "worktrees", opts.RunID, opts.TaskID)
-	if opts.AttemptID != "" {
-		path = filepath.Join(path, opts.AttemptID)
-	}
+	path := Path(opts)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return Worktree{}, fmt.Errorf("create worktree parent: %w", err)
 	}
@@ -100,6 +126,20 @@ func CaptureDiff(ctx context.Context, worktreePath, outputPath string) ([]byte, 
 		}
 	}
 	return diff, nil
+}
+
+func isGitWorktree(path string) bool {
+	if path == "" {
+		return false
+	}
+	if info, err := os.Stat(path); err != nil || !info.IsDir() {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(path, ".git")); err == nil {
+		return true
+	}
+	out, err := runGit(context.Background(), "git", path, "rev-parse", "--is-inside-work-tree")
+	return err == nil && string(bytes.TrimSpace(out)) == "true"
 }
 
 func tempIndex(ctx context.Context, worktreePath string) (string, func(), error) {

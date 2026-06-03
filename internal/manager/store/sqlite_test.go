@@ -44,7 +44,7 @@ func TestStorePersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run bundle: %v", err)
 	}
-	if len(bundle.Stages) != 2 || len(bundle.Events) != 1 || len(bundle.Artifacts) != 2 {
+	if len(bundle.Stages) != 5 || len(bundle.Events) != 1 || len(bundle.Artifacts) != 2 {
 		t.Fatalf("unexpected bundle counts: stages=%d events=%d artifacts=%d", len(bundle.Stages), len(bundle.Events), len(bundle.Artifacts))
 	}
 }
@@ -63,14 +63,20 @@ func TestGetWorkflowRunSelectsLatestAttemptStages(t *testing.T) {
 
 	later := "2099-01-01T00:00:00Z"
 	attemptID := "attempt_later"
+	ideaStageID := "stage_idea_later"
 	implStageID := "stage_impl_later"
 	validationStageID := "stage_validation_later"
+	commitStageID := "stage_commit_later"
+	prReadyStageID := "stage_pr_ready_later"
 	if _, err := st.DB().ExecContext(ctx, `INSERT INTO attempts(id, run_id, task_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`, attemptID, wr.Run.ID, wr.Task.ID, RunStatusPending, later, later); err != nil {
 		t.Fatalf("insert later attempt: %v", err)
 	}
 	for _, stage := range []Stage{
+		{ID: ideaStageID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypeIdeaIntake, Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
 		{ID: implStageID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypeImplementation, Adapter: "noop", Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
-		{ID: validationStageID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypeValidation, Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
+		{ID: validationStageID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypeValidation, Adapter: "validation", Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
+		{ID: commitStageID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypeCommit, Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
+		{ID: prReadyStageID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypePRReady, Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
 	} {
 		if _, err := st.DB().ExecContext(ctx, `INSERT INTO stages(id, run_id, task_id, attempt_id, stage_type, adapter, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, stage.ID, stage.RunID, stage.TaskID, stage.AttemptID, stage.StageType, stage.Adapter, stage.Status, stage.CreatedAt, stage.UpdatedAt); err != nil {
 			t.Fatalf("insert later stage %s: %v", stage.ID, err)
@@ -84,10 +90,19 @@ func TestGetWorkflowRunSelectsLatestAttemptStages(t *testing.T) {
 	if got.Attempt.ID != attemptID {
 		t.Fatalf("Attempt.ID = %q, want %q", got.Attempt.ID, attemptID)
 	}
+	if got.IdeaIntakeStage.ID != ideaStageID || got.IdeaIntakeStage.AttemptID != attemptID {
+		t.Fatalf("IdeaIntakeStage = %+v, want latest attempt stage", got.IdeaIntakeStage)
+	}
 	if got.ImplementationStage.ID != implStageID || got.ImplementationStage.AttemptID != attemptID {
 		t.Fatalf("ImplementationStage = %+v, want latest attempt stage", got.ImplementationStage)
 	}
 	if got.ValidationStage.ID != validationStageID || got.ValidationStage.AttemptID != attemptID {
 		t.Fatalf("ValidationStage = %+v, want latest attempt stage", got.ValidationStage)
+	}
+	if got.CommitStage.ID != commitStageID || got.CommitStage.AttemptID != attemptID {
+		t.Fatalf("CommitStage = %+v, want latest attempt stage", got.CommitStage)
+	}
+	if got.PRReadyStage.ID != prReadyStageID || got.PRReadyStage.AttemptID != attemptID {
+		t.Fatalf("PRReadyStage = %+v, want latest attempt stage", got.PRReadyStage)
 	}
 }

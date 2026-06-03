@@ -14,14 +14,26 @@ func TestGraphRoutesStatuses(t *testing.T) {
 		status string
 		want   string
 	}{
+		{contract.StageTypeIdeaIntake, report.StatusCompleted, NodeImplementation},
+		{contract.StageTypeIdeaIntake, report.StatusFailed, NodeStopReport},
+		{contract.StageTypeIdeaIntake, report.StatusInvalid, NodeStopReport},
+		{contract.StageTypeIdeaIntake, report.StatusNeedsInput, NodeStopReport},
 		{contract.StageTypeImplementation, report.StatusCompleted, NodeValidation},
 		{contract.StageTypeImplementation, report.StatusFailed, NodeStopReport},
 		{contract.StageTypeImplementation, report.StatusInvalid, NodeStopReport},
 		{contract.StageTypeImplementation, report.StatusNeedsInput, NodeStopReport},
-		{contract.StageTypeValidation, report.StatusCompleted, NodeDone},
+		{contract.StageTypeValidation, report.StatusCompleted, NodeCommit},
 		{contract.StageTypeValidation, report.StatusFailed, NodeStopReport},
 		{contract.StageTypeValidation, report.StatusInvalid, NodeStopReport},
 		{contract.StageTypeValidation, report.StatusNeedsInput, NodeStopReport},
+		{contract.StageTypeCommit, report.StatusCompleted, NodePRReady},
+		{contract.StageTypeCommit, report.StatusFailed, NodeStopReport},
+		{contract.StageTypeCommit, report.StatusInvalid, NodeStopReport},
+		{contract.StageTypeCommit, report.StatusNeedsInput, NodeStopReport},
+		{contract.StageTypePRReady, report.StatusCompleted, NodeDone},
+		{contract.StageTypePRReady, report.StatusFailed, NodeStopReport},
+		{contract.StageTypePRReady, report.StatusInvalid, NodeStopReport},
+		{contract.StageTypePRReady, report.StatusNeedsInput, NodeStopReport},
 	}
 	for _, tt := range tests {
 		t.Run(tt.stage+"."+tt.status, func(t *testing.T) {

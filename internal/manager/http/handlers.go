@@ -79,7 +79,7 @@ func (s *Server) handleRunDetail(w http.ResponseWriter, r *http.Request, runID s
 		http.NotFound(w, r)
 		return
 	}
-	s.writePage(w, "run.html", web.RunData{Bundle: bundle, CSRF: csrfFromContext(r.Context()), Title: "Run " + runID})
+	s.writePage(w, "run.html", web.NewRunData(bundle, csrfFromContext(r.Context()), "Run "+runID))
 }
 
 func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request, runID string) {
@@ -137,6 +137,10 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method", http.StatusMethodNotAllowed)
 		return
 	}
+	if r.URL.RawQuery != "" {
+		http.NotFound(w, r)
+		return
+	}
 	artifactID := strings.TrimPrefix(r.URL.Path, "/artifacts/")
 	if artifactID == "" || strings.Contains(artifactID, "/") {
 		http.NotFound(w, r)
@@ -147,8 +151,20 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if artifactIsHTML(artifact.MediaType) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", artifact.ID+".html"))
+		_, _ = w.Write(content)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = fmt.Fprintf(w, "<!doctype html><title>%s</title><pre>%s</pre>", template.HTMLEscapeString(artifact.ID), template.HTMLEscapeString(string(content)))
+}
+
+func artifactIsHTML(mediaType string) bool {
+	mediaType = strings.ToLower(mediaType)
+	return strings.HasPrefix(mediaType, "text/html") || strings.Contains(mediaType, "html")
 }
 
 func (s *Server) writePage(w http.ResponseWriter, name string, data any) {

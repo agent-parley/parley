@@ -1,0 +1,12 @@
+<section id="diff-patch" class="card">
+  <h2>diff.patch</h2>
+  {{if .PRReady.Ready}}
+  <p>PR-ready branch: <code>{{.PRReady.Branch}}</code>{{if .PRReady.CommitSHA}} · commit <code>{{.PRReady.CommitSHA}}</code>{{end}}</p>
+  {{end}}
+  {{if .DiffPatch.ID}}
+  <p><a href="/artifacts/{{.DiffPatch.ID}}">Artifact {{short .DiffPatch.ID}}</a></p>
+  <pre class="diff-preview">{{.DiffPatch.Preview}}</pre>
+  {{else}}
+  <p>No diff.patch artifact yet.</p>
+  {{end}}
+</section>
