@@ -273,7 +273,7 @@ func (a Pi) network() provider.Network {
 	if a.opts.Network != "" {
 		return a.opts.Network
 	}
-	return provider.NetworkBridge
+	return provider.NetworkNone
 }
 
 func (a Pi) piCommand(prompt string) []string {

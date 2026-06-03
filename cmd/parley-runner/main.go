@@ -144,7 +144,7 @@ func piAdapter() adapter.AgentAdapter {
 		PiProvider:         getenv("PARLEY_PI_PROVIDER", ""),
 		Model:              getenv("PARLEY_PI_MODEL", ""),
 		Thinking:           getenv("PARLEY_PI_THINKING", ""),
-		Network:            provider.Network(os.Getenv("PARLEY_PI_NETWORK")),
+		Network:            piNetworkFromEnv(),
 	})
 }
 
@@ -153,6 +153,16 @@ func getenv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func piNetworkFromEnv() provider.Network {
+	if network := os.Getenv("PARLEY_PI_NETWORK"); network != "" {
+		return provider.Network(network)
+	}
+	if os.Getenv("PARLEY_PI_ALLOW_FULL_EGRESS") == "1" {
+		return provider.NetworkBridge
+	}
+	return provider.NetworkNone
 }
 
 func parseNetworks(raw string) []provider.Network {

@@ -61,6 +61,7 @@ func TestPiPrepareBuildsPreflightSafeInvocationAndInputFiles(t *testing.T) {
 		ReferenceRoot:      reference,
 		AgentStateRoot:     agentState,
 		Image:              "localhost/test-pi:latest",
+		Network:            provider.NetworkBridge,
 		AppendSystemExtra:  "extra verification rule",
 	})
 	prepared, err := adapter.Prepare(ctx, piTestDispatch())
