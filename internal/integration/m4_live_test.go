@@ -145,9 +145,20 @@ func TestM4PiFullLoopLive(t *testing.T) {
 			t.Logf("STAGE %-16s status=%s adapter=%s", s.StageType, s.Status, s.Adapter)
 		}
 		for _, ev := range bundle.Events {
-			l := strings.ToLower(ev.Type + " " + ev.Summary)
-			if strings.Contains(l, "fail") || strings.Contains(l, "invalid") || strings.Contains(l, "error") {
-				t.Logf("EVENT [%s] %q data=%v", ev.Type, ev.Summary, ev.Data)
+			sum := ev.Summary
+			if len(sum) > 240 {
+				sum = sum[:240] + "…"
+			}
+			t.Logf("EV [%s] %s", ev.Type, sum)
+			if id, ok := ev.Data["report_artifact_id"].(string); ok && id != "" {
+				if _, content, gerr := st.GetArtifact(ctx, id); gerr == nil {
+					t.Logf("  -> report %s: %s", id, string(content))
+				}
+			}
+			if id, ok := ev.Data["diff_artifact_id"].(string); ok && id != "" {
+				if _, content, gerr := st.GetArtifact(ctx, id); gerr == nil {
+					t.Logf("  -> diff %s bytes=%d", id, len(content))
+				}
 			}
 		}
 		t.Fatalf("live M4 run status=%s events=%d artifacts=%d", bundle.Run.Status, len(bundle.Events), len(bundle.Artifacts))
