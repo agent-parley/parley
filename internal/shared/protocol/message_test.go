@@ -1,6 +1,7 @@
 package protocol_test
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,38 @@ import (
 
 	"github.com/agent-parley/parley/internal/shared/protocol"
 )
+
+func TestArtifactPayloadRoundTrip(t *testing.T) {
+	// Binary content (including a NUL byte) must survive the JSON base64 round-trip.
+	content := []byte{0x00, 0x01, 'd', 'i', 'f', 'f', 0xff}
+	in := protocol.ArtifactPayload{
+		RunID:      "run_1",
+		TaskID:     "task_1",
+		AttemptID:  "attempt_1",
+		ArtifactID: "artifact_1",
+		Name:       "diff.patch",
+		Kind:       "diff",
+		MediaType:  "text/x-diff",
+		Content:    content,
+	}
+	msg, err := protocol.NewMessage(protocol.TypeArtifact, in)
+	if err != nil {
+		t.Fatalf("encode artifact: %v", err)
+	}
+	if msg.Type != protocol.TypeArtifact {
+		t.Fatalf("unexpected type %q", msg.Type)
+	}
+	out, err := protocol.DecodePayload[protocol.ArtifactPayload](msg)
+	if err != nil {
+		t.Fatalf("decode artifact: %v", err)
+	}
+	if out.ArtifactID != in.ArtifactID || out.Name != in.Name || out.Kind != in.Kind {
+		t.Fatalf("metadata mismatch: %+v", out)
+	}
+	if !bytes.Equal(out.Content, content) {
+		t.Fatalf("content mismatch: got %v want %v", out.Content, content)
+	}
+}
 
 func TestSessionRoundTripHandshakeAndPing(t *testing.T) {
 	serverReady := make(chan struct{})

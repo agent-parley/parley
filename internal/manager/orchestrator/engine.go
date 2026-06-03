@@ -169,9 +169,6 @@ func (e *Engine) completeStage(ctx context.Context, wr store.WorkflowRun, stage 
 			Errors:        []string{err.Error()},
 		}
 	}
-	if err := e.materializeAdapterArtifact(ctx, rep); err != nil {
-		return err
-	}
 	artifact, err := e.store.SaveReportArtifact(ctx, rep)
 	if err != nil {
 		return err
@@ -188,44 +185,44 @@ func (e *Engine) completeStage(ctx context.Context, wr store.WorkflowRun, stage 
 	return err
 }
 
-func (e *Engine) materializeAdapterArtifact(ctx context.Context, rep report.Report) error {
-	if rep.Payload == nil {
-		return nil
+// HandleRunnerArtifact persists an artifact transferred over the runner session.
+// Artifacts are first-class (0066/0068): they arrive before the report that
+// references them in evidence_refs, never inlined in the report payload.
+func (e *Engine) HandleRunnerArtifact(ctx context.Context, art protocol.ArtifactPayload) error {
+	kind := art.Kind
+	if kind == "" {
+		kind = "adapter_output"
 	}
-	raw, ok := rep.Payload["artifact"]
-	if !ok {
-		return nil
+	mediaType := art.MediaType
+	if mediaType == "" {
+		mediaType = "application/octet-stream"
 	}
-	artifactMap, ok := raw.(map[string]any)
-	if !ok {
-		return nil
-	}
-	artifactID, _ := artifactMap["id"].(string)
-	content, _ := artifactMap["content"].(string)
-	name, _ := artifactMap["name"].(string)
-	if artifactID == "" || content == "" {
-		return nil
-	}
-	ext := filepath.Ext(name)
+	ext := filepath.Ext(art.Name)
 	if ext == "" {
 		ext = ".txt"
 	}
-	_, err := e.store.SaveArtifactWithID(ctx, artifactID, rep.RunID, "adapter_output", "text/plain", []byte(content), ext)
+	_, err := e.store.SaveArtifactWithID(ctx, art.ArtifactID, art.RunID, kind, mediaType, art.Content, ext)
 	return err
 }
 
 func (e *Engine) stopRun(ctx context.Context, wr store.WorkflowRun, status, summary string) error {
+	// Map to the documented run.* terminal taxonomy (event.schema.md): failed and
+	// invalid are failure terminals; needs_input has no resume path in the skeleton
+	// so it terminates as abandoned.
 	runStatus := store.RunStatusFailed
+	eventType := "run.failed"
 	switch status {
 	case report.StatusInvalid:
 		runStatus = store.RunStatusInvalid
+		eventType = "run.failed"
 	case report.StatusNeedsInput:
 		runStatus = store.RunStatusNeedsInput
+		eventType = "run.abandoned"
 	}
 	if err := e.store.UpdateRunStatus(ctx, wr.Run.ID, runStatus); err != nil {
 		return err
 	}
-	_, err := e.emit(ctx, runEvent(wr, "run.stopped", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, summary, map[string]any{"terminal_status": runStatus}))
+	_, err := e.emit(ctx, runEvent(wr, eventType, event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, summary, map[string]any{"terminal_status": runStatus}))
 	return err
 }
 
@@ -259,11 +256,32 @@ func stageEvent(wr store.WorkflowRun, stage store.Stage, typ string, actor event
 	return event.Event{SchemaVersion: event.SchemaVersion, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, Type: typ, Actor: actor, Summary: summary, Data: data}
 }
 
+// completionEventType maps a stage report to an outcome-faithful event type
+// (0068 + event.schema.md). `invalid` is a non-success terminal, so it shares the
+// `.failed` type; the precise status travels in the event's `status` data field.
+// needs_input does not arise from skeleton stages; it folds into `.failed` until
+// human-input stages land (M4+), which will route it to approval.requested.
+// Note: event.schema.md does not yet define harness.* completion types; emitting
+// them here keeps the actor and the type consistent (tracked as a schema follow-up).
 func completionEventType(rep report.Report) string {
-	if rep.Actor.Kind == report.ActorKindAgent {
+	failed := rep.Status != report.StatusCompleted
+	switch rep.Actor.Kind {
+	case report.ActorKindAgent:
+		if failed {
+			return "adapter.failed"
+		}
 		return "adapter.completed"
+	case report.ActorKindHarness:
+		if failed {
+			return "harness.failed"
+		}
+		return "harness.completed"
+	default:
+		if failed {
+			return "task.failed"
+		}
+		return "task.completed"
 	}
-	return "harness.completed"
 }
 
 func reportActor(actor report.Actor, stage store.Stage) event.Actor {

@@ -8,6 +8,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/agent-parley/parley/internal/runner/adapter"
+	"github.com/agent-parley/parley/internal/runner/runnerio"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/protocol"
@@ -141,6 +142,23 @@ type sessionSink struct {
 
 func (s sessionSink) Emit(ctx context.Context, ev event.Event) error {
 	msg, err := protocol.NewMessage(protocol.TypeEvent, ev)
+	if err != nil {
+		return err
+	}
+	return s.session.Send(ctx, msg)
+}
+
+func (s sessionSink) Artifact(ctx context.Context, art runnerio.Artifact) error {
+	msg, err := protocol.NewMessage(protocol.TypeArtifact, protocol.ArtifactPayload{
+		RunID:      s.disp.RunID,
+		TaskID:     s.disp.TaskID,
+		AttemptID:  s.disp.AttemptID,
+		ArtifactID: art.ID,
+		Name:       art.Name,
+		Kind:       art.Kind,
+		MediaType:  art.MediaType,
+		Content:    art.Content,
+	})
 	if err != nil {
 		return err
 	}

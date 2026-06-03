@@ -54,7 +54,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		return nil, err
 	}
 	engine := orchestrator.NewEngine(st, runner, renderer, hub)
-	runner.SetHandlers(engine.HandleRunnerEvent, engine.HandleRunnerReport, engine.HandleRunnerResult, engine.HandleRunnerLog)
+	runner.SetHandlers(engine.HandleRunnerEvent, engine.HandleRunnerArtifact, engine.HandleRunnerReport, engine.HandleRunnerResult, engine.HandleRunnerLog)
 	httpServer := managerhttp.NewServer(cfg.Addr, st, engine, hub, renderer)
 	return &App{cfg: cfg, store: st, runner: runner, http: httpServer}, nil
 }

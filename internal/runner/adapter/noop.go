@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/agent-parley/parley/internal/runner/runnerio"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/ids"
@@ -15,7 +16,7 @@ type Noop struct{}
 
 func (Noop) Name() string { return "noop" }
 
-func (Noop) Run(ctx context.Context, disp contract.Dispatch, sink EventSink) (report.Report, error) {
+func (Noop) Run(ctx context.Context, disp contract.Dispatch, sink runnerio.Sink) (report.Report, error) {
 	if err := sink.Emit(ctx, progressEvent(disp, "noop adapter started", map[string]any{"step": "start"})); err != nil {
 		return report.Report{}, err
 	}
@@ -37,19 +38,22 @@ func (Noop) Run(ctx context.Context, disp contract.Dispatch, sink EventSink) (re
 	}
 
 	artifactID := ids.New("artifact")
-	payload := map[string]any{
-		"noop": true,
-		"artifact": map[string]any{
-			"id":      artifactID,
-			"name":    "noop.txt",
-			"content": "noop adapter artifact\n",
-		},
+	if err := sink.Artifact(ctx, runnerio.Artifact{
+		ID:        artifactID,
+		Name:      "noop.txt",
+		Kind:      "adapter_output",
+		MediaType: "text/plain",
+		Content:   []byte("noop adapter artifact\n"),
+	}); err != nil {
+		return report.Report{}, err
 	}
+
+	payload := map[string]any{"noop": true}
 	if idea, ok := disp.Input["idea"]; ok {
 		payload["idea"] = idea
 	}
 
-	if err := sink.Emit(ctx, progressEvent(disp, "noop adapter produced artifact metadata", map[string]any{"artifact_id": artifactID})); err != nil {
+	if err := sink.Emit(ctx, progressEvent(disp, "noop adapter produced artifact", map[string]any{"artifact_id": artifactID})); err != nil {
 		return report.Report{}, err
 	}
 

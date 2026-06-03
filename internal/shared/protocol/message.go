@@ -21,12 +21,13 @@ const (
 	TypeCancel   = "cancel"
 	TypePing     = "ping"
 
-	TypeReady  = "ready"
-	TypeEvent  = "event"
-	TypeReport = "report"
-	TypeResult = "result"
-	TypeLog    = "log"
-	TypePong   = "pong"
+	TypeReady    = "ready"
+	TypeEvent    = "event"
+	TypeArtifact = "artifact"
+	TypeReport   = "report"
+	TypeResult   = "result"
+	TypeLog      = "log"
+	TypePong     = "pong"
 )
 
 var ErrSessionClosed = errors.New("protocol session closed")
@@ -58,6 +59,20 @@ type CancelPayload struct {
 }
 
 type EventPayload = event.Event
+
+// ArtifactPayload transfers a durable artifact from Runner to Manager over the
+// session. Content is carried inline (base64 in JSON) for the skeleton; chunked
+// transfer is a later refinement behind this same message type.
+type ArtifactPayload struct {
+	RunID      string `json:"run_id"`
+	TaskID     string `json:"task_id"`
+	AttemptID  string `json:"attempt_id"`
+	ArtifactID string `json:"artifact_id"`
+	Name       string `json:"name"`
+	Kind       string `json:"kind"`
+	MediaType  string `json:"media_type"`
+	Content    []byte `json:"content"`
+}
 
 type ReportPayload = report.Report
 

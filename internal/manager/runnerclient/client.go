@@ -26,6 +26,7 @@ import (
 var ErrDispatchFailed = errors.New("dispatch failed")
 
 type EventHandler func(context.Context, event.Event) error
+type ArtifactHandler func(context.Context, protocol.ArtifactPayload) error
 type ReportHandler func(context.Context, report.Report) error
 type ResultHandler func(context.Context, protocol.ResultPayload) error
 type LogHandler func(context.Context, protocol.LogPayload) error
@@ -39,6 +40,7 @@ type Client struct {
 
 	mu            sync.RWMutex
 	onEvent       EventHandler
+	onArtifact    ArtifactHandler
 	onReport      ReportHandler
 	onResult      ResultHandler
 	onLog         LogHandler
@@ -136,6 +138,7 @@ func Dial(ctx context.Context, url, runnerID string) (*Client, error) {
 		return nil
 	})
 	c.session.Handle(protocol.TypeEvent, c.handleEvent)
+	c.session.Handle(protocol.TypeArtifact, c.handleArtifact)
 	c.session.Handle(protocol.TypeReport, c.handleReport)
 	c.session.Handle(protocol.TypeResult, c.handleResult)
 	c.session.Handle(protocol.TypeLog, c.handleLog)
@@ -158,10 +161,11 @@ func Dial(ctx context.Context, url, runnerID string) (*Client, error) {
 
 func (c *Client) Ready() protocol.ReadyPayload { return c.ready }
 
-func (c *Client) SetHandlers(onEvent EventHandler, onReport ReportHandler, onResult ResultHandler, onLog LogHandler) {
+func (c *Client) SetHandlers(onEvent EventHandler, onArtifact ArtifactHandler, onReport ReportHandler, onResult ResultHandler, onLog LogHandler) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.onEvent = onEvent
+	c.onArtifact = onArtifact
 	c.onReport = onReport
 	c.onResult = onResult
 	c.onLog = onLog
@@ -269,6 +273,20 @@ func (c *Client) handleEvent(ctx context.Context, msg protocol.Message) error {
 	c.mu.RUnlock()
 	if handler != nil {
 		return handler(ctx, ev)
+	}
+	return nil
+}
+
+func (c *Client) handleArtifact(ctx context.Context, msg protocol.Message) error {
+	art, err := protocol.DecodePayload[protocol.ArtifactPayload](msg)
+	if err != nil {
+		return err
+	}
+	c.mu.RLock()
+	handler := c.onArtifact
+	c.mu.RUnlock()
+	if handler != nil {
+		return handler(ctx, art)
 	}
 	return nil
 }
