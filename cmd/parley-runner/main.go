@@ -40,6 +40,8 @@ func configuredAdapters() ([]adapter.AgentAdapter, error) {
 		return nil, nil
 	case "container_sample":
 		return []adapter.AgentAdapter{containerSampleAdapter()}, nil
+	case "pi":
+		return []adapter.AgentAdapter{piAdapter()}, nil
 	default:
 		return nil, fmt.Errorf("unsupported PARLEY_ADAPTER %q", name)
 	}
@@ -88,6 +90,59 @@ func containerSampleAdapter() adapter.AgentAdapter {
 		ReferenceRoot:  referenceRoot,
 		AgentStateRoot: agentStateRoot,
 		Image:          os.Getenv("PARLEY_CONTAINER_IMAGE"),
+	})
+}
+
+func piAdapter() adapter.AgentAdapter {
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "."
+	}
+	dataRoot := cleanPath(getenv("PARLEY_DATA_DIR", ".parley-data"))
+	sourceRepo := cleanPath(getenv("PARLEY_SOURCE_REPO", cwd))
+	artifactDir := cleanOptionalPath(os.Getenv("PARLEY_ARTIFACT_DIR"))
+	referenceRoot := cleanOptionalPath(os.Getenv("PARLEY_REFERENCE_ROOT"))
+	if referenceRoot == "" && pathExists("/project/reference") {
+		referenceRoot = "/project/reference"
+	}
+	agentStateRoot := cleanPath(getenv("PARLEY_AGENT_STATE_ROOT", filepath.Join(dataRoot, "agent-state")))
+	authPath := cleanPath(getenv("PARLEY_PI_AUTH_JSON", filepath.Join(agentStateRoot, "auth.json")))
+
+	artifactRoots := []string{dataRoot}
+	if artifactDir != "" {
+		artifactRoots = append(artifactRoots, artifactDir)
+	}
+	referenceRoots := []string{}
+	if referenceRoot != "" {
+		referenceRoots = append(referenceRoots, referenceRoot)
+	}
+
+	podman := provider.NewPodman(provider.PreflightPolicy{
+		RepoRoots:      []string{sourceRepo},
+		WorktreeRoots:  []string{dataRoot},
+		ArtifactRoots:  artifactRoots,
+		ReferenceRoots: referenceRoots,
+		AgentStateRoot: agentStateRoot,
+	})
+	if executable := getenv("PARLEY_PODMAN_EXECUTABLE", os.Getenv("PARLEY_PODMAN")); executable != "" {
+		podman.Executable = executable
+	}
+
+	image := getenv("PARLEY_PI_IMAGE", os.Getenv("PARLEY_CONTAINER_IMAGE"))
+	return adapter.NewPi(adapter.PiOptions{
+		Provider:           podman,
+		CredentialStrategy: adapter.AuthJSONCredentialStrategy{SourcePath: authPath},
+		DataRoot:           dataRoot,
+		ProjectID:          getenv("PARLEY_PROJECT_ID", "default"),
+		SourceRepo:         sourceRepo,
+		ArtifactDir:        artifactDir,
+		ReferenceRoot:      referenceRoot,
+		AgentStateRoot:     agentStateRoot,
+		Image:              image,
+		PiProvider:         getenv("PARLEY_PI_PROVIDER", ""),
+		Model:              getenv("PARLEY_PI_MODEL", ""),
+		Thinking:           getenv("PARLEY_PI_THINKING", ""),
+		Network:            provider.Network(os.Getenv("PARLEY_PI_NETWORK")),
 	})
 }
 

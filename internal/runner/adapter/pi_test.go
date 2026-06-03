@@ -1,0 +1,326 @@
+package adapter
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/agent-parley/parley/internal/runner/provider"
+	"github.com/agent-parley/parley/internal/runner/runnerio"
+	"github.com/agent-parley/parley/internal/shared/contract"
+	"github.com/agent-parley/parley/internal/shared/event"
+	"github.com/agent-parley/parley/internal/shared/report"
+)
+
+func TestPiEventStreamParsing(t *testing.T) {
+	disp := piTestDispatch()
+	sink := &recordingSink{}
+	stream := &piStreamSink{disp: disp, adapterID: piName, downstream: sink}
+	lines := []string{
+		`{"type":"agent_start"}`,
+		`{"type":"tool_execution_start","toolCallId":"call_1","toolName":"bash","args":{"command":"echo hi"}}`,
+		`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}`,
+		`{"type":"error","message":"boom"}`,
+		`{"type":"agent_end"}`,
+	}
+	for _, line := range lines {
+		if err := stream.Emit(context.Background(), providerOutputEvent(line)); err != nil {
+			t.Fatalf("Emit(%s) error = %v", line, err)
+		}
+	}
+	if len(sink.events) != len(lines) {
+		t.Fatalf("events len = %d, want %d", len(sink.events), len(lines))
+	}
+	assertEvent(t, sink.events[0], "adapter.progress", "pi agent started")
+	assertEvent(t, sink.events[1], "adapter.progress", "pi tool started: bash")
+	assertEvent(t, sink.events[2], "adapter.output", "done")
+	assertEvent(t, sink.events[3], "adapter.progress", "pi error: boom")
+	assertEvent(t, sink.events[4], "adapter.progress", "pi agent completed")
+	if got := sink.events[1].Data["tool_name"]; got != "bash" {
+		t.Fatalf("tool_name = %v, want bash", got)
+	}
+}
+
+func TestPiPrepareBuildsPreflightSafeInvocationAndInputFiles(t *testing.T) {
+	ctx := context.Background()
+	source := initAdapterSourceRepo(t, ctx)
+	dataRoot := t.TempDir()
+	reference := mkdirAdapterDir(t, t.TempDir(), "reference")
+	agentState := mkdirAdapterDir(t, t.TempDir(), "agent-state")
+	authPath := writeTestAuth(t, t.TempDir())
+	adapter := NewPi(PiOptions{
+		Provider:           &scriptedPiProvider{},
+		CredentialStrategy: AuthJSONCredentialStrategy{SourcePath: authPath},
+		DataRoot:           dataRoot,
+		ProjectID:          "p1",
+		SourceRepo:         source,
+		ReferenceRoot:      reference,
+		AgentStateRoot:     agentState,
+		Image:              "localhost/test-pi:latest",
+	})
+	prepared, err := adapter.Prepare(ctx, piTestDispatch())
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	policy := provider.PreflightPolicy{
+		WorktreeRoots:  []string{dataRoot},
+		ArtifactRoots:  []string{dataRoot},
+		ReferenceRoots: []string{reference},
+		AgentStateRoot: agentState,
+	}
+	if err := provider.Preflight(prepared.Invocation, policy); err != nil {
+		t.Fatalf("Preflight() error = %v", err)
+	}
+	if prepared.Invocation.Network != provider.NetworkBridge {
+		t.Fatalf("network = %q, want controlled provider network bridge", prepared.Invocation.Network)
+	}
+	if got := prepared.Invocation.Env; len(got) != 2 || got["HARNESS_RUN_ID"] == "" || got["HARNESS_TASK_ID"] == "" {
+		t.Fatalf("env = %#v, want only harness run/task IDs", got)
+	}
+	for key := range prepared.Invocation.Env {
+		if strings.Contains(strings.ToLower(key), "token") || strings.Contains(strings.ToLower(key), "secret") || strings.Contains(strings.ToLower(key), "api_key") {
+			t.Fatalf("secret-like env key present: %s", key)
+		}
+	}
+	if got := mountHost(prepared.Invocation, containerAuthPath); got != prepared.AuthCopyPath {
+		t.Fatalf("auth mount host = %q, want %q", got, prepared.AuthCopyPath)
+	}
+	if got := mountHost(prepared.Invocation, containerAgentDir); got != prepared.AgentDir {
+		t.Fatalf("agent mount host = %q, want %q", got, prepared.AgentDir)
+	}
+	workerInput := readTestFile(t, prepared.WorkerInputPath)
+	if !strings.Contains(workerInput, "Implement the following user request") || !strings.Contains(workerInput, "/project/workspace/report.json") {
+		t.Fatalf("worker-input.md missing task/report contract:\n%s", workerInput)
+	}
+	appendSystem := readTestFile(t, prepared.AppendSystemPath)
+	if !strings.Contains(appendSystem, "Parley Headless Worker Rules") || !strings.Contains(appendSystem, "Provider credentials") {
+		t.Fatalf("APPEND_SYSTEM.md missing standing rules:\n%s", appendSystem)
+	}
+	if got := readTestFile(t, prepared.AuthCopyPath); got != readTestFile(t, authPath) {
+		t.Fatalf("auth copy = %q, want source contents", got)
+	}
+}
+
+func TestPiRunRepairsInvalidReportOnce(t *testing.T) {
+	ctx := context.Background()
+	fake := &scriptedPiProvider{
+		runs: []func(provider.PreparedInvocation) error{
+			func(inv provider.PreparedInvocation) error {
+				workspace, repo := piMountedDirs(inv)
+				if err := os.WriteFile(filepath.Join(repo, "pi-created.txt"), []byte("hello from pi\n"), 0o600); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(workspace, "report.json"), []byte(`{"status":"surprised","summary":"bad","errors":[]}`), 0o600)
+			},
+			func(inv provider.PreparedInvocation) error {
+				workspace, _ := piMountedDirs(inv)
+				return os.WriteFile(filepath.Join(workspace, "report.json"), []byte(`{"status":"completed","summary":"fixed report","errors":[]}`), 0o600)
+			},
+		},
+	}
+	adapter := newTestPiAdapter(t, ctx, fake)
+	sink := &recordingSink{}
+	rep, err := adapter.Run(ctx, piTestDispatch(), sink)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if rep.Status != report.StatusCompleted || rep.Summary != "fixed report" {
+		t.Fatalf("report = %#v, want completed fixed report", rep)
+	}
+	if fake.callCount != 2 {
+		t.Fatalf("provider calls = %d, want one repair re-dispatch", fake.callCount)
+	}
+	artifacts := artifactsByName(sink.artifacts)
+	if !strings.Contains(artifacts["diff.patch"], "pi-created.txt") {
+		t.Fatalf("diff.patch missing pi-created.txt:\n%s", artifacts["diff.patch"])
+	}
+	if len(rep.EvidenceRefs) != 1 || rep.Payload["diff_artifact_id"] == "" {
+		t.Fatalf("report evidence/payload missing diff artifact: %#v", rep)
+	}
+}
+
+func TestPiRunTreatsContainerExecutionErrorAsFailure(t *testing.T) {
+	ctx := context.Background()
+	boom := errors.New("podman run exited with code 1")
+	fake := &scriptedPiProvider{
+		runs: []func(provider.PreparedInvocation) error{
+			func(inv provider.PreparedInvocation) error {
+				workspace, repo := piMountedDirs(inv)
+				if err := os.WriteFile(filepath.Join(repo, "pi-created.txt"), []byte("hello from pi\n"), 0o600); err != nil {
+					return err
+				}
+				if err := os.WriteFile(filepath.Join(workspace, "report.json"), []byte(`{"status":"completed","summary":"claimed success","errors":[]}`), 0o600); err != nil {
+					return err
+				}
+				return boom
+			},
+		},
+	}
+	adapter := newTestPiAdapter(t, ctx, fake)
+	sink := &recordingSink{}
+	rep, err := adapter.Run(ctx, piTestDispatch(), sink)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if rep.Status != report.StatusFailed {
+		t.Fatalf("report status = %s, want failed; report=%#v", rep.Status, rep)
+	}
+	if len(rep.Errors) != 1 || !strings.Contains(rep.Errors[0], boom.Error()) {
+		t.Fatalf("errors = %#v, want provider run error", rep.Errors)
+	}
+	if fake.callCount != 1 {
+		t.Fatalf("provider calls = %d, want no repair for schema-valid execution failure", fake.callCount)
+	}
+}
+
+func TestPiRunReturnsInvalidAfterOneFailedRepair(t *testing.T) {
+	ctx := context.Background()
+	fake := &scriptedPiProvider{
+		runs: []func(provider.PreparedInvocation) error{
+			func(inv provider.PreparedInvocation) error {
+				workspace, repo := piMountedDirs(inv)
+				if err := os.WriteFile(filepath.Join(repo, "pi-created.txt"), []byte("hello from pi\n"), 0o600); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(workspace, "report.json"), []byte(`{"status":"failed","summary":"missing errors","errors":[]}`), 0o600)
+			},
+			func(inv provider.PreparedInvocation) error {
+				workspace, _ := piMountedDirs(inv)
+				return os.WriteFile(filepath.Join(workspace, "report.json"), []byte(`not json`), 0o600)
+			},
+		},
+	}
+	adapter := newTestPiAdapter(t, ctx, fake)
+	sink := &recordingSink{}
+	rep, err := adapter.Run(ctx, piTestDispatch(), sink)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if rep.Status != report.StatusInvalid || rep.Actor.Kind != report.ActorKindHarness {
+		t.Fatalf("report = %#v, want harness invalid", rep)
+	}
+	if fake.callCount != 2 {
+		t.Fatalf("provider calls = %d, want exactly two", fake.callCount)
+	}
+	if len(rep.Errors) == 0 || !strings.Contains(rep.Errors[0], "parse report.json") {
+		t.Fatalf("invalid errors = %#v, want parse report error", rep.Errors)
+	}
+	if len(rep.EvidenceRefs) != 1 {
+		t.Fatalf("evidence refs = %#v, want diff artifact", rep.EvidenceRefs)
+	}
+}
+
+func providerOutputEvent(line string) event.Event {
+	return event.Event{
+		SchemaVersion: event.SchemaVersion,
+		Type:          "adapter.output",
+		Actor:         event.Actor{Kind: event.ActorKindAdapter, ID: piName},
+		Summary:       line,
+		Data:          map[string]any{"provider": "podman", "stream": "stdout", "line": line},
+	}
+}
+
+func assertEvent(t *testing.T, ev event.Event, typ, summary string) {
+	t.Helper()
+	if ev.Type != typ || ev.Summary != summary {
+		t.Fatalf("event = (%s, %q), want (%s, %q); full=%#v", ev.Type, ev.Summary, typ, summary, ev)
+	}
+}
+
+func piTestDispatch() contract.Dispatch {
+	return contract.Dispatch{
+		RunID:     "run1",
+		TaskID:    "task1",
+		AttemptID: "attempt1",
+		StageID:   "stage1",
+		StageType: contract.StageTypeImplementation,
+		Adapter:   piName,
+		Input:     map[string]any{"idea": "Add a file named pi-created.txt."},
+	}
+}
+
+type scriptedPiProvider struct {
+	invocations []provider.PreparedInvocation
+	runs        []func(provider.PreparedInvocation) error
+	callCount   int
+}
+
+func (p *scriptedPiProvider) Name() string { return "fake-podman" }
+
+func (p *scriptedPiProvider) Run(ctx context.Context, inv provider.PreparedInvocation, sink runnerio.Sink) (provider.Result, error) {
+	p.invocations = append(p.invocations, inv)
+	p.callCount++
+	if err := sink.Emit(ctx, providerOutputEvent(`{"type":"agent_start"}`)); err != nil {
+		return provider.Result{}, err
+	}
+	if err := sink.Emit(ctx, providerOutputEvent(`{"type":"agent_end"}`)); err != nil {
+		return provider.Result{}, err
+	}
+	var err error
+	if idx := p.callCount - 1; idx < len(p.runs) && p.runs[idx] != nil {
+		err = p.runs[idx](inv)
+	}
+	now := time.Now().UTC()
+	return provider.Result{ExitCode: 0, StartedAt: now, EndedAt: now}, err
+}
+
+func newTestPiAdapter(t *testing.T, ctx context.Context, fake *scriptedPiProvider) Pi {
+	t.Helper()
+	source := initAdapterSourceRepo(t, ctx)
+	dataRoot := t.TempDir()
+	reference := mkdirAdapterDir(t, t.TempDir(), "reference")
+	agentState := mkdirAdapterDir(t, t.TempDir(), "agent-state")
+	authPath := writeTestAuth(t, t.TempDir())
+	return NewPi(PiOptions{
+		Provider:           fake,
+		CredentialStrategy: AuthJSONCredentialStrategy{SourcePath: authPath},
+		DataRoot:           dataRoot,
+		ProjectID:          "p1",
+		SourceRepo:         source,
+		ReferenceRoot:      reference,
+		AgentStateRoot:     agentState,
+		Image:              "localhost/test-pi:latest",
+	})
+}
+
+func writeTestAuth(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(path, []byte("{\"openai-codex\":{\"type\":\"oauth\"}}\n"), 0o600); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+	return path
+}
+
+func readTestFile(t *testing.T, path string) string {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(content)
+}
+
+func piMountedDirs(inv provider.PreparedInvocation) (workspace, repo string) {
+	for _, mount := range inv.Mounts {
+		switch mount.Container {
+		case containerWorkspacePath:
+			workspace = mount.Host
+		case containerRepoPath:
+			repo = mount.Host
+		}
+	}
+	return workspace, repo
+}
+
+func artifactsByName(artifacts []runnerio.Artifact) map[string]string {
+	out := map[string]string{}
+	for _, artifact := range artifacts {
+		out[artifact.Name] = string(artifact.Content)
+	}
+	return out
+}

@@ -1,0 +1,60 @@
+#!/bin/sh
+set -eu
+
+export HOME="/home/node"
+export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-${HOME}/.pi/agent}"
+export PI_NPM_ROOT="${PI_NPM_ROOT:-${PI_CODING_AGENT_DIR}/npm}"
+export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-${PI_CODING_AGENT_DIR}/package-store}"
+export PATH="${PI_NPM_ROOT}/node_modules/.bin:${NPM_CONFIG_PREFIX}/bin:${PATH}"
+
+PI_BIN="${PI_BIN:-/usr/local/bin/pi}"
+SHARED_AUTH="${PARLEY_PI_AUTH_MOUNT:-${HOME}/.pi-shared/agent/auth.json}"
+AGENT_AUTH="${PI_CODING_AGENT_DIR}/auth.json"
+SETTINGS_FILE="${PI_CODING_AGENT_DIR}/settings.json"
+
+if [ "${1:-}" = "pi" ]; then
+    shift
+fi
+
+mkdir -p "${PI_CODING_AGENT_DIR}" "${PI_NPM_ROOT}" "${NPM_CONFIG_PREFIX}" "$(dirname "${SHARED_AUTH}")"
+
+if [ -f "${SHARED_AUTH}" ]; then
+    rm -f "${AGENT_AUTH}"
+    ln -s "${SHARED_AUTH}" "${AGENT_AUTH}"
+elif [ ! -f "${AGENT_AUTH}" ]; then
+    printf '{}\n' > "${AGENT_AUTH}"
+    chmod 600 "${AGENT_AUTH}" 2>/dev/null || true
+fi
+
+provider=""
+model=""
+thinking=""
+prev=""
+for arg in "$@"; do
+    case "${prev}" in
+        --provider) provider="${arg}"; prev=""; continue ;;
+        --model) model="${arg}"; prev=""; continue ;;
+        --thinking) thinking="${arg}"; prev=""; continue ;;
+    esac
+    case "${arg}" in
+        --provider|--model|--thinking) prev="${arg}" ;;
+    esac
+done
+
+node - "${SETTINGS_FILE}" "${provider}" "${model}" "${thinking}" <<'NODE'
+const fs = require("fs");
+const [settingsPath, provider, model, thinking] = process.argv.slice(2);
+let settings = {};
+try { settings = JSON.parse(fs.readFileSync(settingsPath, "utf8")); } catch {}
+if (provider) settings.defaultProvider = provider;
+if (model) {
+  settings.defaultModel = model;
+  settings.enabledModels = [model];
+}
+if (thinking) settings.defaultThinkingLevel = thinking;
+settings.quietStartup = true;
+settings.enableInstallTelemetry = false;
+fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+NODE
+
+exec "${PI_BIN}" "$@"
