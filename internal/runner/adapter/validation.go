@@ -177,7 +177,11 @@ func (a Validation) Prepare(disp contract.Dispatch) (ValidationPreparedRun, erro
 			"GOCACHE": containerWorkspacePath + "/.gocache",
 			"GOPATH":  containerWorkspacePath + "/.gopath",
 		},
-		Command:       []string{"sh", "-lc", command},
+		// Use a non-login shell: `sh -lc` sources /etc/profile, which resets
+		// PATH to the Debian default and drops the toolchain image's
+		// /usr/local/go/bin (so `go` becomes "not found"). `sh -c` preserves the
+		// image's ENV PATH.
+		Command:       []string{"sh", "-c", command},
 		WorkDir:       containerRepoPath,
 		Network:       validationNetwork(a.opts.Network),
 		UserNS:        "keep-id",
