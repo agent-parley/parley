@@ -168,6 +168,14 @@ func (a Validation) Prepare(disp contract.Dispatch) (ValidationPreparedRun, erro
 		Env: map[string]string{
 			"HARNESS_RUN_ID":  disp.RunID,
 			"HARNESS_TASK_ID": disp.TaskID,
+			// Validation runs as a non-root keep-id user, but stock toolchain
+			// images (e.g. golang) default HOME=/ and GOPATH=/go — neither
+			// writable by the mapped uid — which breaks the Go build/test cache.
+			// Redirect writable state into the rw workspace mount. Harmless for
+			// non-Go validation commands.
+			"HOME":    containerWorkspacePath,
+			"GOCACHE": containerWorkspacePath + "/.gocache",
+			"GOPATH":  containerWorkspacePath + "/.gopath",
 		},
 		Command:       []string{"sh", "-lc", command},
 		WorkDir:       containerRepoPath,

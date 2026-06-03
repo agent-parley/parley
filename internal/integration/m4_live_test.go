@@ -141,6 +141,15 @@ func TestM4PiFullLoopLive(t *testing.T) {
 		}
 	}
 	if bundle.Run.Status != store.RunStatusCompleted {
+		for _, s := range bundle.Stages {
+			t.Logf("STAGE %-16s status=%s adapter=%s", s.StageType, s.Status, s.Adapter)
+		}
+		for _, ev := range bundle.Events {
+			l := strings.ToLower(ev.Type + " " + ev.Summary)
+			if strings.Contains(l, "fail") || strings.Contains(l, "invalid") || strings.Contains(l, "error") {
+				t.Logf("EVENT [%s] %q data=%v", ev.Type, ev.Summary, ev.Data)
+			}
+		}
 		t.Fatalf("live M4 run status=%s events=%d artifacts=%d", bundle.Run.Status, len(bundle.Events), len(bundle.Artifacts))
 	}
 	_ = client.Close(context.Background())
