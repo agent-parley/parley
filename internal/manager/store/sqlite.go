@@ -220,14 +220,14 @@ func (s *Store) GetWorkflowRun(ctx context.Context, runID string) (WorkflowRun, 
 		return WorkflowRun{}, err
 	}
 	var task Task
-	if err := s.db.QueryRowContext(ctx, `SELECT id, run_id, idea, status, created_at, updated_at FROM tasks WHERE run_id = ? LIMIT 1`, runID).Scan(&task.ID, &task.RunID, &task.Idea, &task.Status, &task.CreatedAt, &task.UpdatedAt); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT id, run_id, idea, status, created_at, updated_at FROM tasks WHERE run_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`, runID).Scan(&task.ID, &task.RunID, &task.Idea, &task.Status, &task.CreatedAt, &task.UpdatedAt); err != nil {
 		return WorkflowRun{}, fmt.Errorf("get task for run %s: %w", runID, err)
 	}
 	var attempt Attempt
-	if err := s.db.QueryRowContext(ctx, `SELECT id, run_id, task_id, status, created_at, updated_at FROM attempts WHERE run_id = ? LIMIT 1`, runID).Scan(&attempt.ID, &attempt.RunID, &attempt.TaskID, &attempt.Status, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT id, run_id, task_id, status, created_at, updated_at FROM attempts WHERE run_id = ? AND task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`, runID, task.ID).Scan(&attempt.ID, &attempt.RunID, &attempt.TaskID, &attempt.Status, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
 		return WorkflowRun{}, fmt.Errorf("get attempt for run %s: %w", runID, err)
 	}
-	stages, err := s.ListStages(ctx, runID)
+	stages, err := s.ListStagesForAttempt(ctx, runID, attempt.ID)
 	if err != nil {
 		return WorkflowRun{}, err
 	}
@@ -244,7 +244,15 @@ func (s *Store) GetWorkflowRun(ctx context.Context, runID string) (WorkflowRun, 
 }
 
 func (s *Store) ListStages(ctx context.Context, runID string) ([]Stage, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, created_at, updated_at FROM stages WHERE run_id = ? ORDER BY created_at ASC`, runID)
+	return s.listStages(ctx, `SELECT id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, created_at, updated_at FROM stages WHERE run_id = ? ORDER BY created_at ASC`, runID)
+}
+
+func (s *Store) ListStagesForAttempt(ctx context.Context, runID, attemptID string) ([]Stage, error) {
+	return s.listStages(ctx, `SELECT id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, created_at, updated_at FROM stages WHERE run_id = ? AND attempt_id = ? ORDER BY created_at ASC`, runID, attemptID)
+}
+
+func (s *Store) listStages(ctx context.Context, query string, args ...any) ([]Stage, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list stages: %w", err)
 	}

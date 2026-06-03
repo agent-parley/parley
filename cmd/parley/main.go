@@ -18,6 +18,7 @@ func main() {
 		Addr:      getenv("PARLEY_ADDR", "127.0.0.1:8080"),
 		DataDir:   getenv("PARLEY_DATA_DIR", ".parley-data"),
 		RunnerBin: os.Getenv("PARLEY_RUNNER_BIN"),
+		Adapter:   getenv("PARLEY_ADAPTER", "noop"),
 	}
 	app, err := manager.New(ctx, cfg)
 	if err != nil {

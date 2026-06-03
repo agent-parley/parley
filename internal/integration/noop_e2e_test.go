@@ -41,7 +41,7 @@ func TestNoopEndToEndRun(t *testing.T) {
 	}
 	hub := managerhttp.NewHub()
 	engine := orchestrator.NewEngine(st, client, renderer, hub)
-	client.SetHandlers(engine.HandleRunnerEvent, engine.HandleRunnerReport, engine.HandleRunnerResult, engine.HandleRunnerLog)
+	client.SetHandlers(engine.HandleRunnerEvent, engine.HandleRunnerArtifact, engine.HandleRunnerReport, engine.HandleRunnerResult, engine.HandleRunnerLog)
 
 	runID, err := engine.StartRun(ctx, "add a local-first harness")
 	if err != nil {
@@ -70,14 +70,22 @@ func TestNoopEndToEndRun(t *testing.T) {
 			t.Fatalf("stage not completed: %+v", stage)
 		}
 	}
-	var reportArtifacts int
+	var reportArtifacts, adapterArtifacts int
 	for _, artifact := range bundle.Artifacts {
-		if artifact.Kind == "report" {
+		switch artifact.Kind {
+		case "report":
 			reportArtifacts++
+		case "adapter_output":
+			adapterArtifacts++
 		}
 	}
 	if reportArtifacts != 2 {
 		t.Fatalf("expected 2 report artifacts, got %d", reportArtifacts)
+	}
+	// D3: the noop adapter's artifact must arrive as a first-class transfer over
+	// the session and be stored, not inlined in the report payload.
+	if adapterArtifacts != 1 {
+		t.Fatalf("expected 1 adapter_output artifact transferred over the session, got %d", adapterArtifacts)
 	}
 	if len(bundle.Events) < 7 {
 		t.Fatalf("expected live workflow events, got %d", len(bundle.Events))

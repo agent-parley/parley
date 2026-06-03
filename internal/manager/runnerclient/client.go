@@ -26,6 +26,7 @@ import (
 var ErrDispatchFailed = errors.New("dispatch failed")
 
 type EventHandler func(context.Context, event.Event) error
+type ArtifactHandler func(context.Context, protocol.ArtifactPayload) error
 type ReportHandler func(context.Context, report.Report) error
 type ResultHandler func(context.Context, protocol.ResultPayload) error
 type LogHandler func(context.Context, protocol.LogPayload) error
@@ -39,6 +40,7 @@ type Client struct {
 
 	mu            sync.RWMutex
 	onEvent       EventHandler
+	onArtifact    ArtifactHandler
 	onReport      ReportHandler
 	onResult      ResultHandler
 	onLog         LogHandler
@@ -64,6 +66,10 @@ func ResolveRunnerBinary() (string, error) {
 }
 
 func StartChild(ctx context.Context, runnerBin string) (*Client, error) {
+	return StartChildWithEnv(ctx, runnerBin, nil)
+}
+
+func StartChildWithEnv(ctx context.Context, runnerBin string, env []string) (*Client, error) {
 	if runnerBin == "" {
 		var err error
 		runnerBin, err = ResolveRunnerBinary()
@@ -72,6 +78,9 @@ func StartChild(ctx context.Context, runnerBin string) (*Client, error) {
 		}
 	}
 	cmd := exec.Command(runnerBin)
+	if len(env) > 0 {
+		cmd.Env = mergeEnv(os.Environ(), env)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("runner stdout pipe: %w", err)
@@ -136,6 +145,7 @@ func Dial(ctx context.Context, url, runnerID string) (*Client, error) {
 		return nil
 	})
 	c.session.Handle(protocol.TypeEvent, c.handleEvent)
+	c.session.Handle(protocol.TypeArtifact, c.handleArtifact)
 	c.session.Handle(protocol.TypeReport, c.handleReport)
 	c.session.Handle(protocol.TypeResult, c.handleResult)
 	c.session.Handle(protocol.TypeLog, c.handleLog)
@@ -156,12 +166,44 @@ func Dial(ctx context.Context, url, runnerID string) (*Client, error) {
 	return c, nil
 }
 
+func mergeEnv(base, overrides []string) []string {
+	positions := map[string]int{}
+	merged := append([]string{}, base...)
+	for i, value := range merged {
+		if key := envKey(value); key != "" {
+			positions[key] = i
+		}
+	}
+	for _, value := range overrides {
+		key := envKey(value)
+		if key == "" {
+			continue
+		}
+		if pos, ok := positions[key]; ok {
+			merged[pos] = value
+			continue
+		}
+		positions[key] = len(merged)
+		merged = append(merged, value)
+	}
+	return merged
+}
+
+func envKey(value string) string {
+	key, _, ok := strings.Cut(value, "=")
+	if !ok {
+		return ""
+	}
+	return key
+}
+
 func (c *Client) Ready() protocol.ReadyPayload { return c.ready }
 
-func (c *Client) SetHandlers(onEvent EventHandler, onReport ReportHandler, onResult ResultHandler, onLog LogHandler) {
+func (c *Client) SetHandlers(onEvent EventHandler, onArtifact ArtifactHandler, onReport ReportHandler, onResult ResultHandler, onLog LogHandler) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.onEvent = onEvent
+	c.onArtifact = onArtifact
 	c.onReport = onReport
 	c.onResult = onResult
 	c.onLog = onLog
@@ -190,7 +232,7 @@ func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.R
 	select {
 	case rep = <-waiter.reportCh:
 	case <-ctx.Done():
-		_ = c.Cancel(context.Background(), disp.RunID, disp.TaskID)
+		_ = c.CancelAttempt(context.Background(), disp.RunID, disp.TaskID, disp.AttemptID)
 		return report.Report{}, ctx.Err()
 	case <-c.session.Done():
 		return report.Report{}, protocol.ErrSessionClosed
@@ -212,7 +254,11 @@ func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.R
 }
 
 func (c *Client) Cancel(ctx context.Context, runID, taskID string) error {
-	return c.send(ctx, protocol.TypeCancel, protocol.CancelPayload{RunID: runID, TaskID: taskID})
+	return c.CancelAttempt(ctx, runID, taskID, "")
+}
+
+func (c *Client) CancelAttempt(ctx context.Context, runID, taskID, attemptID string) error {
+	return c.send(ctx, protocol.TypeCancel, protocol.CancelPayload{RunID: runID, TaskID: taskID, AttemptID: attemptID})
 }
 
 func (c *Client) Ping(ctx context.Context) error {
@@ -269,6 +315,20 @@ func (c *Client) handleEvent(ctx context.Context, msg protocol.Message) error {
 	c.mu.RUnlock()
 	if handler != nil {
 		return handler(ctx, ev)
+	}
+	return nil
+}
+
+func (c *Client) handleArtifact(ctx context.Context, msg protocol.Message) error {
+	art, err := protocol.DecodePayload[protocol.ArtifactPayload](msg)
+	if err != nil {
+		return err
+	}
+	c.mu.RLock()
+	handler := c.onArtifact
+	c.mu.RUnlock()
+	if handler != nil {
+		return handler(ctx, art)
 	}
 	return nil
 }

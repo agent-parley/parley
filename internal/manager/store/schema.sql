@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_run_id ON tasks(run_id);
 CREATE INDEX IF NOT EXISTS idx_attempts_run_id ON attempts(run_id);
+CREATE INDEX IF NOT EXISTS idx_attempts_task_created ON attempts(run_id, task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_stages_run_id ON stages(run_id);
+CREATE INDEX IF NOT EXISTS idx_stages_attempt_id ON stages(run_id, attempt_id);
 CREATE INDEX IF NOT EXISTS idx_events_run_sequence ON events(run_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_artifacts_run_id ON artifacts(run_id);
