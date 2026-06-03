@@ -77,6 +77,7 @@ type PiOptions struct {
 	Model              string
 	Thinking           string
 	Network            provider.Network
+	AppendSystemExtra  string
 	ContainerName      string
 }
 
@@ -217,7 +218,7 @@ func (a Pi) Prepare(ctx context.Context, disp contract.Dispatch) (PiPreparedRun,
 		return PiPreparedRun{}, fmt.Errorf("write worker-input.md: %w", err)
 	}
 	appendSystemPath := filepath.Join(agentDir, "APPEND_SYSTEM.md")
-	if err := os.WriteFile(appendSystemPath, []byte(appendSystemMarkdown()), 0o600); err != nil {
+	if err := os.WriteFile(appendSystemPath, []byte(appendSystemMarkdown(a.opts.AppendSystemExtra)), 0o600); err != nil {
 		return PiPreparedRun{}, fmt.Errorf("write APPEND_SYSTEM.md: %w", err)
 	}
 
@@ -481,8 +482,8 @@ func workerInputMarkdown(disp contract.Dispatch) string {
 	return b.String()
 }
 
-func appendSystemMarkdown() string {
-	return `# Parley Headless Worker Rules
+func appendSystemMarkdown(extra string) string {
+	base := `# Parley Headless Worker Rules
 
 You are running as a non-interactive Parley implementation worker.
 
@@ -494,6 +495,10 @@ You are running as a non-interactive Parley implementation worker.
 - Never wait for interactive user input.
 - Always finish by writing /project/workspace/report.json using the required {status, summary, errors} subset.
 `
+	if strings.TrimSpace(extra) == "" {
+		return base
+	}
+	return base + "\n## Run-specific harness verification\n\n" + strings.TrimSpace(extra) + "\n"
 }
 
 func inputString(input map[string]any, keys ...string) string {

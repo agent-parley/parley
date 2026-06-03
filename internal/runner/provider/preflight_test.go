@@ -93,6 +93,29 @@ func TestPreflightRejectsUnsafeInvocation(t *testing.T) {
 			want: nil,
 		},
 		{
+			name: "custom network rejected by default",
+			mutate: func(inv *PreparedInvocation, _ *PreflightPolicy) {
+				inv.Network = Network("parley-provider-egress")
+			},
+			want: ErrInvalidNetworkPolicy,
+		},
+		{
+			name: "control-plane allowlisted custom network accepted",
+			mutate: func(inv *PreparedInvocation, policy *PreflightPolicy) {
+				inv.Network = Network("parley-provider-egress")
+				policy.AllowedNetworks = []Network{Network("parley-provider-egress")}
+			},
+			want: nil,
+		},
+		{
+			name: "host network not accepted through custom allowlist",
+			mutate: func(inv *PreparedInvocation, policy *PreflightPolicy) {
+				inv.Network = NetworkHost
+				policy.AllowedNetworks = []Network{NetworkHost}
+			},
+			want: ErrHostNetwork,
+		},
+		{
 			name: "credential mount outside agent-state root",
 			mutate: func(inv *PreparedInvocation, _ *PreflightPolicy) {
 				inv.Mounts[3].Host = fixture.credentialOutside

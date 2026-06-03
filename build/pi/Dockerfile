@@ -1,8 +1,20 @@
 FROM docker.io/library/node:22-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732
 
 ARG PI_VERSION=0.78.0
+ARG DEBIAN_SNAPSHOT=20260601T000000Z
 
 RUN set -eu; \
+    snapshot="https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}"; \
+    security_snapshot="https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}"; \
+    sed -i \
+      -e "s|http://deb.debian.org/debian-security|${security_snapshot}|g" \
+      -e "s|https://deb.debian.org/debian-security|${security_snapshot}|g" \
+      -e "s|http://security.debian.org/debian-security|${security_snapshot}|g" \
+      -e "s|https://security.debian.org/debian-security|${security_snapshot}|g" \
+      -e "s|http://deb.debian.org/debian|${snapshot}|g" \
+      -e "s|https://deb.debian.org/debian|${snapshot}|g" \
+      /etc/apt/sources.list.d/debian.sources; \
+    printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99snapshot; \
     apt-get update -qq; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
       git ca-certificates curl; \

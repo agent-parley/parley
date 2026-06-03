@@ -61,6 +61,7 @@ func TestPiPrepareBuildsPreflightSafeInvocationAndInputFiles(t *testing.T) {
 		ReferenceRoot:      reference,
 		AgentStateRoot:     agentState,
 		Image:              "localhost/test-pi:latest",
+		AppendSystemExtra:  "extra verification rule",
 	})
 	prepared, err := adapter.Prepare(ctx, piTestDispatch())
 	if err != nil {
@@ -97,8 +98,8 @@ func TestPiPrepareBuildsPreflightSafeInvocationAndInputFiles(t *testing.T) {
 		t.Fatalf("worker-input.md missing task/report contract:\n%s", workerInput)
 	}
 	appendSystem := readTestFile(t, prepared.AppendSystemPath)
-	if !strings.Contains(appendSystem, "Parley Headless Worker Rules") || !strings.Contains(appendSystem, "Provider credentials") {
-		t.Fatalf("APPEND_SYSTEM.md missing standing rules:\n%s", appendSystem)
+	if !strings.Contains(appendSystem, "Parley Headless Worker Rules") || !strings.Contains(appendSystem, "Provider credentials") || !strings.Contains(appendSystem, "extra verification rule") {
+		t.Fatalf("APPEND_SYSTEM.md missing standing rules or run-specific extra:\n%s", appendSystem)
 	}
 	if got := readTestFile(t, prepared.AuthCopyPath); got != readTestFile(t, authPath) {
 		t.Fatalf("auth copy = %q, want source contents", got)

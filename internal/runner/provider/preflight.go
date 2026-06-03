@@ -35,6 +35,7 @@ type PreflightPolicy struct {
 	ReferenceRoots   []string
 	AgentStateRoot   string
 	AllowHostNetwork bool
+	AllowedNetworks  []Network // extra control-plane-approved Podman network names; host still needs AllowHostNetwork
 
 	// HomeDir is optional and exists to make host-home rejection testable. When
 	// empty, os.UserHomeDir is used.
@@ -57,14 +58,17 @@ func Preflight(inv PreparedInvocation, policy PreflightPolicy) error {
 		errs = append(errs, fmt.Errorf("%w: userns=%q", ErrInvalidUserNamespace, inv.UserNS))
 	}
 
-	switch normalizeNetwork(inv.Network) {
+	network := normalizeNetwork(inv.Network)
+	switch network {
 	case NetworkNone, NetworkBridge:
 	case NetworkHost:
 		if !policy.AllowHostNetwork {
 			errs = append(errs, fmt.Errorf("%w: network=%s", ErrHostNetwork, NetworkHost))
 		}
 	default:
-		errs = append(errs, fmt.Errorf("%w: network=%q", ErrInvalidNetworkPolicy, inv.Network))
+		if !networkAllowed(network, policy.AllowedNetworks) {
+			errs = append(errs, fmt.Errorf("%w: network=%q", ErrInvalidNetworkPolicy, inv.Network))
+		}
 	}
 
 	for name := range inv.Env {
@@ -256,6 +260,15 @@ func normalizeNetwork(network Network) Network {
 		return NetworkNone
 	}
 	return network
+}
+
+func networkAllowed(network Network, allowed []Network) bool {
+	for _, candidate := range allowed {
+		if network == candidate && network != "" && network != NetworkHost {
+			return true
+		}
+	}
+	return false
 }
 
 func hasCredentialMount(mounts []Mount) bool {

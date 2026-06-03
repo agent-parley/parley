@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/agent-parley/parley/internal/runner/adapter"
@@ -118,11 +119,12 @@ func piAdapter() adapter.AgentAdapter {
 	}
 
 	podman := provider.NewPodman(provider.PreflightPolicy{
-		RepoRoots:      []string{sourceRepo},
-		WorktreeRoots:  []string{dataRoot},
-		ArtifactRoots:  artifactRoots,
-		ReferenceRoots: referenceRoots,
-		AgentStateRoot: agentStateRoot,
+		RepoRoots:       []string{sourceRepo},
+		WorktreeRoots:   []string{dataRoot},
+		ArtifactRoots:   artifactRoots,
+		ReferenceRoots:  referenceRoots,
+		AgentStateRoot:  agentStateRoot,
+		AllowedNetworks: parseNetworks(os.Getenv("PARLEY_PI_ALLOWED_NETWORKS")),
 	})
 	if executable := getenv("PARLEY_PODMAN_EXECUTABLE", os.Getenv("PARLEY_PODMAN")); executable != "" {
 		podman.Executable = executable
@@ -151,6 +153,21 @@ func getenv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func parseNetworks(raw string) []provider.Network {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	networks := make([]provider.Network, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			networks = append(networks, provider.Network(part))
+		}
+	}
+	return networks
 }
 
 func cleanPath(path string) string {
