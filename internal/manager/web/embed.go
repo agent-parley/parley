@@ -24,9 +24,11 @@ type TemplateRenderer struct {
 }
 
 type IndexData struct {
-	Runs  []store.Run
-	CSRF  string
-	Title string
+	Runs            []store.Run
+	Runners         []store.Runner
+	RunnerEventPage store.SystemEventPage
+	CSRF            string
+	Title           string
 }
 
 type RunData struct {
@@ -170,11 +172,11 @@ func short(s string) string {
 
 func statusClass(status string) string {
 	switch status {
-	case "completed":
+	case "completed", "connected":
 		return "status-completed"
-	case "failed", "invalid":
+	case "failed", "invalid", "down", "cancelled":
 		return "status-failed"
-	case "running":
+	case "running", "suspect":
 		return "status-running"
 	default:
 		return "status-pending"

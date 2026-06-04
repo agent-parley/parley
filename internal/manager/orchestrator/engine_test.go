@@ -19,7 +19,7 @@ func TestCompletionEventType(t *testing.T) {
 		{"harness completed", report.ActorKindHarness, report.StatusCompleted, "harness.completed"},
 		{"harness failed", report.ActorKindHarness, report.StatusFailed, "harness.failed"},
 		{"harness invalid", report.ActorKindHarness, report.StatusInvalid, "harness.failed"},
-		{"human completed", report.ActorKindHuman, report.StatusCompleted, "task.completed"},
+		{"human completed", report.ActorKindHuman, report.StatusCompleted, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

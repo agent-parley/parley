@@ -30,6 +30,9 @@ type ArtifactHandler func(context.Context, protocol.ArtifactPayload) error
 type ReportHandler func(context.Context, report.Report) error
 type ResultHandler func(context.Context, protocol.ResultPayload) error
 type LogHandler func(context.Context, protocol.LogPayload) error
+type HeartbeatMissedHandler func(context.Context, string, int, error)
+type HeartbeatRecoveredHandler func(context.Context, string)
+type DownHandler func(context.Context, string, string, error)
 
 type Client struct {
 	session  *protocol.Session
@@ -38,14 +41,22 @@ type Client struct {
 	ready    protocol.ReadyPayload
 	pongCh   chan struct{}
 
-	mu            sync.RWMutex
-	onEvent       EventHandler
-	onArtifact    ArtifactHandler
-	onReport      ReportHandler
-	onResult      ResultHandler
-	onLog         LogHandler
-	reportWaiters map[string]*dispatchWaiter
-	resultWaiters map[string]*dispatchWaiter
+	downOnce sync.Once
+
+	mu                   sync.RWMutex
+	onEvent              EventHandler
+	onArtifact           ArtifactHandler
+	onReport             ReportHandler
+	onResult             ResultHandler
+	onLog                LogHandler
+	onHeartbeatMissed    HeartbeatMissedHandler
+	onHeartbeatRecovered HeartbeatRecoveredHandler
+	onDown               DownHandler
+	reportWaiters        map[string]*dispatchWaiter
+	resultWaiters        map[string]*dispatchWaiter
+	closing              bool
+	cmdDone              chan struct{}
+	cmdErr               error
 }
 
 type dispatchWaiter struct {
@@ -70,6 +81,13 @@ func StartChild(ctx context.Context, runnerBin string) (*Client, error) {
 }
 
 func StartChildWithEnv(ctx context.Context, runnerBin string, env []string) (*Client, error) {
+	return StartChildWithEnvAndID(ctx, runnerBin, env, ids.New("runner"))
+}
+
+func StartChildWithEnvAndID(ctx context.Context, runnerBin string, env []string, runnerID string) (*Client, error) {
+	if runnerID == "" {
+		runnerID = ids.New("runner")
+	}
 	if runnerBin == "" {
 		var err error
 		runnerBin, err = ResolveRunnerBinary()
@@ -106,13 +124,15 @@ func StartChildWithEnv(ctx context.Context, runnerBin string, env []string) (*Cl
 		_ = cmd.Wait()
 		return nil, err
 	}
-	client, err := Dial(ctx, url, ids.New("runner"))
+	client, err := Dial(ctx, url, runnerID)
 	if err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		return nil, err
 	}
 	client.cmd = cmd
+	client.cmdDone = make(chan struct{})
+	go client.watchProcess()
 	return client, nil
 }
 
@@ -162,6 +182,7 @@ func Dial(ctx context.Context, url, runnerID string) (*Client, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+	go c.watchSession()
 	go c.heartbeat()
 	return c, nil
 }
@@ -199,6 +220,8 @@ func envKey(value string) string {
 
 func (c *Client) Ready() protocol.ReadyPayload { return c.ready }
 
+func (c *Client) RunnerID() string { return c.runnerID }
+
 func (c *Client) SetHandlers(onEvent EventHandler, onArtifact ArtifactHandler, onReport ReportHandler, onResult ResultHandler, onLog LogHandler) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -207,6 +230,14 @@ func (c *Client) SetHandlers(onEvent EventHandler, onArtifact ArtifactHandler, o
 	c.onReport = onReport
 	c.onResult = onResult
 	c.onLog = onLog
+}
+
+func (c *Client) SetLifecycleHandlers(onHeartbeatMissed HeartbeatMissedHandler, onHeartbeatRecovered HeartbeatRecoveredHandler, onDown DownHandler) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onHeartbeatMissed = onHeartbeatMissed
+	c.onHeartbeatRecovered = onHeartbeatRecovered
+	c.onDown = onDown
 }
 
 func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.Report, error) {
@@ -283,22 +314,27 @@ func (c *Client) Ping(ctx context.Context) error {
 }
 
 func (c *Client) Close(ctx context.Context) error {
+	c.setClosing()
 	_ = c.session.Close(websocket.StatusNormalClosure, "manager shutdown")
 	if c.cmd == nil || c.cmd.Process == nil {
 		return nil
 	}
 	_ = c.cmd.Process.Signal(os.Interrupt)
-	done := make(chan error, 1)
-	go func() { done <- c.cmd.Wait() }()
+	cmdDone := c.commandDone()
+	if cmdDone == nil {
+		return nil
+	}
 	select {
-	case err := <-done:
+	case <-cmdDone:
+		err := c.commandErr()
 		if err != nil && !strings.Contains(err.Error(), "signal: interrupt") {
 			return fmt.Errorf("wait runner: %w", err)
 		}
 		return nil
 	case <-time.After(3 * time.Second):
 		_ = c.cmd.Process.Kill()
-		return <-done
+		<-cmdDone
+		return c.commandErr()
 	case <-ctx.Done():
 		_ = c.cmd.Process.Kill()
 		return ctx.Err()
@@ -400,16 +436,109 @@ func (c *Client) send(ctx context.Context, typ string, payload any) error {
 func (c *Client) heartbeat() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+	missed := 0
 	for {
 		select {
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_ = c.Ping(ctx)
+			err := c.Ping(ctx)
 			cancel()
+			if err != nil {
+				missed++
+				c.notifyHeartbeatMissed(missed, err)
+				if missed >= 3 {
+					c.markDown("heartbeat_timeout", err)
+					return
+				}
+				continue
+			}
+			if missed > 0 {
+				missed = 0
+				c.notifyHeartbeatRecovered()
+			}
 		case <-c.session.Done():
 			return
 		}
 	}
+}
+
+func (c *Client) watchSession() {
+	<-c.session.Done()
+	if c.isClosing() {
+		return
+	}
+	c.markDown("session_done", protocol.ErrSessionClosed)
+}
+
+func (c *Client) watchProcess() {
+	err := c.cmd.Wait()
+	c.mu.Lock()
+	c.cmdErr = err
+	if c.cmdDone != nil {
+		close(c.cmdDone)
+	}
+	closing := c.closing
+	c.mu.Unlock()
+	if closing {
+		return
+	}
+	c.markDown("process_exit", err)
+}
+
+func (c *Client) markDown(reason string, err error) {
+	c.downOnce.Do(func() {
+		c.mu.RLock()
+		handler := c.onDown
+		runnerID := c.runnerID
+		c.mu.RUnlock()
+		if handler != nil {
+			handler(context.Background(), runnerID, reason, err)
+		}
+	})
+}
+
+func (c *Client) notifyHeartbeatMissed(missed int, err error) {
+	c.mu.RLock()
+	handler := c.onHeartbeatMissed
+	runnerID := c.runnerID
+	c.mu.RUnlock()
+	if handler != nil {
+		handler(context.Background(), runnerID, missed, err)
+	}
+}
+
+func (c *Client) notifyHeartbeatRecovered() {
+	c.mu.RLock()
+	handler := c.onHeartbeatRecovered
+	runnerID := c.runnerID
+	c.mu.RUnlock()
+	if handler != nil {
+		handler(context.Background(), runnerID)
+	}
+}
+
+func (c *Client) setClosing() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closing = true
+}
+
+func (c *Client) isClosing() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.closing
+}
+
+func (c *Client) commandDone() <-chan struct{} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cmdDone
+}
+
+func (c *Client) commandErr() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cmdErr
 }
 
 func readReadyLine(ctx context.Context, r io.Reader) (string, error) {

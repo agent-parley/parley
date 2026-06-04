@@ -25,7 +25,17 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.writePage(w, "index.html", web.IndexData{Runs: runs, CSRF: csrfFromContext(r.Context()), Title: "Parley"})
+	runners, err := s.store.ListRunners(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	runnerEventPage, err := s.store.ListSystemEventsPage(r.Context(), parseInt64Query(r, "runner_events_before"), 50)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.writePage(w, "index.html", web.IndexData{Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, CSRF: csrfFromContext(r.Context()), Title: "Parley"})
 }
 
 func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
@@ -62,6 +72,10 @@ func (s *Server) handleRunPath(w http.ResponseWriter, r *http.Request) {
 		s.handleRunEvents(w, r, runID)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "cancel" {
+		s.handleCancelRun(w, r, runID)
+		return
+	}
 	if len(parts) == 1 {
 		s.handleRunDetail(w, r, runID)
 		return
@@ -80,6 +94,18 @@ func (s *Server) handleRunDetail(w http.ResponseWriter, r *http.Request, runID s
 		return
 	}
 	s.writePage(w, "run.html", web.NewRunData(bundle, csrfFromContext(r.Context()), "Run "+runID))
+}
+
+func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request, runID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.engine.CancelRun(r.Context(), runID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/runs/"+runID, http.StatusSeeOther)
 }
 
 func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request, runID string) {
@@ -165,6 +191,18 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 func artifactIsHTML(mediaType string) bool {
 	mediaType = strings.ToLower(mediaType)
 	return strings.HasPrefix(mediaType, "text/html") || strings.Contains(mediaType, "html")
+}
+
+func parseInt64Query(r *http.Request, key string) int64 {
+	value := r.URL.Query().Get(key)
+	if value == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 func (s *Server) writePage(w http.ResponseWriter, name string, data any) {

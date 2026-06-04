@@ -10,21 +10,22 @@ import (
 	"github.com/agent-parley/parley/internal/manager/web"
 )
 
-type RunStarter interface {
+type RunController interface {
 	StartRun(context.Context, string) (string, error)
+	CancelRun(context.Context, string) error
 }
 
 type Server struct {
 	addr     string
 	store    *store.Store
-	engine   RunStarter
+	engine   RunController
 	hub      *Hub
 	renderer web.Renderer
 	security *security
 	http     *http.Server
 }
 
-func NewServer(addr string, st *store.Store, engine RunStarter, hub *Hub, renderer web.Renderer) *Server {
+func NewServer(addr string, st *store.Store, engine RunController, hub *Hub, renderer web.Renderer) *Server {
 	if addr == "" {
 		addr = "127.0.0.1:8080"
 	}
