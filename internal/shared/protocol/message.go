@@ -247,7 +247,11 @@ func (s *Session) reader(ctx context.Context) {
 	for {
 		var msg Message
 		if err := wsjson.Read(ctx, s.conn, &msg); err != nil {
-			debugf("reader read error: %v", err)
+			if status := websocket.CloseStatus(err); status == websocket.StatusNormalClosure || status == websocket.StatusGoingAway {
+				debugf("reader: peer closed session normally (%s)", status)
+			} else {
+				debugf("reader read error: %v", err)
+			}
 			s.close()
 			return
 		}
