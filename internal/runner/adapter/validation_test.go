@@ -71,7 +71,7 @@ func TestValidationGateTruthTable(t *testing.T) {
 			if fp.inv.Network != provider.NetworkNone {
 				t.Fatalf("validation network = %s, want none", fp.inv.Network)
 			}
-			if strings.Join(fp.inv.Command, " ") != "sh -lc echo validate" {
+			if strings.Join(fp.inv.Command, " ") != "sh -c echo validate" {
 				t.Fatalf("validation command = %#v", fp.inv.Command)
 			}
 		})

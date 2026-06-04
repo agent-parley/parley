@@ -62,12 +62,31 @@ func (a Validation) Run(ctx context.Context, disp contract.Dispatch, sink runner
 		return report.Report{}, err
 	}
 
+	// Snapshot untracked files so we can strip whatever the validation command
+	// writes into the worktree (e.g. `go build ./...` drops a compiled binary)
+	// before capturing the diff. Otherwise that build output pollutes both the
+	// diff.patch artifact and the hook-free commit (`git add -A`), which must
+	// reflect only the worker's changes (ADR 0072). A failed snapshot disables
+	// cleanup — never strip against an empty baseline, or worker files go too.
+	baseline, baselineErr := worktree.ListUntrackedFiles(ctx, prepared.WorktreePath)
+
 	result, runErr := a.opts.Provider.Run(ctx, prepared.Invocation, sink)
 	if ctx.Err() != nil {
 		return report.Report{}, fmt.Errorf("validation canceled: %w", ctx.Err())
 	}
 	if runErr != nil && result.StartedAt.IsZero() {
 		return validationFailureReport(disp, "validation sandbox failed to start", runErr, validationPayload(prepared, result, runErr, "")), nil
+	}
+
+	var removed []string
+	if baselineErr == nil {
+		var cleanupErr error
+		removed, cleanupErr = worktree.RemoveCreatedUntracked(ctx, prepared.WorktreePath, baseline)
+		if cleanupErr != nil {
+			if emitErr := sink.Emit(ctx, validationEvent(disp, "validation worktree cleanup incomplete", map[string]any{"error": cleanupErr.Error()})); emitErr != nil {
+				return report.Report{}, emitErr
+			}
+		}
 	}
 
 	diffPath := filepath.Join(prepared.ArtifactDir, "diff.patch")
@@ -86,6 +105,9 @@ func (a Validation) Run(ctx context.Context, disp contract.Dispatch, sink runner
 	passed := exitZero && diffNonEmpty && runErr == nil
 	payload["gate"] = map[string]any{"exit_zero": exitZero, "diff_non_empty": diffNonEmpty, "passed": passed}
 	payload["diff_bytes"] = len(diff)
+	if len(removed) > 0 {
+		payload["worktree_artifacts_removed"] = removed
+	}
 
 	status := report.StatusCompleted
 	summary := "validation passed"
@@ -171,11 +193,13 @@ func (a Validation) Prepare(disp contract.Dispatch) (ValidationPreparedRun, erro
 			// Validation runs as a non-root keep-id user, but stock toolchain
 			// images (e.g. golang) default HOME=/ and GOPATH=/go — neither
 			// writable by the mapped uid — which breaks the Go build/test cache.
-			// Redirect writable state into the rw workspace mount. Harmless for
-			// non-Go validation commands.
-			"HOME":    containerWorkspacePath,
-			"GOCACHE": containerWorkspacePath + "/.gocache",
-			"GOPATH":  containerWorkspacePath + "/.gopath",
+			// Point writable state at container-local /tmp (world-writable 1777,
+			// not bind-mounted) rather than the SELinux :Z-relabeled workspace
+			// mount, so the build cache's many small files never touch the host
+			// artifact dir. Harmless for non-Go validation commands.
+			"HOME":    "/tmp",
+			"GOCACHE": "/tmp/gocache",
+			"GOPATH":  "/tmp/gopath",
 		},
 		// Use a non-login shell: `sh -lc` sources /etc/profile, which resets
 		// PATH to the Debian default and drops the toolchain image's
