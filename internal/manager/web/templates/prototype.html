@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <script type="module" src="/assets/datastar.min.js"></script>
+  <style>{{template "styles" .}}</style>
+</head>
+<body>
+  <main class="prototype-shell">
+    <header class="prototype-hero">
+      <p class="eyebrow">Disposable prototype · seeded data · no real dispatch</p>
+      <h1>Parley operator UI prototype</h1>
+      <p>Compare richer hypermedia-first layouts for run outcomes, Runner health, stage timelines, event taxonomy, diff.patch, and outputs.</p>
+      <nav class="prototype-toggle" aria-label="Prototype variations">
+        {{range .Variations}}
+        <a class="toggle-link {{if eq $.Variation .ID}}active{{end}}" href="/prototype?v={{.ID}}&amp;run={{$.Selected.View.Run.ID}}"><strong>{{.Name}}</strong><span>{{.Summary}}</span></a>
+        {{end}}
+      </nav>
+      {{if .Feedback}}<p class="prototype-feedback">{{.Feedback}}</p>{{end}}
+    </header>
+
+    {{if eq .Variation "1"}}
+    <section class="prototype-layout command-center">
+      <aside class="prototype-sidebar">
+        <section class="card compact-card">
+          <h2>Create run</h2>
+          <form method="get" action="/prototype">
+            <input type="hidden" name="v" value="{{.Variation}}">
+            <input type="hidden" name="run" value="{{.Selected.View.Run.ID}}">
+            <input type="hidden" name="mock" value="create">
+            <label for="prototype-idea-1">Task plan seed</label>
+            <textarea id="prototype-idea-1" name="idea" rows="4" placeholder="Describe a change for Parley to drive through the workflow."></textarea>
+            <button type="submit">Mock create run</button>
+          </form>
+        </section>
+
+        <section class="card compact-card">
+          <h2>Runner health</h2>
+          <div class="runner-grid">
+            {{range .Runners}}
+            <article class="runner-card">
+              <div><strong>{{.Runner.ID}}</strong> <span class="pill {{statusClass .Runner.Status}}">{{.Runner.Status}}</span></div>
+              <p>{{.Summary}}</p>
+              <p class="muted">origin: {{.Runner.Origin}} · missed heartbeats: {{.Runner.MissedHeartbeats}}</p>
+            </article>
+            {{end}}
+          </div>
+        </section>
+
+        <section class="card compact-card">
+          <h2>Run outcomes</h2>
+          <ul class="run-list outcome-list">
+            {{range .Runs}}
+            <li class="{{if eq $.Selected.View.Run.ID .View.Run.ID}}selected{{end}}">
+              <a href="/prototype?v={{$.Variation}}&amp;run={{.View.Run.ID}}"><strong>{{short .View.Run.ID}}</strong></a>
+              <span class="pill {{statusClass .View.Run.Status}}">{{.View.Run.Status}}</span>
+              <br><span>{{.View.Run.Idea}}</span>
+              <br><small>{{.OutcomeNote}}</small>
+            </li>
+            {{end}}
+          </ul>
+        </section>
+      </aside>
+
+      <section class="prototype-main">
+        <section class="card run-spotlight">
+          <div class="split-heading">
+            <div>
+              <p class="eyebrow">Selected run</p>
+              <h2>{{.Selected.View.Run.Idea}}</h2>
+              <p>Run outcome: <span class="pill {{statusClass .Selected.View.Run.Status}}">{{.Selected.View.Run.Status}}</span> · Runner <code>{{.Selected.RunnerID}}</code> <span class="pill {{statusClass .Selected.RunnerHealth}}">{{.Selected.RunnerHealth}}</span></p>
+            </div>
+            <form method="get" action="/prototype" class="inline-action">
+              <input type="hidden" name="v" value="{{.Variation}}">
+              <input type="hidden" name="run" value="{{.Selected.View.Run.ID}}">
+              <input type="hidden" name="mock" value="cancel">
+              {{if .Selected.CancelEnabled}}<button type="submit" class="danger">Mock cancel run</button>{{else}}<button type="button" disabled>Cancel unavailable</button>{{end}}
+            </form>
+          </div>
+          <p class="idea">{{.Selected.TaskPlan}}</p>
+        </section>
+
+        <section class="card">
+          <h2>Stage timeline linked to events</h2>
+          <ol class="stage-rail">
+            {{range .Selected.StageGroups}}
+            <li class="stage-node {{statusClass .Stage.Status}}">
+              <div class="stage-node-header"><strong>{{.Label}}</strong> <code>{{.Stage.StageType}}</code> <span class="pill {{statusClass .Stage.Status}}">{{.Stage.Status}}</span></div>
+              <p class="muted">{{.Performer}}</p>
+              {{if .Events}}
+              <ol class="event-chips">
+                {{range .Events}}
+                <li><span class="seq">#{{.Event.Sequence}}</span> <strong>{{.Event.Type}}</strong> <span class="muted">{{.ActorLabel}}</span><br>{{.Event.Summary}}</li>
+                {{end}}
+              </ol>
+              {{else}}
+              <p class="muted">No stage-scoped events yet.</p>
+              {{end}}
+            </li>
+            {{end}}
+          </ol>
+        </section>
+
+        <section class="card two-column-card">
+          <div>
+            <h2>diff.patch</h2>
+            {{if .Selected.View.PRReady.Ready}}<p>PR-ready branch: <code>{{.Selected.View.PRReady.Branch}}</code>{{if .Selected.View.PRReady.CommitSHA}} · commit <code>{{.Selected.View.PRReady.CommitSHA}}</code>{{end}}</p>{{end}}
+            {{if .Selected.View.DiffPatch.ID}}
+            <p>Diff output ID: <code>{{.Selected.View.DiffPatch.ID}}</code></p>
+            <pre class="diff-preview">{{.Selected.View.DiffPatch.Preview}}</pre>
+            {{else}}
+            <p>No diff.patch output yet.</p>
+            {{end}}
+          </div>
+          <div>
+            <h2>Outputs / artifacts</h2>
+            {{template "prototype-artifacts" .Selected}}
+          </div>
+        </section>
+      </section>
+    </section>
+    {{end}}
+
+    {{if eq .Variation "2"}}
+    <section class="prototype-layout map-layout">
+      <section class="card map-intro">
+        <div>
+          <p class="eyebrow">Timeline-first</p>
+          <h2>{{.Selected.View.Run.Idea}}</h2>
+          <p>{{.Selected.OutcomeNote}}</p>
+        </div>
+        <form method="get" action="/prototype" class="inline-action">
+          <input type="hidden" name="v" value="{{.Variation}}">
+          <input type="hidden" name="run" value="{{.Selected.View.Run.ID}}">
+          <input type="hidden" name="mock" value="cancel">
+          {{if .Selected.CancelEnabled}}<button type="submit" class="danger">Mock cancel run</button>{{else}}<button type="button" disabled>Cancel unavailable</button>{{end}}
+        </form>
+      </section>
+
+      <section class="stage-board">
+        {{range .Selected.StageGroups}}
+        <article class="stage-lane {{statusClass .Stage.Status}}">
+          <header>
+            <p class="eyebrow">{{.Stage.StageType}}</p>
+            <h3>{{.Label}}</h3>
+            <span class="pill {{statusClass .Stage.Status}}">{{.Stage.Status}}</span>
+            <p class="muted">{{.Performer}}</p>
+          </header>
+          {{if .Events}}
+          <ol class="lane-events">
+            {{range .Events}}
+            <li>
+              <span class="family-tag">{{.Family}}</span>
+              <strong>{{.Event.Type}}</strong>
+              <p>{{.Event.Summary}}</p>
+              <small>#{{.Event.Sequence}} · {{.ActorLabel}}</small>
+            </li>
+            {{end}}
+          </ol>
+          {{else}}
+          <p class="muted">Waiting for events.</p>
+          {{end}}
+        </article>
+        {{end}}
+      </section>
+
+      <section class="prototype-lower-grid">
+        <section class="card compact-card">
+          <h2>Run list</h2>
+          <ul class="run-list">
+            {{range .Runs}}
+            <li><a href="/prototype?v={{$.Variation}}&amp;run={{.View.Run.ID}}">{{short .View.Run.ID}}</a> <span class="pill {{statusClass .View.Run.Status}}">{{.View.Run.Status}}</span><br>{{.View.Run.Idea}}</li>
+            {{end}}
+          </ul>
+        </section>
+        <section class="card compact-card">
+          <h2>Runner timeline</h2>
+          <ol class="events compact-events">
+            {{range .RunnerEvents}}
+            <li><span class="seq">#{{.Event.Sequence}}</span> <strong>{{.Event.Type}}</strong><br>{{.Event.Summary}}</li>
+            {{end}}
+          </ol>
+        </section>
+        <section class="card compact-card">
+          <h2>Diff + outputs</h2>
+          {{if .Selected.View.DiffPatch.ID}}<p><code>{{.Selected.View.DiffPatch.ID}}</code> is shown as escaped text.</p>{{else}}<p>No diff.patch output yet.</p>{{end}}
+          {{template "prototype-artifacts" .Selected}}
+        </section>
+      </section>
+    </section>
+    {{end}}
+
+    {{if eq .Variation "3"}}
+    <section class="prototype-layout safety-layout">
+      <section class="card safety-command">
+        <div>
+          <p class="eyebrow">Safety review console</p>
+          <h2>{{.Selected.View.Run.Idea}}</h2>
+          <p>Run outcome: <span class="pill {{statusClass .Selected.View.Run.Status}}">{{.Selected.View.Run.Status}}</span> · Runner health: <span class="pill {{statusClass .Selected.RunnerHealth}}">{{.Selected.RunnerHealth}}</span></p>
+          <ul class="check-list">
+            {{range .Selected.SafetyHighlights}}<li>{{.}}</li>{{end}}
+          </ul>
+        </div>
+        <div class="action-stack">
+          <form method="get" action="/prototype">
+            <input type="hidden" name="v" value="{{.Variation}}">
+            <input type="hidden" name="run" value="{{.Selected.View.Run.ID}}">
+            <input type="hidden" name="mock" value="create">
+            <label for="prototype-idea-3">New task plan seed</label>
+            <textarea id="prototype-idea-3" name="idea" rows="3"></textarea>
+            <button type="submit">Mock create run</button>
+          </form>
+          <form method="get" action="/prototype">
+            <input type="hidden" name="v" value="{{.Variation}}">
+            <input type="hidden" name="run" value="{{.Selected.View.Run.ID}}">
+            <input type="hidden" name="mock" value="cancel">
+            {{if .Selected.CancelEnabled}}<button type="submit" class="danger">Mock cancel run</button>{{else}}<button type="button" disabled>Cancel unavailable</button>{{end}}
+          </form>
+        </div>
+      </section>
+
+      <section class="review-grid">
+        <section class="card diff-card">
+          <h2>diff.patch review</h2>
+          {{if .Selected.View.DiffPatch.ID}}
+          <p>Output ID: <code>{{.Selected.View.DiffPatch.ID}}</code>. Rendered with escaped preformatted text.</p>
+          <pre class="diff-preview large-diff">{{.Selected.View.DiffPatch.Preview}}</pre>
+          {{else}}
+          <p>No diff.patch output yet.</p>
+          {{end}}
+        </section>
+        <section class="card">
+          <h2>Outputs</h2>
+          {{template "prototype-artifacts" .Selected}}
+        </section>
+      </section>
+
+      <section class="card">
+        <h2>Evidence trail</h2>
+        <div class="evidence-grid">
+          {{range .Selected.EventViews}}
+          <article class="event-card">
+            <span class="family-tag">{{.Family}}</span>
+            <strong>{{.Event.Type}}</strong>
+            <p>{{.Event.Summary}}</p>
+            <small>#{{.Event.Sequence}} · {{if .StageType}}{{.StageLabel}}{{else}}run lifecycle{{end}} · {{.ActorLabel}}</small>
+          </article>
+          {{end}}
+        </div>
+      </section>
+
+      <section class="prototype-lower-grid">
+        <section class="card compact-card">
+          <h2>Run outcomes</h2>
+          <ul class="run-list">
+            {{range .Runs}}
+            <li><a href="/prototype?v={{$.Variation}}&amp;run={{.View.Run.ID}}">{{short .View.Run.ID}}</a> <span class="pill {{statusClass .View.Run.Status}}">{{.View.Run.Status}}</span><br>{{.OutcomeNote}}</li>
+            {{end}}
+          </ul>
+        </section>
+        <section class="card compact-card">
+          <h2>Runner health</h2>
+          {{range .Runners}}
+          <p><strong>{{.Runner.ID}}</strong> <span class="pill {{statusClass .Runner.Status}}">{{.Runner.Status}}</span><br><span class="muted">{{.Summary}}</span></p>
+          {{end}}
+        </section>
+      </section>
+    </section>
+    {{end}}
+  </main>
+</body>
+</html>
+
+{{define "prototype-artifacts"}}
+{{if .View.ArtifactViews}}
+<ul class="artifact-list">
+  {{range .View.ArtifactViews}}
+  <li>
+    <div><strong>{{.Kind}}</strong> <code>{{.ID}}</code></div>
+    <p class="muted">{{.MediaType}}{{if .DownloadOnly}} · download only; never rendered inline{{end}}</p>
+    {{if .DownloadOnly}}<span class="safety-tag">raw HTML treated as download</span>{{end}}
+    {{if .Preview}}<pre class="artifact-preview">{{.Preview}}</pre>{{end}}
+  </li>
+  {{end}}
+</ul>
+{{else}}
+<p>No outputs yet.</p>
+{{end}}
+{{end}}

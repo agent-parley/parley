@@ -76,7 +76,7 @@ func NewRunView(bundle store.RunBundle) RunView {
 }
 
 func NewRenderer() (*TemplateRenderer, error) {
-	funcs := template.FuncMap{"short": short, "statusClass": statusClass}
+	funcs := template.FuncMap{"short": short, "statusClass": statusClass, "stageLabel": stageLabel, "eventFamily": eventFamily}
 	tmpl, err := template.New("").Funcs(funcs).ParseFS(Embedded, "templates/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("parse templates: %w", err)
@@ -174,8 +174,12 @@ func statusClass(status string) string {
 	switch status {
 	case "completed", "connected":
 		return "status-completed"
-	case "failed", "invalid", "down", "cancelled":
+	case "failed", "invalid", "down":
 		return "status-failed"
+	case "cancelled":
+		return "status-cancelled"
+	case "abandoned", "needs_input":
+		return "status-abandoned"
 	case "running", "suspect":
 		return "status-running"
 	default:

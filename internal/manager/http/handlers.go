@@ -38,6 +38,19 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	s.writePage(w, "index.html", web.IndexData{Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, CSRF: csrfFromContext(r.Context()), Title: "Parley"})
 }
 
+func (s *Server) handlePrototype(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/prototype" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	query := r.URL.Query()
+	s.writePage(w, "prototype.html", web.NewPrototypeData(query.Get("v"), query.Get("run"), query.Get("mock")))
+}
+
 func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/runs" {
 		http.NotFound(w, r)

@@ -1,4 +1,4 @@
-.PHONY: build test vet run clean test-race test-integration test-live-m4 test-live-m5 test-live-m5-loop
+.PHONY: build test vet run prototype clean test-race test-integration test-live-m4 test-live-m5 test-live-m5-loop
 
 BIN_DIR := bin
 MANAGER := $(BIN_DIR)/parley
@@ -66,6 +66,9 @@ test-live-m5-loop: build
 
 run: build
 	PARLEY_RUNNER_BIN=$$(pwd)/$(RUNNER) ./$(MANAGER)
+
+prototype:
+	go run ./cmd/parley-prototype
 
 clean:
 	rm -rf $(BIN_DIR) .parley-data
