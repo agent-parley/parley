@@ -11,6 +11,12 @@
   <main>
     <nav><a href="/">← Runs</a></nav>
     {{template "run_summary.html" .View}}
+    <section class="card">
+      <form method="post" action="/runs/{{.View.Run.ID}}/cancel">
+        <input type="hidden" name="_csrf" value="{{.CSRF}}">
+        <button type="submit" class="danger">Cancel run</button>
+      </form>
+    </section>
     {{template "stage_statuses.html" .View}}
     {{template "event_log.html" .View}}
     {{template "diff_patch.html" .View}}

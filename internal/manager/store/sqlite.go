@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,9 +29,17 @@ const (
 	RunStatusFailed     = "failed"
 	RunStatusInvalid    = "invalid"
 	RunStatusNeedsInput = "needs_input"
+	RunStatusCancelled  = "cancelled"
 
 	StageStatusPending = "pending"
 	StageStatusRunning = "running"
+
+	RunnerStatusConnected = "connected"
+	RunnerStatusSuspect   = "suspect"
+	RunnerStatusDown      = "down"
+
+	RunnerOriginSpawned    = "spawned"
+	RunnerOriginRegistered = "registered"
 )
 
 type Store struct {
@@ -85,6 +94,16 @@ type Artifact struct {
 	MediaType string
 	Path      string
 	CreatedAt string
+}
+
+type Runner struct {
+	ID               string
+	Status           string
+	Origin           string
+	CapabilitiesJSON string
+	MissedHeartbeats int
+	ConnectedAt      string
+	UpdatedAt        string
 }
 
 type WorkflowRun struct {
@@ -142,6 +161,125 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, string(schema)); err != nil {
 		return fmt.Errorf("migrate sqlite: %w", err)
+	}
+	if err := s.ensureRunnerRegistrySchema(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureEventsSchema(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+type sqliteColumn struct {
+	Name    string
+	NotNull bool
+}
+
+func (s *Store) tableColumns(ctx context.Context, table string) (map[string]sqliteColumn, error) {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return nil, fmt.Errorf("pragma table_info %s: %w", table, err)
+	}
+	defer rows.Close()
+	cols := map[string]sqliteColumn{}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &defaultValue, &pk); err != nil {
+			return nil, fmt.Errorf("scan table_info %s: %w", table, err)
+		}
+		cols[name] = sqliteColumn{Name: name, NotNull: notnull != 0}
+	}
+	return cols, rows.Err()
+}
+
+func (s *Store) ensureRunnerRegistrySchema(ctx context.Context) error {
+	cols, err := s.tableColumns(ctx, "runner_registry")
+	if err != nil {
+		return err
+	}
+	if _, ok := cols["origin"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE runner_registry ADD COLUMN origin TEXT NOT NULL DEFAULT 'registered'`); err != nil {
+			return fmt.Errorf("add runner origin column: %w", err)
+		}
+	}
+	if _, ok := cols["missed_heartbeats"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE runner_registry ADD COLUMN missed_heartbeats INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add runner missed_heartbeats column: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureEventsSchema(ctx context.Context) error {
+	cols, err := s.tableColumns(ctx, "events")
+	if err != nil {
+		return err
+	}
+	needsRebuild := false
+	if _, ok := cols["scope"]; !ok {
+		needsRebuild = true
+	}
+	if runID, ok := cols["run_id"]; ok && runID.NotNull {
+		needsRebuild = true
+	}
+	if needsRebuild {
+		if err := s.rebuildEventsTable(ctx); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_events_run_sequence ON events(run_id, sequence)`); err != nil {
+		return fmt.Errorf("create events run index: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_events_scope_sequence ON events(scope, sequence)`); err != nil {
+		return fmt.Errorf("create events scope index: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) rebuildEventsTable(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin events rebuild: %w", err)
+	}
+	defer rollback(tx)
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE events RENAME TO events_legacy`); err != nil {
+		return fmt.Errorf("rename legacy events: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE events (
+  id TEXT PRIMARY KEY,
+  run_id TEXT REFERENCES runs(id),
+  scope TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  timestamp TEXT NOT NULL,
+  task_id TEXT,
+  attempt_id TEXT,
+  type TEXT NOT NULL,
+  actor_kind TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  data_json TEXT NOT NULL,
+  envelope_json TEXT NOT NULL,
+  UNIQUE(scope, sequence)
+)`); err != nil {
+		return fmt.Errorf("create events table: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO events(id, run_id, scope, sequence, timestamp, task_id, attempt_id, type, actor_kind, actor_id, summary, data_json, envelope_json)
+SELECT id, run_id, 'run:' || run_id, sequence, timestamp, task_id, attempt_id, type, actor_kind, actor_id, summary, data_json, envelope_json
+FROM events_legacy ORDER BY run_id, sequence`); err != nil {
+		return fmt.Errorf("copy legacy events: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE events_legacy`); err != nil {
+		return fmt.Errorf("drop legacy events: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit events rebuild: %w", err)
 	}
 	return nil
 }
@@ -288,6 +426,27 @@ func (s *Store) UpdateRunStatus(ctx context.Context, runID, status string) error
 	return nil
 }
 
+func (s *Store) UpdateRunStatusIfOpen(ctx context.Context, runID, status string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE runs SET status = ?, updated_at = ? WHERE id = ? AND status NOT IN (?, ?, ?, ?, ?)`, status, nowRFC3339(), runID, RunStatusCompleted, RunStatusFailed, RunStatusInvalid, RunStatusNeedsInput, RunStatusCancelled)
+	if err != nil {
+		return false, fmt.Errorf("update open run status: %w", err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read rows affected: %w", err)
+	}
+	return changed > 0, nil
+}
+
+func RunStatusIsTerminal(status string) bool {
+	switch status {
+	case RunStatusCompleted, RunStatusFailed, RunStatusInvalid, RunStatusNeedsInput, RunStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Store) UpdateStageStatus(ctx context.Context, stageID, status string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE stages SET status = ?, updated_at = ? WHERE id = ?`, status, nowRFC3339(), stageID)
 	if err != nil {
@@ -352,13 +511,14 @@ func (s *Store) AppendEvent(ctx context.Context, ev event.Event) (event.Event, e
 	if ev.Data == nil {
 		ev.Data = map[string]any{}
 	}
+	scope := eventScope(ev)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return event.Event{}, fmt.Errorf("begin append event: %w", err)
 	}
 	defer rollback(tx)
 	var last sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT MAX(sequence) FROM events WHERE run_id = ?`, ev.RunID).Scan(&last); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT MAX(sequence) FROM events WHERE scope = ?`, scope).Scan(&last); err != nil {
 		return event.Event{}, fmt.Errorf("query last event sequence: %w", err)
 	}
 	if last.Valid {
@@ -374,23 +534,37 @@ func (s *Store) AppendEvent(ctx context.Context, ev event.Event) (event.Event, e
 	if err != nil {
 		return event.Event{}, fmt.Errorf("marshal event envelope: %w", err)
 	}
-	var eventLogPath string
-	if err := tx.QueryRowContext(ctx, `SELECT artifacts.path FROM runs JOIN artifacts ON artifacts.id = runs.event_log_artifact_id WHERE runs.id = ?`, ev.RunID).Scan(&eventLogPath); err != nil {
-		return event.Event{}, fmt.Errorf("get event log artifact path: %w", err)
+	var runID any
+	if ev.RunID != "" {
+		runID = ev.RunID
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO events(id, run_id, sequence, timestamp, task_id, attempt_id, type, actor_kind, actor_id, summary, data_json, envelope_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, ev.ID, ev.RunID, ev.Sequence, ev.Timestamp, ev.TaskID, ev.AttemptID, ev.Type, ev.Actor.Kind, ev.Actor.ID, ev.Summary, string(dataJSON), string(envelopeJSON)); err != nil {
+	var taskID any
+	if ev.TaskID != "" {
+		taskID = ev.TaskID
+	}
+	var attemptID any
+	if ev.AttemptID != "" {
+		attemptID = ev.AttemptID
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO events(id, run_id, scope, sequence, timestamp, task_id, attempt_id, type, actor_kind, actor_id, summary, data_json, envelope_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, ev.ID, runID, scope, ev.Sequence, ev.Timestamp, taskID, attemptID, ev.Type, ev.Actor.Kind, ev.Actor.ID, ev.Summary, string(dataJSON), string(envelopeJSON)); err != nil {
 		return event.Event{}, fmt.Errorf("insert event: %w", err)
 	}
-	f, err := os.OpenFile(eventLogPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
-	if err != nil {
-		return event.Event{}, fmt.Errorf("open event jsonl artifact: %w", err)
-	}
-	if _, err := f.Write(append(envelopeJSON, '\n')); err != nil {
-		_ = f.Close()
-		return event.Event{}, fmt.Errorf("append event jsonl artifact: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return event.Event{}, fmt.Errorf("close event jsonl artifact: %w", err)
+	if ev.RunID != "" {
+		var eventLogPath string
+		if err := tx.QueryRowContext(ctx, `SELECT artifacts.path FROM runs JOIN artifacts ON artifacts.id = runs.event_log_artifact_id WHERE runs.id = ?`, ev.RunID).Scan(&eventLogPath); err != nil {
+			return event.Event{}, fmt.Errorf("get event log artifact path: %w", err)
+		}
+		f, err := os.OpenFile(eventLogPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+		if err != nil {
+			return event.Event{}, fmt.Errorf("open event jsonl artifact: %w", err)
+		}
+		if _, err := f.Write(append(envelopeJSON, '\n')); err != nil {
+			_ = f.Close()
+			return event.Event{}, fmt.Errorf("append event jsonl artifact: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return event.Event{}, fmt.Errorf("close event jsonl artifact: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return event.Event{}, fmt.Errorf("commit append event: %w", err)
@@ -403,7 +577,27 @@ func (s *Store) ListEvents(ctx context.Context, runID string) ([]event.Event, er
 }
 
 func (s *Store) ListEventsAfter(ctx context.Context, runID string, after int64) ([]event.Event, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT envelope_json FROM events WHERE run_id = ? AND sequence > ? ORDER BY sequence ASC`, runID, after)
+	return s.listEventsWhere(ctx, `run_id = ? AND sequence > ?`, []any{runID, after})
+}
+
+func (s *Store) ListRunnerEvents(ctx context.Context, runnerID string) ([]event.Event, error) {
+	return s.ListRunnerEventsAfter(ctx, runnerID, 0)
+}
+
+func (s *Store) ListRunnerEventsAfter(ctx context.Context, runnerID string, after int64) ([]event.Event, error) {
+	return s.listEventsWhere(ctx, `scope = ? AND sequence > ?`, []any{"runner:" + runnerID, after})
+}
+
+func (s *Store) ListSystemEvents(ctx context.Context) ([]event.Event, error) {
+	return s.listEventsWhereOrdered(ctx, `run_id IS NULL`, nil, `rowid ASC`)
+}
+
+func (s *Store) listEventsWhere(ctx context.Context, where string, args []any) ([]event.Event, error) {
+	return s.listEventsWhereOrdered(ctx, where, args, `sequence ASC`)
+}
+
+func (s *Store) listEventsWhereOrdered(ctx context.Context, where string, args []any, orderBy string) ([]event.Event, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT envelope_json FROM events WHERE `+where+` ORDER BY `+orderBy, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list events: %w", err)
 	}
@@ -477,16 +671,70 @@ func (s *Store) SaveWorkflowSnapshot(ctx context.Context, runID string, snapshot
 }
 
 func (s *Store) UpsertRunner(ctx context.Context, runnerID, status string, capabilities any) error {
+	return s.UpsertRunnerWithOrigin(ctx, runnerID, status, RunnerOriginRegistered, capabilities)
+}
+
+func (s *Store) UpsertRunnerWithOrigin(ctx context.Context, runnerID, status, origin string, capabilities any) error {
+	if origin == "" {
+		origin = RunnerOriginRegistered
+	}
 	capJSON, err := json.Marshal(capabilities)
 	if err != nil {
 		return fmt.Errorf("marshal runner capabilities: %w", err)
 	}
 	now := nowRFC3339()
-	_, err = s.db.ExecContext(ctx, `INSERT INTO runner_registry(runner_id, status, capabilities_json, connected_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(runner_id) DO UPDATE SET status = excluded.status, capabilities_json = excluded.capabilities_json, updated_at = excluded.updated_at`, runnerID, status, string(capJSON), now, now)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO runner_registry(runner_id, status, origin, capabilities_json, missed_heartbeats, connected_at, updated_at) VALUES (?, ?, ?, ?, 0, ?, ?) ON CONFLICT(runner_id) DO UPDATE SET status = excluded.status, origin = excluded.origin, capabilities_json = excluded.capabilities_json, missed_heartbeats = 0, updated_at = excluded.updated_at`, runnerID, status, origin, string(capJSON), now, now)
 	if err != nil {
 		return fmt.Errorf("upsert runner: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) UpdateRunnerHealth(ctx context.Context, runnerID, status string, missedHeartbeats int) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE runner_registry SET status = ?, missed_heartbeats = ?, updated_at = ? WHERE runner_id = ?`, status, missedHeartbeats, nowRFC3339(), runnerID)
+	if err != nil {
+		return fmt.Errorf("update runner health: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetRunner(ctx context.Context, runnerID string) (Runner, error) {
+	var runner Runner
+	err := s.db.QueryRowContext(ctx, `SELECT runner_id, status, origin, capabilities_json, missed_heartbeats, connected_at, updated_at FROM runner_registry WHERE runner_id = ?`, runnerID).Scan(&runner.ID, &runner.Status, &runner.Origin, &runner.CapabilitiesJSON, &runner.MissedHeartbeats, &runner.ConnectedAt, &runner.UpdatedAt)
+	if err != nil {
+		return Runner{}, fmt.Errorf("get runner %s: %w", runnerID, err)
+	}
+	return runner, nil
+}
+
+func (s *Store) ListRunners(ctx context.Context) ([]Runner, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT runner_id, status, origin, capabilities_json, missed_heartbeats, connected_at, updated_at FROM runner_registry ORDER BY updated_at DESC, runner_id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list runners: %w", err)
+	}
+	defer rows.Close()
+	var runners []Runner
+	for rows.Next() {
+		var runner Runner
+		if err := rows.Scan(&runner.ID, &runner.Status, &runner.Origin, &runner.CapabilitiesJSON, &runner.MissedHeartbeats, &runner.ConnectedAt, &runner.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan runner: %w", err)
+		}
+		runners = append(runners, runner)
+	}
+	return runners, rows.Err()
+}
+
+func eventScope(ev event.Event) string {
+	if ev.RunID != "" {
+		return "run:" + ev.RunID
+	}
+	if runnerID, ok := ev.Data["runner_id"].(string); ok && runnerID != "" {
+		return "runner:" + runnerID
+	}
+	if strings.HasPrefix(ev.Type, "runner.") && ev.Actor.ID != "" {
+		return "runner:" + ev.Actor.ID
+	}
+	return "system"
 }
 
 func (s *Store) artifactPath(id, ext string) string {

@@ -25,7 +25,17 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.writePage(w, "index.html", web.IndexData{Runs: runs, CSRF: csrfFromContext(r.Context()), Title: "Parley"})
+	runners, err := s.store.ListRunners(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	runnerEvents, err := s.store.ListSystemEvents(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.writePage(w, "index.html", web.IndexData{Runs: runs, Runners: runners, RunnerEvents: runnerEvents, CSRF: csrfFromContext(r.Context()), Title: "Parley"})
 }
 
 func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
@@ -62,6 +72,10 @@ func (s *Server) handleRunPath(w http.ResponseWriter, r *http.Request) {
 		s.handleRunEvents(w, r, runID)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "cancel" {
+		s.handleCancelRun(w, r, runID)
+		return
+	}
 	if len(parts) == 1 {
 		s.handleRunDetail(w, r, runID)
 		return
@@ -80,6 +94,18 @@ func (s *Server) handleRunDetail(w http.ResponseWriter, r *http.Request, runID s
 		return
 	}
 	s.writePage(w, "run.html", web.NewRunData(bundle, csrfFromContext(r.Context()), "Run "+runID))
+}
+
+func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request, runID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.engine.CancelRun(r.Context(), runID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/runs/"+runID, http.StatusSeeOther)
 }
 
 func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request, runID string) {

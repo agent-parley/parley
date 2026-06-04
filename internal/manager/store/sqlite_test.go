@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -46,6 +49,121 @@ func TestStorePersistence(t *testing.T) {
 	}
 	if len(bundle.Stages) != 5 || len(bundle.Events) != 1 || len(bundle.Artifacts) != 2 {
 		t.Fatalf("unexpected bundle counts: stages=%d events=%d artifacts=%d", len(bundle.Stages), len(bundle.Events), len(bundle.Artifacts))
+	}
+}
+
+func TestRunlessRunnerEventPersistsWithNullRunIDAndScopedSequence(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	first, err := st.AppendEvent(ctx, event.Event{SchemaVersion: event.SchemaVersion, Type: "runner.registered", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "registered", Data: map[string]any{"runner_id": "runner_a"}})
+	if err != nil {
+		t.Fatalf("append first runner event: %v", err)
+	}
+	second, err := st.AppendEvent(ctx, event.Event{SchemaVersion: event.SchemaVersion, Type: "runner.ready", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "ready", Data: map[string]any{"runner_id": "runner_a"}})
+	if err != nil {
+		t.Fatalf("append second runner event: %v", err)
+	}
+	other, err := st.AppendEvent(ctx, event.Event{SchemaVersion: event.SchemaVersion, Type: "runner.registered", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "registered", Data: map[string]any{"runner_id": "runner_b"}})
+	if err != nil {
+		t.Fatalf("append other runner event: %v", err)
+	}
+	if first.Sequence != 1 || second.Sequence != 2 || other.Sequence != 1 {
+		t.Fatalf("sequences = %d,%d,%d; want 1,2,1", first.Sequence, second.Sequence, other.Sequence)
+	}
+	var nullRunID int
+	if err := st.DB().QueryRowContext(ctx, `SELECT run_id IS NULL FROM events WHERE id = ?`, first.ID).Scan(&nullRunID); err != nil {
+		t.Fatalf("query null run_id: %v", err)
+	}
+	if nullRunID != 1 {
+		t.Fatal("runner event run_id is not NULL")
+	}
+	events, err := st.ListRunnerEvents(ctx, "runner_a")
+	if err != nil {
+		t.Fatalf("list runner events: %v", err)
+	}
+	if len(events) != 2 || events[0].RunID != "" || events[1].Type != "runner.ready" {
+		t.Fatalf("unexpected runner events: %#v", events)
+	}
+}
+
+func TestSystemEventsUseAppendOrderNotPerScopeSequenceOrID(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	first, err := st.AppendEvent(ctx, event.Event{SchemaVersion: event.SchemaVersion, ID: "evt_z", Timestamp: "2026-06-04T00:00:00Z", Type: "runner.registered", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "registered", Data: map[string]any{"runner_id": "runner_a"}})
+	if err != nil {
+		t.Fatalf("append first: %v", err)
+	}
+	second, err := st.AppendEvent(ctx, event.Event{SchemaVersion: event.SchemaVersion, ID: "evt_a", Timestamp: "2026-06-04T00:00:00Z", Type: "runner.ready", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "ready", Data: map[string]any{"runner_id": "runner_b"}})
+	if err != nil {
+		t.Fatalf("append second: %v", err)
+	}
+	if first.Sequence != 1 || second.Sequence != 1 {
+		t.Fatalf("per-runner sequences = %d,%d; want both 1", first.Sequence, second.Sequence)
+	}
+	events, err := st.ListSystemEvents(ctx)
+	if err != nil {
+		t.Fatalf("list system events: %v", err)
+	}
+	if len(events) != 2 || events[0].ID != first.ID || events[1].ID != second.ID {
+		t.Fatalf("system events = %#v, want append order %s then %s", events, first.ID, second.ID)
+	}
+}
+
+func TestMigrateLegacyEventsBackfillsRunScope(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	artifactDir := filepath.Join(dataDir, "artifacts")
+	if err := os.MkdirAll(artifactDir, 0o700); err != nil {
+		t.Fatalf("mkdir artifacts: %v", err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dataDir, "parley.db"))
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	legacy := `
+CREATE TABLE runs (id TEXT PRIMARY KEY, idea TEXT NOT NULL, status TEXT NOT NULL, event_log_artifact_id TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE artifacts (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), kind TEXT NOT NULL, media_type TEXT NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE events (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), sequence INTEGER NOT NULL, timestamp TEXT NOT NULL, task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, type TEXT NOT NULL, actor_kind TEXT NOT NULL, actor_id TEXT NOT NULL, summary TEXT NOT NULL, data_json TEXT NOT NULL, envelope_json TEXT NOT NULL, UNIQUE(run_id, sequence));
+CREATE INDEX idx_events_run_sequence ON events(run_id, sequence);
+INSERT INTO runs(id, idea, status, event_log_artifact_id, created_at, updated_at) VALUES ('run_legacy', 'idea', 'running', 'artifact_log', '2026-06-04T00:00:00Z', '2026-06-04T00:00:00Z');
+INSERT INTO artifacts(id, run_id, kind, media_type, path, created_at) VALUES ('artifact_log', 'run_legacy', 'event_log', 'application/x-jsonlines', '` + filepath.Join(artifactDir, "artifact_log.jsonl") + `', '2026-06-04T00:00:00Z');
+INSERT INTO events(id, run_id, sequence, timestamp, task_id, attempt_id, type, actor_kind, actor_id, summary, data_json, envelope_json) VALUES ('evt_legacy', 'run_legacy', 1, '2026-06-04T00:00:00Z', 'task_legacy', 'attempt_legacy', 'run.created', 'user', 'test', 'created', '{}', '{"schema_version":1,"id":"evt_legacy","sequence":1,"timestamp":"2026-06-04T00:00:00Z","run_id":"run_legacy","task_id":"task_legacy","attempt_id":"attempt_legacy","type":"run.created","actor":{"kind":"user","id":"test"},"summary":"created","data":{}}');
+`
+	if _, err := db.ExecContext(ctx, legacy); err != nil {
+		_ = db.Close()
+		t.Fatalf("seed legacy db: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	st, err := Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("open migrated store: %v", err)
+	}
+	defer st.Close()
+	var scope string
+	var runIDNotNull int
+	if err := st.DB().QueryRowContext(ctx, `SELECT scope, run_id IS NOT NULL FROM events WHERE id = 'evt_legacy'`).Scan(&scope, &runIDNotNull); err != nil {
+		t.Fatalf("read migrated event row: %v", err)
+	}
+	if scope != "run:run_legacy" || runIDNotNull != 1 {
+		t.Fatalf("migrated scope/run_id = %q/%d, want run:run_legacy/non-null", scope, runIDNotNull)
+	}
+	persisted, err := st.AppendEvent(ctx, event.Event{SchemaVersion: event.SchemaVersion, RunID: "run_legacy", TaskID: "task_legacy", AttemptID: "attempt_legacy", Type: "run.started", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "started", Data: map[string]any{}})
+	if err != nil {
+		t.Fatalf("append after migration: %v", err)
+	}
+	if persisted.Sequence != 2 {
+		t.Fatalf("post-migration sequence = %d, want 2", persisted.Sequence)
 	}
 }
 

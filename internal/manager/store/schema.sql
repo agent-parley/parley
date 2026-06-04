@@ -47,7 +47,9 @@ CREATE TABLE IF NOT EXISTS workflow_snapshots (
 CREATE TABLE IF NOT EXISTS runner_registry (
   runner_id TEXT PRIMARY KEY,
   status TEXT NOT NULL,
+  origin TEXT NOT NULL DEFAULT 'registered',
   capabilities_json TEXT NOT NULL,
+  missed_heartbeats INTEGER NOT NULL DEFAULT 0,
   connected_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -63,18 +65,19 @@ CREATE TABLE IF NOT EXISTS artifacts (
 
 CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL REFERENCES runs(id),
+  run_id TEXT REFERENCES runs(id),
+  scope TEXT NOT NULL,
   sequence INTEGER NOT NULL,
   timestamp TEXT NOT NULL,
-  task_id TEXT NOT NULL,
-  attempt_id TEXT NOT NULL,
+  task_id TEXT,
+  attempt_id TEXT,
   type TEXT NOT NULL,
   actor_kind TEXT NOT NULL,
   actor_id TEXT NOT NULL,
   summary TEXT NOT NULL,
   data_json TEXT NOT NULL,
   envelope_json TEXT NOT NULL,
-  UNIQUE(run_id, sequence)
+  UNIQUE(scope, sequence)
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);

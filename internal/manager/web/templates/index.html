@@ -20,6 +20,26 @@
       </form>
     </section>
     <section class="card">
+      <h2>Runner health</h2>
+      {{if .Runners}}
+      <ul class="run-list">
+        {{range .Runners}}
+        <li><strong>{{short .ID}}</strong> <span class="pill {{statusClass .Status}}">{{.Status}}</span> <span class="muted">origin: {{.Origin}} · missed heartbeats: {{.MissedHeartbeats}}</span><br><small>updated {{.UpdatedAt}}</small></li>
+        {{end}}
+      </ul>
+      {{else}}
+      <p>No runners registered.</p>
+      {{end}}
+      {{if .RunnerEvents}}
+      <h3>Runner timeline</h3>
+      <ol class="events">
+        {{range .RunnerEvents}}
+        <li><span class="seq">#{{.Sequence}}</span> <strong>{{.Type}}</strong> <span class="muted">{{.Actor.Kind}}/{{.Actor.ID}}</span><br>{{.Summary}}</li>
+        {{end}}
+      </ol>
+      {{end}}
+    </section>
+    <section class="card">
       <h2>Runs</h2>
       {{if .Runs}}
       <ul class="run-list">

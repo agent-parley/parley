@@ -2,9 +2,11 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
+	"sync"
 
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/runner/worktree"
@@ -28,11 +30,17 @@ type Broadcaster interface {
 }
 
 type Engine struct {
-	store                 *store.Store
-	runner                Runner
-	renderer              FragmentRenderer
-	broadcast             Broadcaster
-	graph                 Graph
+	store     *store.Store
+	runner    Runner
+	renderer  FragmentRenderer
+	broadcast Broadcaster
+	graph     Graph
+
+	mu          sync.Mutex
+	activeRuns  map[string]context.CancelFunc
+	activeStage map[string]store.Stage
+	cancelling  map[string]bool
+
 	implementationAdapter string
 	validationAdapter     string
 	dataRoot              string
@@ -79,6 +87,9 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 		renderer:              renderer,
 		broadcast:             broadcast,
 		graph:                 NewGraph(),
+		activeRuns:            map[string]context.CancelFunc{},
+		activeStage:           map[string]store.Stage{},
+		cancelling:            map[string]bool{},
 		implementationAdapter: implementationAdapter,
 		validationAdapter:     validationAdapter,
 		dataRoot:              dataRoot,
@@ -108,7 +119,9 @@ func (e *Engine) StartRun(ctx context.Context, idea string) (string, error) {
 	if _, err := e.emit(ctx, runEvent(wr, "run.created", event.Actor{Kind: event.ActorKindUser, ID: "local"}, "run created", map[string]any{"idea": idea})); err != nil {
 		return "", err
 	}
-	go e.executeRun(context.Background(), wr.Run.ID)
+	runCtx, cancel := context.WithCancel(context.Background())
+	e.registerActiveRun(wr.Run.ID, cancel)
+	go e.executeRun(runCtx, wr.Run.ID)
 	return wr.Run.ID, nil
 }
 
@@ -117,7 +130,66 @@ func (e *Engine) CancelRun(ctx context.Context, runID string) error {
 	if err != nil {
 		return err
 	}
-	return e.runner.CancelAttempt(ctx, wr.Run.ID, wr.Task.ID, wr.Attempt.ID)
+	if store.RunStatusIsTerminal(wr.Run.Status) {
+		return nil
+	}
+	e.markCancelling(runID)
+	if cancel := e.activeCancel(runID); cancel != nil {
+		cancel()
+	}
+	if e.runner == nil {
+		return nil
+	}
+	if err := e.runner.CancelAttempt(ctx, wr.Run.ID, wr.Task.ID, wr.Attempt.ID); err != nil && !errors.Is(err, protocol.ErrSessionClosed) {
+		return err
+	}
+	return nil
+}
+
+func (e *Engine) registerActiveRun(runID string, cancel context.CancelFunc) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.activeRuns[runID] = cancel
+}
+
+func (e *Engine) unregisterActiveRun(runID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.activeRuns, runID)
+	delete(e.activeStage, runID)
+	delete(e.cancelling, runID)
+}
+
+func (e *Engine) activeCancel(runID string) context.CancelFunc {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.activeRuns[runID]
+}
+
+func (e *Engine) markCancelling(runID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cancelling[runID] = true
+}
+
+func (e *Engine) isCancelling(runID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cancelling[runID]
+}
+
+func (e *Engine) setActiveStage(runID string, stage store.Stage) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.activeStage[runID] = stage
+}
+
+func (e *Engine) clearActiveStage(runID string, stageID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.activeStage[runID].ID == stageID {
+		delete(e.activeStage, runID)
+	}
 }
 
 func (e *Engine) HandleRunnerEvent(ctx context.Context, ev event.Event) error {
@@ -131,18 +203,80 @@ func (e *Engine) HandleRunnerResult(context.Context, protocol.ResultPayload) err
 
 func (e *Engine) HandleRunnerLog(context.Context, protocol.LogPayload) error { return nil }
 
+func (e *Engine) HandleRunnerDown(ctx context.Context, runnerID, reason string) error {
+	e.mu.Lock()
+	active := make([]string, 0, len(e.activeRuns))
+	cancels := make([]context.CancelFunc, 0, len(e.activeRuns))
+	for runID, cancel := range e.activeRuns {
+		active = append(active, runID)
+		cancels = append(cancels, cancel)
+	}
+	e.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	var joined []error
+	for _, runID := range active {
+		wr, err := e.store.GetWorkflowRun(ctx, runID)
+		if err != nil {
+			joined = append(joined, err)
+			continue
+		}
+		if e.isCancelling(runID) {
+			if err := e.cancelRunTerminal(ctx, wr, "workflow cancelled while runner disconnected"); err != nil {
+				joined = append(joined, err)
+			}
+			continue
+		}
+		changed, err := e.store.UpdateRunStatusIfOpen(ctx, runID, store.RunStatusFailed)
+		if err != nil {
+			joined = append(joined, err)
+			continue
+		}
+		if !changed {
+			continue
+		}
+		_, err = e.emit(ctx, runEvent(wr, "run.failed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "runner disconnected", map[string]any{
+			"terminal_status": store.RunStatusFailed,
+			"reason":          "runner_disconnected",
+			"runner_id":       runnerID,
+			"signal":          reason,
+		}))
+		if err != nil {
+			joined = append(joined, err)
+		}
+	}
+	return errors.Join(joined...)
+}
+
 func (e *Engine) executeRun(ctx context.Context, runID string) {
+	defer e.unregisterActiveRun(runID)
 	if err := e.executeRunErr(ctx, runID); err != nil {
+		if e.isCancelling(runID) {
+			if wr, getErr := e.store.GetWorkflowRun(context.Background(), runID); getErr == nil {
+				if cancelErr := e.cancelRunTerminal(context.Background(), wr, "workflow cancelled"); cancelErr != nil {
+					log.Printf("workflow %s cancel terminal failed: %v", runID, cancelErr)
+				}
+				return
+			}
+		}
 		log.Printf("workflow %s failed: %v", runID, err)
 	}
 }
 
 func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
-	wr, err := e.store.GetWorkflowRun(ctx, runID)
+	wr, err := e.store.GetWorkflowRun(context.Background(), runID)
 	if err != nil {
 		return err
 	}
-	if err := e.store.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusRunning); err != nil {
+	changed, err := e.store.UpdateRunStatusIfOpen(context.Background(), wr.Run.ID, store.RunStatusRunning)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	if _, err := e.emit(context.Background(), runEvent(wr, "run.started", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "run started", map[string]any{"status": store.RunStatusRunning})); err != nil {
 		return err
 	}
 
@@ -155,7 +289,10 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 		return err
 	}
 	if next == NodeStopReport {
-		return e.stopRun(ctx, wr, ideaReport.Status, "workflow stopped after idea intake")
+		return e.stopRun(context.Background(), wr, ideaReport.Status, "workflow stopped after idea intake")
+	}
+	if e.isCancelling(wr.Run.ID) {
+		return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after idea intake")
 	}
 
 	implementationReport, err := e.dispatchStage(ctx, wr, wr.ImplementationStage, e.implementationAdapter, contract.StageTypeImplementation, implementationInput(wr, ideaReport))
@@ -167,7 +304,10 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 		return err
 	}
 	if next == NodeStopReport {
-		return e.stopRun(ctx, wr, implementationReport.Status, "workflow stopped after implementation")
+		return e.stopRun(context.Background(), wr, implementationReport.Status, "workflow stopped after implementation")
+	}
+	if e.isCancelling(wr.Run.ID) {
+		return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after implementation")
 	}
 
 	validationReport, err := e.dispatchStage(ctx, wr, wr.ValidationStage, e.validationAdapter, contract.StageTypeValidation, map[string]any{"idea": wr.Run.Idea})
@@ -179,7 +319,10 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 		return err
 	}
 	if next == NodeStopReport {
-		return e.stopRun(ctx, wr, validationReport.Status, "workflow stopped after validation")
+		return e.stopRun(context.Background(), wr, validationReport.Status, "workflow stopped after validation")
+	}
+	if e.isCancelling(wr.Run.ID) {
+		return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after validation")
 	}
 
 	commitReport, err := e.runCommit(ctx, wr, validationReport)
@@ -191,7 +334,10 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 		return err
 	}
 	if next == NodeStopReport {
-		return e.stopRun(ctx, wr, commitReport.Status, "workflow stopped after commit")
+		return e.stopRun(context.Background(), wr, commitReport.Status, "workflow stopped after commit")
+	}
+	if e.isCancelling(wr.Run.ID) {
+		return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after commit")
 	}
 
 	prReadyReport, err := e.runPRReady(ctx, wr, commitReport)
@@ -203,12 +349,19 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 		return err
 	}
 	if next != NodeDone {
-		return e.stopRun(ctx, wr, prReadyReport.Status, "workflow stopped after pr_ready")
+		return e.stopRun(context.Background(), wr, prReadyReport.Status, "workflow stopped after pr_ready")
 	}
-	if err := e.store.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusCompleted); err != nil {
+	if e.isCancelling(wr.Run.ID) {
+		return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after pr_ready")
+	}
+	changed, err = e.store.UpdateRunStatusIfOpen(context.Background(), wr.Run.ID, store.RunStatusCompleted)
+	if err != nil {
 		return err
 	}
-	_, err = e.emit(ctx, runEvent(wr, "run.completed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "run reached PR-ready human stop", map[string]any{
+	if !changed {
+		return nil
+	}
+	_, err = e.emit(context.Background(), runEvent(wr, "run.completed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "run reached PR-ready human stop", map[string]any{
 		"terminal_status":  store.RunStatusCompleted,
 		"branch":           payloadString(prReadyReport.Payload, "branch"),
 		"commit_sha":       payloadString(prReadyReport.Payload, "commit_sha"),
@@ -252,13 +405,15 @@ func (e *Engine) runIdeaIntake(ctx context.Context, wr store.WorkflowRun) (repor
 		},
 		Errors: []string{},
 	}
-	if err := e.completeStage(ctx, wr, stage, rep); err != nil {
+	if err := e.completeStage(context.Background(), wr, stage, rep); err != nil {
 		return report.Report{}, err
 	}
 	return rep, nil
 }
 
 func (e *Engine) dispatchStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, adapterName, stageType string, input map[string]any) (report.Report, error) {
+	e.setActiveStage(wr.Run.ID, stage)
+	defer e.clearActiveStage(wr.Run.ID, stage.ID)
 	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
 		return report.Report{}, err
 	}
@@ -271,11 +426,23 @@ func (e *Engine) dispatchStage(ctx context.Context, wr store.WorkflowRun, stage 
 		Adapter:   adapterName,
 		Input:     input,
 	}
+	if stageType == contract.StageTypeImplementation {
+		if _, err := e.emit(ctx, stageEvent(wr, stage, "adapter.invocation_prepared", event.Actor{Kind: event.ActorKindAdapter, ID: adapterName}, "adapter invocation prepared", map[string]any{"adapter": adapterName})); err != nil {
+			return report.Report{}, err
+		}
+		if _, err := e.emit(ctx, stageEvent(wr, stage, "adapter.started", event.Actor{Kind: event.ActorKindAdapter, ID: adapterName}, "adapter started", map[string]any{"adapter": adapterName})); err != nil {
+			return report.Report{}, err
+		}
+	}
+	if e.runner == nil {
+		rep := dispatchFailedReport(wr, stage, adapterName, fmt.Errorf("runner unavailable"))
+		return rep, e.completeStage(context.Background(), wr, stage, rep)
+	}
 	rep, err := e.runner.Dispatch(ctx, disp)
 	if err != nil {
 		rep = dispatchFailedReport(wr, stage, adapterName, err)
 	}
-	if err := e.completeStage(ctx, wr, stage, rep); err != nil {
+	if err := e.completeStage(context.Background(), wr, stage, rep); err != nil {
 		return report.Report{}, err
 	}
 	return rep, nil
@@ -289,7 +456,7 @@ func (e *Engine) runCommit(ctx context.Context, wr store.WorkflowRun, validation
 	worktreePath, err := worktree.Locate(e.dataRoot, e.projectID, wr.Run.ID, wr.Task.ID, wr.Attempt.ID)
 	if err != nil {
 		rep := commitFailureReport(wr, stage, err, validationReport)
-		return rep, e.completeStage(ctx, wr, stage, rep)
+		return rep, e.completeStage(context.Background(), wr, stage, rep)
 	}
 	result, err := commitWorktree(ctx, commitOptions{
 		WorktreePath:   worktreePath,
@@ -304,7 +471,7 @@ func (e *Engine) runCommit(ctx context.Context, wr store.WorkflowRun, validation
 	})
 	if err != nil {
 		rep := commitFailureReport(wr, stage, err, validationReport)
-		return rep, e.completeStage(ctx, wr, stage, rep)
+		return rep, e.completeStage(context.Background(), wr, stage, rep)
 	}
 	rep := report.Report{
 		SchemaVersion: report.SchemaVersion,
@@ -328,7 +495,7 @@ func (e *Engine) runCommit(ctx context.Context, wr store.WorkflowRun, validation
 		},
 		Errors: []string{},
 	}
-	if err := e.completeStage(ctx, wr, stage, rep); err != nil {
+	if err := e.completeStage(context.Background(), wr, stage, rep); err != nil {
 		return report.Report{}, err
 	}
 	return rep, nil
@@ -362,13 +529,14 @@ func (e *Engine) runPRReady(ctx context.Context, wr store.WorkflowRun, commitRep
 		},
 		Errors: []string{},
 	}
-	if err := e.completeStage(ctx, wr, stage, rep); err != nil {
+	if err := e.completeStage(context.Background(), wr, stage, rep); err != nil {
 		return report.Report{}, err
 	}
 	return rep, nil
 }
 
 func (e *Engine) startStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, summary string) error {
+	e.setActiveStage(wr.Run.ID, stage)
 	if err := e.store.UpdateStageStatus(ctx, stage.ID, store.StageStatusRunning); err != nil {
 		return err
 	}
@@ -377,6 +545,7 @@ func (e *Engine) startStage(ctx context.Context, wr store.WorkflowRun, stage sto
 }
 
 func (e *Engine) completeStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, rep report.Report) error {
+	defer e.clearActiveStage(wr.Run.ID, stage.ID)
 	if err := rep.Validate(); err != nil {
 		rep = report.Report{
 			SchemaVersion: report.SchemaVersion,
@@ -406,7 +575,12 @@ func (e *Engine) completeStage(ctx context.Context, wr store.WorkflowRun, stage 
 		"report_artifact_id": artifact.ID,
 	}
 	copyPayloadStrings(data, rep.Payload, "branch", "commit_sha", "diff_artifact_id", "task_contract_artifact_id")
-	_, err = e.emit(ctx, stageEvent(wr, stage, completionEventType(rep), reportActor(rep.Actor, stage), rep.Summary, data))
+	if typ := completionEventType(rep); typ != "" {
+		if _, err := e.emit(ctx, stageEvent(wr, stage, typ, reportActor(rep.Actor, stage), rep.Summary, data)); err != nil {
+			return err
+		}
+	}
+	_, err = e.emit(ctx, stageEvent(wr, stage, stageTerminalEventType(rep.Status), event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, stageTerminalSummary(stage, rep), data))
 	return err
 }
 
@@ -431,6 +605,9 @@ func (e *Engine) HandleRunnerArtifact(ctx context.Context, art protocol.Artifact
 }
 
 func (e *Engine) stopRun(ctx context.Context, wr store.WorkflowRun, status, summary string) error {
+	if e.isCancelling(wr.Run.ID) {
+		return e.cancelRunTerminal(ctx, wr, summary)
+	}
 	// Map to the documented run.* terminal taxonomy (event.schema.md): failed and
 	// invalid are failure terminals; needs_input has no resume path in the skeleton
 	// so it terminates as abandoned.
@@ -444,10 +621,26 @@ func (e *Engine) stopRun(ctx context.Context, wr store.WorkflowRun, status, summ
 		runStatus = store.RunStatusNeedsInput
 		eventType = "run.abandoned"
 	}
-	if err := e.store.UpdateRunStatus(ctx, wr.Run.ID, runStatus); err != nil {
+	changed, err := e.store.UpdateRunStatusIfOpen(ctx, wr.Run.ID, runStatus)
+	if err != nil {
 		return err
 	}
-	_, err := e.emit(ctx, runEvent(wr, eventType, event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, summary, map[string]any{"terminal_status": runStatus}))
+	if !changed {
+		return nil
+	}
+	_, err = e.emit(ctx, runEvent(wr, eventType, event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, summary, map[string]any{"terminal_status": runStatus}))
+	return err
+}
+
+func (e *Engine) cancelRunTerminal(ctx context.Context, wr store.WorkflowRun, summary string) error {
+	changed, err := e.store.UpdateRunStatusIfOpen(ctx, wr.Run.ID, store.RunStatusCancelled)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	_, err = e.emit(ctx, runEvent(wr, "run.cancelled", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, summary, map[string]any{"terminal_status": store.RunStatusCancelled}))
 	return err
 }
 
@@ -455,6 +648,10 @@ func (e *Engine) emit(ctx context.Context, ev event.Event) (event.Event, error) 
 	persisted, err := e.store.AppendEvent(ctx, ev)
 	if err != nil {
 		return event.Event{}, err
+	}
+	if persisted.RunID == "" {
+		e.broadcast.Broadcast("", persisted, "")
+		return persisted, nil
 	}
 	bundle, err := e.store.RunBundle(ctx, persisted.RunID)
 	if err != nil {
@@ -557,13 +754,9 @@ func stageEvent(wr store.WorkflowRun, stage store.Stage, typ string, actor event
 	return event.Event{SchemaVersion: event.SchemaVersion, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, Type: typ, Actor: actor, Summary: summary, Data: data}
 }
 
-// completionEventType maps a stage report to an outcome-faithful event type
-// (0068 + event.schema.md). `invalid` is a non-success terminal, so it shares the
-// `.failed` type; the precise status travels in the event's `status` data field.
-// needs_input does not arise from skeleton stages; it folds into `.failed` until
-// human-input stages land, which will route it to approval.requested.
-// Note: event.schema.md does not yet define harness.* completion types; emitting
-// them here keeps the actor and the type consistent (tracked as issue #6).
+// completionEventType maps a stage report to the performer-family detail event
+// from event.schema.md. Unknown/human actors do not emit task.* in the skeleton;
+// the stage terminal event records their lifecycle outcome.
 func completionEventType(rep report.Report) string {
 	failed := rep.Status != report.StatusCompleted
 	switch rep.Actor.Kind {
@@ -578,10 +771,29 @@ func completionEventType(rep report.Report) string {
 		}
 		return "harness.completed"
 	default:
-		if failed {
-			return "task.failed"
-		}
-		return "task.completed"
+		return ""
+	}
+}
+
+func stageTerminalEventType(status string) string {
+	switch status {
+	case report.StatusCompleted:
+		return "stage.completed"
+	case report.StatusInvalid:
+		return "stage.invalid"
+	default:
+		return "stage.failed"
+	}
+}
+
+func stageTerminalSummary(stage store.Stage, rep report.Report) string {
+	switch rep.Status {
+	case report.StatusCompleted:
+		return stage.StageType + " stage completed"
+	case report.StatusInvalid:
+		return stage.StageType + " stage returned invalid report"
+	default:
+		return stage.StageType + " stage failed"
 	}
 }
 

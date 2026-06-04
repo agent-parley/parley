@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	managerhttp "github.com/agent-parley/parley/internal/manager/http"
@@ -11,6 +12,15 @@ import (
 	"github.com/agent-parley/parley/internal/manager/runnerclient"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
+	"github.com/agent-parley/parley/internal/shared/contract"
+	"github.com/agent-parley/parley/internal/shared/event"
+	"github.com/agent-parley/parley/internal/shared/report"
+)
+
+const (
+	spawnedRunnerRestartCap    = 3
+	spawnedRunnerRestartWindow = time.Minute
+	spawnedRunnerRestartDelay  = 250 * time.Millisecond
 )
 
 type Config struct {
@@ -21,10 +31,17 @@ type Config struct {
 }
 
 type App struct {
-	cfg    Config
-	store  *store.Store
-	runner *runnerclient.Client
-	http   *managerhttp.Server
+	cfg       Config
+	store     *store.Store
+	runner    *runnerProxy
+	engine    *orchestrator.Engine
+	http      *managerhttp.Server
+	runnerEnv []string
+
+	mu             sync.Mutex
+	runnerID       string
+	restartHistory []time.Time
+	closing        bool
 }
 
 func New(ctx context.Context, cfg Config) (*App, error) {
@@ -48,28 +65,61 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		return nil, err
 	}
 	hub := managerhttp.NewHub()
-	runner, err := runnerclient.StartChildWithEnv(ctx, cfg.RunnerBin, []string{
-		"PARLEY_ADAPTER=" + cfg.Adapter,
-		"PARLEY_DATA_DIR=" + cfg.DataDir,
-	})
-	if err != nil {
-		_ = st.Close()
-		return nil, err
-	}
-	if err := st.UpsertRunner(ctx, runner.Ready().RunnerID, "connected", runner.Ready().Capabilities); err != nil {
-		_ = runner.Close(context.Background())
-		_ = st.Close()
-		return nil, err
-	}
+	runner := newRunnerProxy()
 	engine := orchestrator.NewEngineWithOptions(st, runner, renderer, hub, orchestrator.EngineOptions{
 		ImplementationAdapter: cfg.Adapter,
 		ValidationAdapter:     "validation",
 		DataRoot:              cfg.DataDir,
 		ProjectID:             getenv("PARLEY_PROJECT_ID", "default"),
 	})
-	runner.SetHandlers(engine.HandleRunnerEvent, engine.HandleRunnerArtifact, engine.HandleRunnerReport, engine.HandleRunnerResult, engine.HandleRunnerLog)
-	httpServer := managerhttp.NewServer(cfg.Addr, st, engine, hub, renderer)
-	return &App{cfg: cfg, store: st, runner: runner, http: httpServer}, nil
+	app := &App{
+		cfg:    cfg,
+		store:  st,
+		runner: runner,
+		engine: engine,
+		runnerEnv: []string{
+			"PARLEY_ADAPTER=" + cfg.Adapter,
+			"PARLEY_DATA_DIR=" + cfg.DataDir,
+		},
+	}
+	if err := app.startRunnerChild(ctx, false); err != nil {
+		_ = st.Close()
+		return nil, err
+	}
+	engineRunner := engine
+	httpServer := managerhttp.NewServer(cfg.Addr, st, engineRunner, hub, renderer)
+	app.http = httpServer
+	return app, nil
+}
+
+func (a *App) startRunnerChild(ctx context.Context, restarted bool) error {
+	a.mu.Lock()
+	runnerID := a.runnerID
+	a.mu.Unlock()
+	client, err := runnerclient.StartChildWithEnvAndID(ctx, a.cfg.RunnerBin, a.runnerEnv, runnerID)
+	if err != nil {
+		return err
+	}
+	if runnerID == "" {
+		runnerID = client.RunnerID()
+		a.mu.Lock()
+		a.runnerID = runnerID
+		a.mu.Unlock()
+	}
+	client.SetHandlers(a.engine.HandleRunnerEvent, a.engine.HandleRunnerArtifact, a.engine.HandleRunnerReport, a.engine.HandleRunnerResult, a.engine.HandleRunnerLog)
+	client.SetLifecycleHandlers(a.handleHeartbeatMissed, a.handleHeartbeatRecovered, a.handleRunnerDown)
+	if err := a.store.UpsertRunnerWithOrigin(ctx, client.Ready().RunnerID, store.RunnerStatusConnected, store.RunnerOriginSpawned, client.Ready().Capabilities); err != nil {
+		_ = client.Close(context.Background())
+		return err
+	}
+	a.runner.Set(client)
+	if !restarted {
+		if err := a.appendRunnerEvent(ctx, runnerID, "runner.registered", "spawned runner registered", map[string]any{"status": store.RunnerStatusConnected}); err != nil {
+			return err
+		}
+		return a.appendRunnerEvent(ctx, runnerID, "runner.ready", "spawned runner ready", map[string]any{"status": store.RunnerStatusConnected, "capabilities": client.Ready().Capabilities})
+	}
+	return a.appendRunnerEvent(ctx, runnerID, "runner.reconnected", "spawned runner reconnected", map[string]any{"status": store.RunnerStatusConnected})
 }
 
 func (a *App) Run(ctx context.Context) error {
@@ -91,6 +141,96 @@ func (a *App) Run(ctx context.Context) error {
 	}
 }
 
+func (a *App) handleHeartbeatMissed(ctx context.Context, runnerID string, missed int, err error) {
+	if a.isClosing() {
+		return
+	}
+	_ = a.store.UpdateRunnerHealth(ctx, runnerID, store.RunnerStatusSuspect, missed)
+	_ = a.appendRunnerEvent(ctx, runnerID, "runner.heartbeat_missed", "runner heartbeat missed", map[string]any{"status": store.RunnerStatusSuspect, "missed_heartbeats": missed, "error": errString(err)})
+}
+
+func (a *App) handleHeartbeatRecovered(ctx context.Context, runnerID string) {
+	if a.isClosing() {
+		return
+	}
+	_ = a.store.UpdateRunnerHealth(ctx, runnerID, store.RunnerStatusConnected, 0)
+	_ = a.appendRunnerEvent(ctx, runnerID, "runner.reconnected", "runner heartbeat recovered", map[string]any{"status": store.RunnerStatusConnected})
+}
+
+func (a *App) handleRunnerDown(ctx context.Context, runnerID, reason string, err error) {
+	if a.isClosing() {
+		return
+	}
+	oldClient := a.runner.current()
+	a.runner.ClearForRestart()
+	if oldClient != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = oldClient.Close(shutdownCtx)
+		cancel()
+	}
+	_ = a.store.UpdateRunnerHealth(ctx, runnerID, store.RunnerStatusDown, 0)
+	_ = a.appendRunnerEvent(ctx, runnerID, "runner.down", "runner down", map[string]any{"status": store.RunnerStatusDown, "reason": reason, "error": errString(err)})
+	_ = a.engine.HandleRunnerDown(context.Background(), runnerID, reason)
+	runner, getErr := a.store.GetRunner(ctx, runnerID)
+	if getErr != nil || runner.Origin != store.RunnerOriginSpawned {
+		a.runner.MarkDown(fmt.Errorf("runner %s down: %s", runnerID, reason))
+		return
+	}
+	if !a.allowRestart(runnerID) {
+		a.runner.MarkDown(fmt.Errorf("runner %s down: crash loop", runnerID))
+		return
+	}
+	go func() {
+		time.Sleep(spawnedRunnerRestartDelay)
+		if a.isClosing() {
+			return
+		}
+		if err := a.startRunnerChild(context.Background(), true); err != nil {
+			_ = a.store.UpdateRunnerHealth(context.Background(), runnerID, store.RunnerStatusDown, 0)
+			_ = a.appendRunnerEvent(context.Background(), runnerID, "runner.down", "runner restart failed", map[string]any{"status": store.RunnerStatusDown, "reason": "restart_failed", "error": err.Error()})
+			a.runner.MarkDown(err)
+		}
+	}()
+}
+
+func (a *App) allowRestart(runnerID string) bool {
+	now := time.Now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cutoff := now.Add(-spawnedRunnerRestartWindow)
+	kept := a.restartHistory[:0]
+	for _, t := range a.restartHistory {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	a.restartHistory = kept
+	if len(a.restartHistory) >= spawnedRunnerRestartCap {
+		_ = a.appendRunnerEvent(context.Background(), runnerID, "runner.down", "runner crash-loop guard tripped", map[string]any{"status": store.RunnerStatusDown, "reason": "crash_loop", "restart_cap": spawnedRunnerRestartCap, "window_seconds": int(spawnedRunnerRestartWindow.Seconds())})
+		return false
+	}
+	a.restartHistory = append(a.restartHistory, now)
+	return true
+}
+
+func (a *App) appendRunnerEvent(ctx context.Context, runnerID, typ, summary string, data map[string]any) error {
+	if data == nil {
+		data = map[string]any{}
+	}
+	data["runner_id"] = runnerID
+	if _, ok := data["origin"]; !ok {
+		data["origin"] = store.RunnerOriginSpawned
+	}
+	_, err := a.store.AppendEvent(ctx, event.Event{
+		SchemaVersion: event.SchemaVersion,
+		Type:          typ,
+		Actor:         event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"},
+		Summary:       summary,
+		Data:          data,
+	})
+	return err
+}
+
 func getenv(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -99,6 +239,9 @@ func getenv(key, fallback string) string {
 }
 
 func (a *App) close(ctx context.Context) error {
+	a.mu.Lock()
+	a.closing = true
+	a.mu.Unlock()
 	if a.runner != nil {
 		_ = a.runner.Close(ctx)
 	}
@@ -106,4 +249,115 @@ func (a *App) close(ctx context.Context) error {
 		return a.store.Close()
 	}
 	return nil
+}
+
+func (a *App) isClosing() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.closing
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+type runnerProxy struct {
+	mu      sync.Mutex
+	client  *runnerclient.Client
+	ready   chan struct{}
+	downErr error
+}
+
+func newRunnerProxy() *runnerProxy {
+	return &runnerProxy{ready: make(chan struct{})}
+}
+
+func (p *runnerProxy) Set(client *runnerclient.Client) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.client = client
+	p.downErr = nil
+	if p.ready != nil {
+		close(p.ready)
+		p.ready = nil
+	}
+}
+
+func (p *runnerProxy) ClearForRestart() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.client = nil
+	p.downErr = nil
+	p.ready = make(chan struct{})
+}
+
+func (p *runnerProxy) MarkDown(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.client = nil
+	p.downErr = err
+	if p.ready != nil {
+		close(p.ready)
+		p.ready = nil
+	}
+}
+
+func (p *runnerProxy) Dispatch(ctx context.Context, disp contract.Dispatch) (report.Report, error) {
+	client, err := p.waitClient(ctx)
+	if err != nil {
+		return report.Report{}, err
+	}
+	return client.Dispatch(ctx, disp)
+}
+
+func (p *runnerProxy) CancelAttempt(ctx context.Context, runID, taskID, attemptID string) error {
+	client, err := p.waitClient(ctx)
+	if err != nil {
+		return err
+	}
+	return client.CancelAttempt(ctx, runID, taskID, attemptID)
+}
+
+func (p *runnerProxy) Close(ctx context.Context) error {
+	client := p.current()
+	if client == nil {
+		return nil
+	}
+	return client.Close(ctx)
+}
+
+func (p *runnerProxy) waitClient(ctx context.Context) (*runnerclient.Client, error) {
+	for {
+		p.mu.Lock()
+		client := p.client
+		if client != nil {
+			p.mu.Unlock()
+			return client, nil
+		}
+		if p.downErr != nil {
+			err := p.downErr
+			p.mu.Unlock()
+			return nil, fmt.Errorf("runner unavailable: %w", err)
+		}
+		ready := p.ready
+		if ready == nil {
+			ready = make(chan struct{})
+			p.ready = ready
+		}
+		p.mu.Unlock()
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func (p *runnerProxy) current() *runnerclient.Client {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.client
 }

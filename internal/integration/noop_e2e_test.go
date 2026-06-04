@@ -20,6 +20,7 @@ import (
 	runnersession "github.com/agent-parley/parley/internal/runner/session"
 	"github.com/agent-parley/parley/internal/runner/worktree"
 	"github.com/agent-parley/parley/internal/shared/contract"
+	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/ids"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
@@ -123,6 +124,7 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 	if !completedEvent {
 		t.Fatal("missing run.completed event")
 	}
+	assertM5ActiveEventStream(t, bundle.Events)
 	_ = client.Close(context.Background())
 	stop()
 	select {
@@ -132,6 +134,37 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("server shutdown timeout")
+	}
+}
+
+func assertM5ActiveEventStream(t *testing.T, events []event.Event) {
+	t.Helper()
+	seen := map[string]bool{}
+	for _, ev := range events {
+		if strings.HasPrefix(ev.Type, "task.") {
+			t.Fatalf("unexpected planned task.* event emitted: %s", ev.Type)
+		}
+		seen[ev.Type] = true
+	}
+	for _, typ := range []string{"run.created", "run.started", "stage.started", "adapter.invocation_prepared", "adapter.started", "adapter.completed", "harness.completed", "stage.completed", "run.completed"} {
+		if !seen[typ] {
+			t.Fatalf("missing active event type %s in stream", typ)
+		}
+	}
+	assertEventOrder(t, events, "run.created", "run.started", "run.completed")
+	assertEventOrder(t, events, "adapter.invocation_prepared", "adapter.started", "adapter.completed")
+}
+
+func assertEventOrder(t *testing.T, events []event.Event, ordered ...string) {
+	t.Helper()
+	pos := 0
+	for _, ev := range events {
+		if pos < len(ordered) && ev.Type == ordered[pos] {
+			pos++
+		}
+	}
+	if pos != len(ordered) {
+		t.Fatalf("events did not contain ordered subsequence %#v", ordered)
 	}
 }
 
