@@ -83,7 +83,11 @@ func (r Report) Validate() error {
 
 func validStageType(v string) bool {
 	switch v {
-	case contract.StageTypeImplementation, contract.StageTypeValidation:
+	case contract.StageTypeIdeaIntake,
+		contract.StageTypeImplementation,
+		contract.StageTypeValidation,
+		contract.StageTypeCommit,
+		contract.StageTypePRReady:
 		return true
 	default:
 		return false

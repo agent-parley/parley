@@ -34,6 +34,35 @@ type Worktree struct {
 	TaskID     string
 }
 
+// Path returns the canonical harness path for a task worktree.
+func Path(opts CreateOptions) string {
+	path := filepath.Join(opts.DataRoot, "projects", opts.ProjectID, "worktrees", opts.RunID, opts.TaskID)
+	if opts.AttemptID != "" {
+		path = filepath.Join(path, opts.AttemptID)
+	}
+	return path
+}
+
+// Locate returns the existing worktree path for a run/task. It prefers the
+// attempt-scoped path used by newer adapters, then falls back to the original
+// run/task path used by the M2 sample adapter.
+func Locate(dataRoot, projectID, runID, taskID, attemptID string) (string, error) {
+	if projectID == "" {
+		projectID = "default"
+	}
+	if attemptID != "" {
+		attemptPath := Path(CreateOptions{DataRoot: dataRoot, ProjectID: projectID, RunID: runID, TaskID: taskID, AttemptID: attemptID})
+		if isGitWorktree(attemptPath) {
+			return attemptPath, nil
+		}
+	}
+	legacyPath := Path(CreateOptions{DataRoot: dataRoot, ProjectID: projectID, RunID: runID, TaskID: taskID})
+	if isGitWorktree(legacyPath) {
+		return legacyPath, nil
+	}
+	return "", fmt.Errorf("worktree not found for run %s task %s", runID, taskID)
+}
+
 // Create creates a real git worktree for one task attempt.
 func Create(ctx context.Context, opts CreateOptions) (Worktree, error) {
 	if opts.DataRoot == "" {
@@ -54,10 +83,7 @@ func Create(ctx context.Context, opts CreateOptions) (Worktree, error) {
 		baseRef = "HEAD"
 	}
 
-	path := filepath.Join(opts.DataRoot, "projects", opts.ProjectID, "worktrees", opts.RunID, opts.TaskID)
-	if opts.AttemptID != "" {
-		path = filepath.Join(path, opts.AttemptID)
-	}
+	path := Path(opts)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return Worktree{}, fmt.Errorf("create worktree parent: %w", err)
 	}
@@ -100,6 +126,72 @@ func CaptureDiff(ctx context.Context, worktreePath, outputPath string) ([]byte, 
 		}
 	}
 	return diff, nil
+}
+
+// ListUntrackedFiles returns the worktree's untracked, non-ignored files as
+// paths relative to the worktree root. It mirrors what CaptureDiff sweeps in
+// (`git add -N .` honours .gitignore the same way), so a before/after snapshot
+// identifies files a step newly created. NUL-delimited output avoids
+// core.quotePath escaping surprises.
+func ListUntrackedFiles(ctx context.Context, worktreePath string) ([]string, error) {
+	if worktreePath == "" {
+		return nil, fmt.Errorf("worktree path is required")
+	}
+	out, err := runGit(ctx, "git", worktreePath, "ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return nil, fmt.Errorf("list untracked files: %w", err)
+	}
+	var files []string
+	for _, part := range bytes.Split(out, []byte{0}) {
+		if len(part) > 0 {
+			files = append(files, string(part))
+		}
+	}
+	return files, nil
+}
+
+// RemoveCreatedUntracked deletes untracked files present now but absent from
+// the `baseline` snapshot — i.e. files created since the snapshot was taken.
+// It is used to strip artifacts a validation command leaves in the worktree
+// (e.g. the binary `go build ./...` writes), which would otherwise pollute the
+// captured diff and the commit. Callers MUST pass a baseline taken from a
+// successful ListUntrackedFiles; never call with a baseline from a failed
+// snapshot, or worker-created files would be removed. It does not revert
+// modifications to already-tracked files. Returns the removed relative paths.
+func RemoveCreatedUntracked(ctx context.Context, worktreePath string, baseline []string) ([]string, error) {
+	current, err := ListUntrackedFiles(ctx, worktreePath)
+	if err != nil {
+		return nil, err
+	}
+	keep := make(map[string]struct{}, len(baseline))
+	for _, path := range baseline {
+		keep[path] = struct{}{}
+	}
+	var removed []string
+	for _, rel := range current {
+		if _, ok := keep[rel]; ok {
+			continue
+		}
+		if err := os.Remove(filepath.Join(worktreePath, rel)); err != nil && !os.IsNotExist(err) {
+			return removed, fmt.Errorf("remove created file %s: %w", rel, err)
+		}
+		removed = append(removed, rel)
+	}
+	return removed, nil
+}
+
+func isGitWorktree(path string) bool {
+	if path == "" {
+		return false
+	}
+	if info, err := os.Stat(path); err != nil || !info.IsDir() {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(path, ".git")); err == nil {
+		return true
+	}
+	out, err := runGit(context.Background(), "git", path, "rev-parse", "--is-inside-work-tree")
+	return err == nil && string(bytes.TrimSpace(out)) == "true"
 }
 
 func tempIndex(ctx context.Context, worktreePath string) (string, func(), error) {

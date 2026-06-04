@@ -7,13 +7,14 @@
   <script type="module" src="/assets/datastar.min.js"></script>
   <style>{{template "styles" .}}</style>
 </head>
-<body data-on:load="@get('/runs/{{.Bundle.Run.ID}}/events', {openWhenHidden: true})">
+<body data-on:load="@get('/runs/{{.View.Run.ID}}/events', {openWhenHidden: true})">
   <main>
     <nav><a href="/">← Runs</a></nav>
-    {{template "run_summary.html" .Bundle}}
-    {{template "stage_statuses.html" .Bundle}}
-    {{template "event_log.html" .Bundle}}
-    {{template "artifacts.html" .Bundle}}
+    {{template "run_summary.html" .View}}
+    {{template "stage_statuses.html" .View}}
+    {{template "event_log.html" .View}}
+    {{template "diff_patch.html" .View}}
+    {{template "artifacts.html" .View}}
   </main>
 </body>
 </html>

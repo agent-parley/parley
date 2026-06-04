@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"sync"
 
 	"github.com/coder/websocket"
@@ -14,6 +16,22 @@ import (
 	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
+
+// protocolDebug surfaces the cause of every session close to stderr when
+// PARLEY_PROTOCOL_DEBUG is set. The close sites (reader read/handler error,
+// writer write error) otherwise discard the underlying error, which makes a
+// dropped session ("protocol session closed") impossible to diagnose. The
+// message type in each log line identifies the side: only a runner handles
+// "dispatch"/"hello"/"ping"/"cancel"; only a manager handles
+// "event"/"artifact"/"report"/"result"/"ready"/"pong". Diagnostic only —
+// remove once the live loop is stable.
+var protocolDebug = os.Getenv("PARLEY_PROTOCOL_DEBUG") != ""
+
+func debugf(format string, args ...any) {
+	if protocolDebug {
+		log.Printf("[protocol] "+format, args...)
+	}
+}
 
 const (
 	TypeHello    = "hello"
@@ -31,6 +49,15 @@ const (
 )
 
 var ErrSessionClosed = errors.New("protocol session closed")
+
+// MaxMessageBytes bounds a single protocol message. coder/websocket defaults
+// the read limit to 32 KiB, which is far too small for this channel: artifacts
+// (diffs, validation logs, reports) are carried inline as base64 JSON (see
+// ArtifactPayload), so any non-trivial diff trips the limit and drops the
+// session with StatusMessageTooBig. 64 MiB is a generous bound for the
+// skeleton; chunked artifact transfer is the documented later refinement for
+// anything larger.
+const MaxMessageBytes = 64 << 20
 
 // Message is the symmetric Manager<->Runner JSON envelope.
 type Message struct {
@@ -142,6 +169,7 @@ type Session struct {
 }
 
 func NewSession(conn *websocket.Conn) *Session {
+	conn.SetReadLimit(MaxMessageBytes)
 	return &Session{
 		conn:     conn,
 		handlers: make(map[string]Handler),
@@ -202,6 +230,7 @@ func (s *Session) writer(ctx context.Context) {
 			err := wsjson.Write(req.ctx, s.conn, req.msg)
 			req.done <- err
 			if err != nil {
+				debugf("writer write error (type=%s, payload_bytes=%d): %v", req.msg.Type, len(req.msg.Payload), err)
 				s.close()
 				return
 			}
@@ -218,10 +247,16 @@ func (s *Session) reader(ctx context.Context) {
 	for {
 		var msg Message
 		if err := wsjson.Read(ctx, s.conn, &msg); err != nil {
+			if status := websocket.CloseStatus(err); status == websocket.StatusNormalClosure || status == websocket.StatusGoingAway {
+				debugf("reader: peer closed session normally (%s)", status)
+			} else {
+				debugf("reader read error: %v", err)
+			}
 			s.close()
 			return
 		}
 		if msg.Type == "" {
+			debugf("reader received empty-type message")
 			s.close()
 			return
 		}
@@ -232,6 +267,7 @@ func (s *Session) reader(ctx context.Context) {
 			continue
 		}
 		if err := handler(ctx, msg); err != nil {
+			debugf("handler %q returned error: %v", msg.Type, err)
 			s.close()
 			return
 		}

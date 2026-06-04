@@ -91,8 +91,11 @@ type WorkflowRun struct {
 	Run                 Run
 	Task                Task
 	Attempt             Attempt
+	IdeaIntakeStage     Stage
 	ImplementationStage Stage
 	ValidationStage     Stage
+	CommitStage         Stage
+	PRReadyStage        Stage
 }
 
 type RunBundle struct {
@@ -150,8 +153,11 @@ func (s *Store) CreateWorkflowRun(ctx context.Context, idea string) (WorkflowRun
 	}
 	wr.Task = Task{ID: ids.New("task"), RunID: wr.Run.ID, Idea: idea, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
 	wr.Attempt = Attempt{ID: ids.New("attempt"), RunID: wr.Run.ID, TaskID: wr.Task.ID, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
+	wr.IdeaIntakeStage = Stage{ID: ids.New("stage"), RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeIdeaIntake, Adapter: "", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
 	wr.ImplementationStage = Stage{ID: ids.New("stage"), RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeImplementation, Adapter: "noop", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
-	wr.ValidationStage = Stage{ID: ids.New("stage"), RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeValidation, Adapter: "", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
+	wr.ValidationStage = Stage{ID: ids.New("stage"), RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeValidation, Adapter: "validation", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
+	wr.CommitStage = Stage{ID: ids.New("stage"), RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeCommit, Adapter: "", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
+	wr.PRReadyStage = Stage{ID: ids.New("stage"), RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypePRReady, Adapter: "", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
 
 	eventLogPath := s.artifactPath(wr.Run.EventLogArtifactID, ".jsonl")
 	if err := os.WriteFile(eventLogPath, nil, 0o600); err != nil {
@@ -174,7 +180,7 @@ func (s *Store) CreateWorkflowRun(ctx context.Context, idea string) (WorkflowRun
 	if _, err := tx.ExecContext(ctx, `INSERT INTO attempts(id, run_id, task_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`, wr.Attempt.ID, wr.Attempt.RunID, wr.Attempt.TaskID, wr.Attempt.Status, now, now); err != nil {
 		return WorkflowRun{}, fmt.Errorf("insert attempt: %w", err)
 	}
-	for _, stage := range []Stage{wr.ImplementationStage, wr.ValidationStage} {
+	for _, stage := range []Stage{wr.IdeaIntakeStage, wr.ImplementationStage, wr.ValidationStage, wr.CommitStage, wr.PRReadyStage} {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO stages(id, run_id, task_id, attempt_id, stage_type, adapter, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, stage.ID, stage.RunID, stage.TaskID, stage.AttemptID, stage.StageType, stage.Adapter, stage.Status, now, now); err != nil {
 			return WorkflowRun{}, fmt.Errorf("insert stage: %w", err)
 		}
@@ -234,10 +240,16 @@ func (s *Store) GetWorkflowRun(ctx context.Context, runID string) (WorkflowRun, 
 	wr := WorkflowRun{Run: run, Task: task, Attempt: attempt}
 	for _, stage := range stages {
 		switch stage.StageType {
+		case contract.StageTypeIdeaIntake:
+			wr.IdeaIntakeStage = stage
 		case contract.StageTypeImplementation:
 			wr.ImplementationStage = stage
 		case contract.StageTypeValidation:
 			wr.ValidationStage = stage
+		case contract.StageTypeCommit:
+			wr.CommitStage = stage
+		case contract.StageTypePRReady:
+			wr.PRReadyStage = stage
 		}
 	}
 	return wr, nil
@@ -280,6 +292,14 @@ func (s *Store) UpdateStageStatus(ctx context.Context, stageID, status string) e
 	_, err := s.db.ExecContext(ctx, `UPDATE stages SET status = ?, updated_at = ? WHERE id = ?`, status, nowRFC3339(), stageID)
 	if err != nil {
 		return fmt.Errorf("update stage status: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) UpdateStageAdapter(ctx context.Context, stageID, adapter string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE stages SET adapter = ?, updated_at = ? WHERE id = ?`, adapter, nowRFC3339(), stageID)
+	if err != nil {
+		return fmt.Errorf("update stage adapter: %w", err)
 	}
 	return nil
 }

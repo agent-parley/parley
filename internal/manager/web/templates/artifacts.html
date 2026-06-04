@@ -1,9 +1,14 @@
 <section id="artifacts" class="card">
   <h2>Artifacts</h2>
-  {{if .Artifacts}}
+  {{if .ArtifactViews}}
   <ul>
-    {{range .Artifacts}}
-    <li><a href="/artifacts/{{.ID}}">{{short .ID}}</a> <span class="muted">{{.Kind}} · {{.MediaType}}</span></li>
+    {{range .ArtifactViews}}
+    <li>
+      <a href="/artifacts/{{.ID}}">{{short .ID}}</a>
+      <span class="muted">{{.Kind}} · {{.MediaType}}</span>
+      {{if .DownloadOnly}}<span class="muted">download only</span>{{end}}
+      {{if .Preview}}<pre class="artifact-preview">{{.Preview}}</pre>{{end}}
+    </li>
     {{end}}
   </ul>
   {{else}}

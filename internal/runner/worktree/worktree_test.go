@@ -91,6 +91,53 @@ func TestCreateCanScopeByAttempt(t *testing.T) {
 	}
 }
 
+func TestRemoveCreatedUntrackedStripsBuildOutput(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	source := initSourceRepo(t, ctx)
+	wt, err := Create(ctx, CreateOptions{DataRoot: t.TempDir(), ProjectID: "p1", RunID: "run1", TaskID: "task1", SourceRepo: source})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Worker output exists before validation runs.
+	if err := os.WriteFile(filepath.Join(wt.Path, "m4-live.txt"), []byte("hello\n"), 0o600); err != nil {
+		t.Fatalf("write worker file: %v", err)
+	}
+	baseline, err := ListUntrackedFiles(ctx, wt.Path)
+	if err != nil {
+		t.Fatalf("ListUntrackedFiles() error = %v", err)
+	}
+
+	// Validation build drops a compiled binary into the worktree.
+	if err := os.WriteFile(filepath.Join(wt.Path, "m4live"), make([]byte, 40_000), 0o755); err != nil {
+		t.Fatalf("write build artifact: %v", err)
+	}
+	removed, err := RemoveCreatedUntracked(ctx, wt.Path, baseline)
+	if err != nil {
+		t.Fatalf("RemoveCreatedUntracked() error = %v", err)
+	}
+	if len(removed) != 1 || removed[0] != "m4live" {
+		t.Fatalf("removed = %v, want [m4live]", removed)
+	}
+	if _, err := os.Stat(filepath.Join(wt.Path, "m4live")); !os.IsNotExist(err) {
+		t.Fatalf("build artifact not removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wt.Path, "m4-live.txt")); err != nil {
+		t.Fatalf("worker file wrongly removed: %v", err)
+	}
+
+	diff, err := CaptureDiff(ctx, wt.Path, "")
+	if err != nil {
+		t.Fatalf("CaptureDiff() error = %v", err)
+	}
+	if text := string(diff); !strings.Contains(text, "m4-live.txt") || strings.Contains(text, "m4live\n") || strings.Contains(text, "+++ b/m4live") {
+		t.Fatalf("diff should contain only the worker file:\n%s", text)
+	}
+}
+
 func initSourceRepo(t *testing.T, ctx context.Context) string {
 	t.Helper()
 	dir := t.TempDir()

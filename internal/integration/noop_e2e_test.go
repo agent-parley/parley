@@ -2,6 +2,10 @@ package integration_test
 
 import (
 	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,27 +14,43 @@ import (
 	"github.com/agent-parley/parley/internal/manager/runnerclient"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
+	"github.com/agent-parley/parley/internal/runner/adapter"
+	"github.com/agent-parley/parley/internal/runner/provider"
+	"github.com/agent-parley/parley/internal/runner/runnerio"
 	runnersession "github.com/agent-parley/parley/internal/runner/session"
+	"github.com/agent-parley/parley/internal/runner/worktree"
+	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/ids"
+	"github.com/agent-parley/parley/internal/shared/report"
 )
 
-func TestNoopEndToEndRun(t *testing.T) {
+func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	dataRoot := t.TempDir()
+	projectID := "p1"
+	source := initFullLoopSourceRepo(t, ctx)
+
 	serverCtx, stop := context.WithCancel(context.Background())
 	defer stop()
-	srv, url, err := runnersession.Listen()
+	srv, url, err := runnersession.Listen(runnersession.WithAdapters(
+		fakeImplementationAdapter{dataRoot: dataRoot, projectID: projectID, sourceRepo: source},
+		adapter.NewValidation(adapter.ValidationOptions{Provider: fakeSandboxProvider{}, DataRoot: dataRoot, ProjectID: projectID, Image: "fake-validation", Command: "go build ./... && go test ./..."}),
+	))
 	if err != nil {
 		t.Fatalf("listen runner: %v", err)
 	}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(serverCtx) }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	client, err := runnerclient.Dial(ctx, url, ids.New("runner"))
 	if err != nil {
 		t.Fatalf("dial runner: %v", err)
 	}
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := store.Open(ctx, filepath.Join(dataRoot, "manager"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -40,7 +60,7 @@ func TestNoopEndToEndRun(t *testing.T) {
 		t.Fatalf("renderer: %v", err)
 	}
 	hub := managerhttp.NewHub()
-	engine := orchestrator.NewEngine(st, client, renderer, hub)
+	engine := orchestrator.NewEngineWithOptions(st, client, renderer, hub, orchestrator.EngineOptions{ImplementationAdapter: "fake_impl", ValidationAdapter: "validation", DataRoot: dataRoot, ProjectID: projectID})
 	client.SetHandlers(engine.HandleRunnerEvent, engine.HandleRunnerArtifact, engine.HandleRunnerReport, engine.HandleRunnerResult, engine.HandleRunnerLog)
 
 	runID, err := engine.StartRun(ctx, "add a local-first harness")
@@ -62,33 +82,46 @@ func TestNoopEndToEndRun(t *testing.T) {
 			t.Fatalf("run did not complete; last status=%s", bundle.Run.Status)
 		}
 	}
-	if len(bundle.Stages) != 2 {
-		t.Fatalf("expected 2 stages, got %d", len(bundle.Stages))
+	if len(bundle.Stages) != 5 {
+		t.Fatalf("expected 5 stages, got %d", len(bundle.Stages))
 	}
 	for _, stage := range bundle.Stages {
 		if stage.Status != store.RunStatusCompleted {
 			t.Fatalf("stage not completed: %+v", stage)
 		}
 	}
-	var reportArtifacts, adapterArtifacts int
+	var reportArtifacts, diffArtifacts, contractArtifacts int
 	for _, artifact := range bundle.Artifacts {
 		switch artifact.Kind {
 		case "report":
 			reportArtifacts++
-		case "adapter_output":
-			adapterArtifacts++
+		case "diff_patch":
+			diffArtifacts++
+		case "task_contract":
+			contractArtifacts++
 		}
 	}
-	if reportArtifacts != 2 {
-		t.Fatalf("expected 2 report artifacts, got %d", reportArtifacts)
+	if reportArtifacts != 5 {
+		t.Fatalf("expected 5 report artifacts, got %d", reportArtifacts)
 	}
-	// D3: the noop adapter's artifact must arrive as a first-class transfer over
-	// the session and be stored, not inlined in the report payload.
-	if adapterArtifacts != 1 {
-		t.Fatalf("expected 1 adapter_output artifact transferred over the session, got %d", adapterArtifacts)
+	if diffArtifacts != 1 {
+		t.Fatalf("expected 1 validation diff.patch artifact, got %d", diffArtifacts)
 	}
-	if len(bundle.Events) < 7 {
-		t.Fatalf("expected live workflow events, got %d", len(bundle.Events))
+	if contractArtifacts != 1 {
+		t.Fatalf("expected 1 task contract artifact, got %d", contractArtifacts)
+	}
+	var completedEvent bool
+	for _, ev := range bundle.Events {
+		if ev.Type == "run.completed" {
+			completedEvent = true
+			branch, _ := ev.Data["branch"].(string)
+			if !strings.HasPrefix(branch, "agent/"+runID+"/") {
+				t.Fatalf("completed branch = %q", branch)
+			}
+		}
+	}
+	if !completedEvent {
+		t.Fatal("missing run.completed event")
 	}
 	_ = client.Close(context.Background())
 	stop()
@@ -99,5 +132,70 @@ func TestNoopEndToEndRun(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("server shutdown timeout")
+	}
+}
+
+type fakeImplementationAdapter struct {
+	dataRoot   string
+	projectID  string
+	sourceRepo string
+}
+
+func (a fakeImplementationAdapter) Name() string { return "fake_impl" }
+
+func (a fakeImplementationAdapter) Run(ctx context.Context, disp contract.Dispatch, _ runnerio.Sink) (report.Report, error) {
+	wt, err := worktree.Create(ctx, worktree.CreateOptions{DataRoot: a.dataRoot, ProjectID: a.projectID, RunID: disp.RunID, TaskID: disp.TaskID, AttemptID: disp.AttemptID, SourceRepo: a.sourceRepo})
+	if err != nil {
+		return report.Report{}, err
+	}
+	if err := os.WriteFile(filepath.Join(wt.Path, "feature.txt"), []byte("feature\n"), 0o600); err != nil {
+		return report.Report{}, err
+	}
+	return report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         disp.RunID,
+		TaskID:        disp.TaskID,
+		AttemptID:     disp.AttemptID,
+		StageID:       disp.StageID,
+		StageType:     disp.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: a.Name()},
+		Status:        report.StatusCompleted,
+		Summary:       "fake implementation changed worktree",
+		EvidenceRefs:  []string{},
+		Payload:       map[string]any{"worktree": wt.Path},
+		Errors:        []string{},
+	}, nil
+}
+
+type fakeSandboxProvider struct{}
+
+func (fakeSandboxProvider) Name() string { return "fake" }
+
+func (fakeSandboxProvider) Run(context.Context, provider.PreparedInvocation, runnerio.Sink) (provider.Result, error) {
+	now := time.Now().UTC()
+	return provider.Result{ExitCode: 0, StartedAt: now, EndedAt: now}, nil
+}
+
+func initFullLoopSourceRepo(t *testing.T, ctx context.Context) string {
+	t.Helper()
+	dir := t.TempDir()
+	runFullLoopGit(t, ctx, dir, "init")
+	runFullLoopGit(t, ctx, dir, "config", "user.email", "test@example.invalid")
+	runFullLoopGit(t, ctx, dir, "config", "user.name", "Parley Test")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello\n"), 0o600); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runFullLoopGit(t, ctx, dir, "add", "README.md")
+	runFullLoopGit(t, ctx, dir, "commit", "-m", "initial")
+	return dir
+}
+
+func runFullLoopGit(t *testing.T, ctx context.Context, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, out)
 	}
 }
