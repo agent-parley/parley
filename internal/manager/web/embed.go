@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/agent-parley/parley/internal/manager/store"
-	"github.com/agent-parley/parley/internal/shared/event"
 )
 
 //go:embed templates/*.html assets/*
@@ -25,11 +24,11 @@ type TemplateRenderer struct {
 }
 
 type IndexData struct {
-	Runs         []store.Run
-	Runners      []store.Runner
-	RunnerEvents []event.Event
-	CSRF         string
-	Title        string
+	Runs            []store.Run
+	Runners         []store.Runner
+	RunnerEventPage store.SystemEventPage
+	CSRF            string
+	Title           string
 }
 
 type RunData struct {

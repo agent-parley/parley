@@ -106,6 +106,18 @@ type Runner struct {
 	UpdatedAt        string
 }
 
+type SystemEvent struct {
+	Cursor int64
+	Event  event.Event
+}
+
+type SystemEventPage struct {
+	Events      []SystemEvent
+	OlderCursor int64
+	HasOlder    bool
+	Limit       int
+}
+
 type WorkflowRun struct {
 	Run                 Run
 	Task                Task
@@ -588,8 +600,49 @@ func (s *Store) ListRunnerEventsAfter(ctx context.Context, runnerID string, afte
 	return s.listEventsWhere(ctx, `scope = ? AND sequence > ?`, []any{"runner:" + runnerID, after})
 }
 
-func (s *Store) ListSystemEvents(ctx context.Context) ([]event.Event, error) {
-	return s.listEventsWhereOrdered(ctx, `run_id IS NULL`, nil, `rowid ASC`)
+func (s *Store) ListSystemEventsPage(ctx context.Context, before int64, limit int) (SystemEventPage, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	where := `run_id IS NULL`
+	args := []any{}
+	if before > 0 {
+		where += ` AND rowid < ?`
+		args = append(args, before)
+	}
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(ctx, `SELECT rowid, envelope_json FROM events WHERE `+where+` ORDER BY rowid DESC LIMIT ?`, args...)
+	if err != nil {
+		return SystemEventPage{}, fmt.Errorf("list system events page: %w", err)
+	}
+	defer rows.Close()
+	entries := make([]SystemEvent, 0, limit+1)
+	for rows.Next() {
+		var entry SystemEvent
+		var raw string
+		if err := rows.Scan(&entry.Cursor, &raw); err != nil {
+			return SystemEventPage{}, fmt.Errorf("scan system event: %w", err)
+		}
+		if err := json.Unmarshal([]byte(raw), &entry.Event); err != nil {
+			return SystemEventPage{}, fmt.Errorf("decode system event envelope: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return SystemEventPage{}, err
+	}
+	page := SystemEventPage{Limit: limit}
+	if len(entries) > limit {
+		page.HasOlder = true
+		entries = entries[:limit]
+	}
+	if len(entries) > 0 {
+		page.OlderCursor = entries[len(entries)-1].Cursor
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		page.Events = append(page.Events, entries[i])
+	}
+	return page, nil
 }
 
 func (s *Store) listEventsWhere(ctx context.Context, where string, args []any) ([]event.Event, error) {

@@ -30,13 +30,16 @@
       {{else}}
       <p>No runners registered.</p>
       {{end}}
-      {{if .RunnerEvents}}
-      <h3>Runner timeline</h3>
+      {{if .RunnerEventPage.Events}}
+      <h3 id="runner-timeline">Runner timeline</h3>
       <ol class="events">
-        {{range .RunnerEvents}}
-        <li><span class="seq">#{{.Sequence}}</span> <strong>{{.Type}}</strong> <span class="muted">{{.Actor.Kind}}/{{.Actor.ID}}</span><br>{{.Summary}}</li>
+        {{range .RunnerEventPage.Events}}
+        <li><span class="seq">#{{.Event.Sequence}}</span> <strong>{{.Event.Type}}</strong> <span class="muted">{{.Event.Actor.Kind}}/{{.Event.Actor.ID}}</span><br>{{.Event.Summary}}</li>
         {{end}}
       </ol>
+      {{if .RunnerEventPage.HasOlder}}
+      <p><a href="/?runner_events_before={{.RunnerEventPage.OlderCursor}}#runner-timeline">Older runner events</a></p>
+      {{end}}
       {{end}}
     </section>
     <section class="card">

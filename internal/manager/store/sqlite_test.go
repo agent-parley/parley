@@ -105,15 +105,37 @@ func TestSystemEventsUseAppendOrderNotPerScopeSequenceOrID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("append second: %v", err)
 	}
-	if first.Sequence != 1 || second.Sequence != 1 {
-		t.Fatalf("per-runner sequences = %d,%d; want both 1", first.Sequence, second.Sequence)
+	third, err := st.AppendEvent(ctx, event.Event{SchemaVersion: event.SchemaVersion, ID: "evt_m", Timestamp: "2026-06-04T00:00:00Z", Type: "runner.down", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "down", Data: map[string]any{"runner_id": "runner_c"}})
+	if err != nil {
+		t.Fatalf("append third: %v", err)
 	}
-	events, err := st.ListSystemEvents(ctx)
+	if first.Sequence != 1 || second.Sequence != 1 || third.Sequence != 1 {
+		t.Fatalf("per-runner sequences = %d,%d,%d; want all 1", first.Sequence, second.Sequence, third.Sequence)
+	}
+	page, err := st.ListSystemEventsPage(ctx, 0, 10)
 	if err != nil {
 		t.Fatalf("list system events: %v", err)
 	}
-	if len(events) != 2 || events[0].ID != first.ID || events[1].ID != second.ID {
-		t.Fatalf("system events = %#v, want append order %s then %s", events, first.ID, second.ID)
+	if len(page.Events) != 3 || page.Events[0].Event.ID != first.ID || page.Events[1].Event.ID != second.ID || page.Events[2].Event.ID != third.ID {
+		t.Fatalf("system events = %#v, want append order %s, %s, %s", page.Events, first.ID, second.ID, third.ID)
+	}
+
+	latest, err := st.ListSystemEventsPage(ctx, 0, 2)
+	if err != nil {
+		t.Fatalf("list latest system events: %v", err)
+	}
+	if !latest.HasOlder || latest.OlderCursor == 0 {
+		t.Fatalf("latest page cursor = %d hasOlder=%v, want older cursor", latest.OlderCursor, latest.HasOlder)
+	}
+	if len(latest.Events) != 2 || latest.Events[0].Event.ID != second.ID || latest.Events[1].Event.ID != third.ID {
+		t.Fatalf("latest page = %#v, want %s then %s", latest.Events, second.ID, third.ID)
+	}
+	older, err := st.ListSystemEventsPage(ctx, latest.OlderCursor, 2)
+	if err != nil {
+		t.Fatalf("list older system events: %v", err)
+	}
+	if older.HasOlder || len(older.Events) != 1 || older.Events[0].Event.ID != first.ID {
+		t.Fatalf("older page = %#v hasOlder=%v, want only %s", older.Events, older.HasOlder, first.ID)
 	}
 }
 

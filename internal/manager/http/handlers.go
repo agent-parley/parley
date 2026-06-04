@@ -30,12 +30,12 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	runnerEvents, err := s.store.ListSystemEvents(r.Context())
+	runnerEventPage, err := s.store.ListSystemEventsPage(r.Context(), parseInt64Query(r, "runner_events_before"), 50)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.writePage(w, "index.html", web.IndexData{Runs: runs, Runners: runners, RunnerEvents: runnerEvents, CSRF: csrfFromContext(r.Context()), Title: "Parley"})
+	s.writePage(w, "index.html", web.IndexData{Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, CSRF: csrfFromContext(r.Context()), Title: "Parley"})
 }
 
 func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
@@ -191,6 +191,18 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 func artifactIsHTML(mediaType string) bool {
 	mediaType = strings.ToLower(mediaType)
 	return strings.HasPrefix(mediaType, "text/html") || strings.Contains(mediaType, "html")
+}
+
+func parseInt64Query(r *http.Request, key string) int64 {
+	value := r.URL.Query().Get(key)
+	if value == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 func (s *Server) writePage(w http.ResponseWriter, name string, data any) {
