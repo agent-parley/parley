@@ -40,6 +40,7 @@ type Engine struct {
 	activeRuns  map[string]context.CancelFunc
 	activeStage map[string]store.Stage
 	cancelling  map[string]bool
+	runnerDown  map[string]string
 
 	implementationAdapter string
 	validationAdapter     string
@@ -90,6 +91,7 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 		activeRuns:            map[string]context.CancelFunc{},
 		activeStage:           map[string]store.Stage{},
 		cancelling:            map[string]bool{},
+		runnerDown:            map[string]string{},
 		implementationAdapter: implementationAdapter,
 		validationAdapter:     validationAdapter,
 		dataRoot:              dataRoot,
@@ -158,6 +160,7 @@ func (e *Engine) unregisterActiveRun(runID string) {
 	delete(e.activeRuns, runID)
 	delete(e.activeStage, runID)
 	delete(e.cancelling, runID)
+	delete(e.runnerDown, runID)
 }
 
 func (e *Engine) activeCancel(runID string) context.CancelFunc {
@@ -176,6 +179,24 @@ func (e *Engine) isCancelling(runID string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.cancelling[runID]
+}
+
+// markRunnerDown records that runID's in-flight work failed because its runner
+// disconnected. It is set both when a stage dispatch fails with ErrSessionClosed
+// (the stage path itself observed the runner vanish) and from HandleRunnerDown,
+// so whichever path finalizes the run, run.failed carries reason=runner_disconnected
+// rather than a generic dispatch-failure summary.
+func (e *Engine) markRunnerDown(runID, reason string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.runnerDown[runID] = reason
+}
+
+func (e *Engine) runnerDownReason(runID string) (string, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	reason, ok := e.runnerDown[runID]
+	return reason, ok
 }
 
 func (e *Engine) setActiveStage(runID string, stage store.Stage) {
@@ -222,6 +243,7 @@ func (e *Engine) HandleRunnerDown(ctx context.Context, runnerID, reason string) 
 			joined = append(joined, err)
 			continue
 		}
+		e.markRunnerDown(runID, "runner_disconnected")
 		if e.isCancelling(runID) {
 			if err := e.cancelRunTerminal(ctx, wr, "workflow cancelled while runner disconnected"); err != nil {
 				joined = append(joined, err)
@@ -440,6 +462,12 @@ func (e *Engine) dispatchStage(ctx context.Context, wr store.WorkflowRun, stage 
 	}
 	rep, err := e.runner.Dispatch(ctx, disp)
 	if err != nil {
+		if errors.Is(err, protocol.ErrSessionClosed) {
+			// The dispatch failed because the runner vanished mid-stage — classify
+			// it so the run terminal reads runner_disconnected regardless of whether
+			// this path or HandleRunnerDown finalizes the run first.
+			e.markRunnerDown(wr.Run.ID, "runner_disconnected")
+		}
 		rep = dispatchFailedReport(wr, stage, adapterName, err)
 	}
 	if err := e.completeStage(context.Background(), wr, stage, rep); err != nil {
@@ -628,7 +656,12 @@ func (e *Engine) stopRun(ctx context.Context, wr store.WorkflowRun, status, summ
 	if !changed {
 		return nil
 	}
-	_, err = e.emit(ctx, runEvent(wr, eventType, event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, summary, map[string]any{"terminal_status": runStatus}))
+	data := map[string]any{"terminal_status": runStatus}
+	if reason, ok := e.runnerDownReason(wr.Run.ID); ok && runStatus == store.RunStatusFailed {
+		data["reason"] = reason
+		summary = "runner disconnected"
+	}
+	_, err = e.emit(ctx, runEvent(wr, eventType, event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, summary, data))
 	return err
 }
 

@@ -8,6 +8,7 @@ import (
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
+	"github.com/agent-parley/parley/internal/shared/protocol"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
 
@@ -263,4 +264,45 @@ func eventTypes(events []event.Event) []string {
 		out = append(out, ev.Type)
 	}
 	return out
+}
+
+// TestDispatchSessionClosedRoutesToRunnerDisconnected exercises the failure path
+// on its own — a dispatch returning ErrSessionClosed with no HandleRunnerDown
+// call — to prove the stage path self-classifies the run terminal as
+// runner_disconnected, so the reason is deterministic regardless of which path
+// finalizes the run during a real runner crash.
+func TestDispatchSessionClosedRoutesToRunnerDisconnected(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	engine := NewEngineWithOptions(st, sessionClosedRunner{}, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	runID, err := engine.StartRun(ctx, "runner vanishes mid-dispatch")
+	if err != nil {
+		t.Fatalf("StartRun() error = %v", err)
+	}
+	waitForRunStatus(t, st, runID, store.RunStatusFailed)
+	events, err := st.ListEvents(ctx, runID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	for _, ev := range events {
+		if ev.Type == "run.failed" && ev.Data["reason"] == "runner_disconnected" {
+			return
+		}
+	}
+	t.Fatalf("expected run.failed with reason=runner_disconnected via the dispatch path; got %#v", eventTypes(events))
+}
+
+// sessionClosedRunner fails every dispatch as if the runner vanished mid-stage.
+type sessionClosedRunner struct{}
+
+func (sessionClosedRunner) Dispatch(context.Context, contract.Dispatch) (report.Report, error) {
+	return report.Report{}, protocol.ErrSessionClosed
+}
+
+func (sessionClosedRunner) CancelAttempt(context.Context, string, string, string) error {
+	return nil
 }
