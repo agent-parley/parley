@@ -175,7 +175,7 @@ func (s sessionSink) Emit(ctx context.Context, ev event.Event) error {
 }
 
 func (s sessionSink) Artifact(ctx context.Context, art runnerio.Artifact) error {
-	msg, err := protocol.NewMessage(protocol.TypeArtifact, protocol.ArtifactPayload{
+	return protocol.SendArtifact(ctx, s.session, protocol.ArtifactPayload{
 		RunID:      s.disp.RunID,
 		TaskID:     s.disp.TaskID,
 		AttemptID:  s.disp.AttemptID,
@@ -185,10 +185,6 @@ func (s sessionSink) Artifact(ctx context.Context, art runnerio.Artifact) error 
 		MediaType:  art.MediaType,
 		Content:    art.Content,
 	})
-	if err != nil {
-		return err
-	}
-	return s.session.Send(ctx, msg)
 }
 
 func failedReport(disp contract.Dispatch, err error) report.Report {

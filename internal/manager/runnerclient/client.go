@@ -54,6 +54,7 @@ type Client struct {
 	onDown               DownHandler
 	reportWaiters        map[string]*dispatchWaiter
 	resultWaiters        map[string]*dispatchWaiter
+	artifacts            *artifactReassembler
 	closing              bool
 	cmdDone              chan struct{}
 	cmdErr               error
@@ -144,7 +145,14 @@ func Dial(ctx context.Context, url, runnerID string) (*Client, error) {
 		}
 		return nil, fmt.Errorf("dial runner websocket: %w", err)
 	}
-	c := &Client{session: protocol.NewSession(conn), runnerID: runnerID, pongCh: make(chan struct{}, 1), reportWaiters: map[string]*dispatchWaiter{}, resultWaiters: map[string]*dispatchWaiter{}}
+	c := &Client{
+		session:       protocol.NewSession(conn),
+		runnerID:      runnerID,
+		pongCh:        make(chan struct{}, 1),
+		reportWaiters: map[string]*dispatchWaiter{},
+		resultWaiters: map[string]*dispatchWaiter{},
+		artifacts:     newArtifactReassembler(),
+	}
 	readyCh := make(chan protocol.ReadyPayload, 1)
 	c.session.Handle(protocol.TypeReady, func(ctx context.Context, msg protocol.Message) error {
 		ready, err := protocol.DecodePayload[protocol.ReadyPayload](msg)
@@ -316,6 +324,7 @@ func (c *Client) Ping(ctx context.Context) error {
 func (c *Client) Close(ctx context.Context) error {
 	c.setClosing()
 	_ = c.session.Close(websocket.StatusNormalClosure, "manager shutdown")
+	c.cleanupArtifacts()
 	if c.cmd == nil || c.cmd.Process == nil {
 		return nil
 	}
@@ -360,11 +369,20 @@ func (c *Client) handleArtifact(ctx context.Context, msg protocol.Message) error
 	if err != nil {
 		return err
 	}
+	assembler := c.artifactReassembler()
+	complete, ready, err := assembler.Accept(art)
+	if err != nil {
+		_ = assembler.Close()
+		return err
+	}
+	if !ready {
+		return nil
+	}
 	c.mu.RLock()
 	handler := c.onArtifact
 	c.mu.RUnlock()
 	if handler != nil {
-		return handler(ctx, art)
+		return handler(ctx, complete)
 	}
 	return nil
 }
@@ -464,6 +482,7 @@ func (c *Client) heartbeat() {
 
 func (c *Client) watchSession() {
 	<-c.session.Done()
+	c.cleanupArtifacts()
 	if c.isClosing() {
 		return
 	}
@@ -486,6 +505,7 @@ func (c *Client) watchProcess() {
 }
 
 func (c *Client) markDown(reason string, err error) {
+	c.cleanupArtifacts()
 	c.downOnce.Do(func() {
 		c.mu.RLock()
 		handler := c.onDown
@@ -527,6 +547,24 @@ func (c *Client) isClosing() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.closing
+}
+
+func (c *Client) artifactReassembler() *artifactReassembler {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.artifacts == nil {
+		c.artifacts = newArtifactReassembler()
+	}
+	return c.artifacts
+}
+
+func (c *Client) cleanupArtifacts() {
+	c.mu.RLock()
+	artifacts := c.artifacts
+	c.mu.RUnlock()
+	if artifacts != nil {
+		_ = artifacts.Close()
+	}
 }
 
 func (c *Client) commandDone() <-chan struct{} {

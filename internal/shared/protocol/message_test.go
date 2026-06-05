@@ -25,6 +25,8 @@ func TestArtifactPayloadRoundTrip(t *testing.T) {
 		Name:       "diff.patch",
 		Kind:       "diff",
 		MediaType:  "text/x-diff",
+		Seq:        0,
+		Last:       true,
 		Content:    content,
 	}
 	msg, err := protocol.NewMessage(protocol.TypeArtifact, in)
@@ -40,6 +42,9 @@ func TestArtifactPayloadRoundTrip(t *testing.T) {
 	}
 	if out.ArtifactID != in.ArtifactID || out.Name != in.Name || out.Kind != in.Kind {
 		t.Fatalf("metadata mismatch: %+v", out)
+	}
+	if out.Seq != in.Seq || out.Last != in.Last {
+		t.Fatalf("chunk metadata mismatch: %+v", out)
 	}
 	if !bytes.Equal(out.Content, content) {
 		t.Fatalf("content mismatch: got %v want %v", out.Content, content)
