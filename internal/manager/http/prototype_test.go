@@ -15,7 +15,7 @@ func TestPrototypeRouteRendersSingleLinearDesignFromSeedData(t *testing.T) {
 		t.Fatalf("new renderer: %v", err)
 	}
 	srv := NewServer("127.0.0.1:8080", nil, nil, NewHub(), renderer)
-	for _, path := range []string{"/prototype", "/prototype?tab=review", "/prototype?view=runners", "/prototype?cancel=prominent"} {
+	for _, path := range []string{"/prototype", "/prototype?tab=review", "/prototype?view=runners", "/prototype?run=run_proto_completed&tab=review"} {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080"+path, nil)
 		srv.routes().ServeHTTP(rec, req)

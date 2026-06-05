@@ -2,7 +2,6 @@ package web
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/agent-parley/parley/internal/manager/store"
@@ -22,15 +21,13 @@ type PrototypeData struct {
 	Selected      PrototypeRun
 	Tab           string
 	View          string
-	CancelMode    string
 }
 
 type PrototypeOptions struct {
-	RunID      string
-	Tab        string
-	View       string
-	Mock       string
-	CancelMode string
+	RunID string
+	Tab   string
+	View  string
+	Mock  string
 }
 
 type PrototypeRunnerSummary struct {
@@ -77,13 +74,6 @@ type PrototypeEventView struct {
 	Family     string
 	StageType  string
 	StageLabel string
-	ActorLabel string
-	DataFields []PrototypeDataField
-}
-
-type PrototypeDataField struct {
-	Key   string
-	Value string
 }
 
 type PrototypeDiffLine struct {
@@ -117,7 +107,6 @@ func NewPrototypeDataWithOptions(options PrototypeOptions) PrototypeData {
 		Selected:      selected,
 		Tab:           normalizePrototypeTab(options.Tab),
 		View:          normalizePrototypeView(options.View),
-		CancelMode:    normalizePrototypeCancelMode(options.CancelMode),
 	}
 }
 
@@ -144,13 +133,6 @@ func normalizePrototypeView(value string) string {
 		return "runners"
 	}
 	return "runs"
-}
-
-func normalizePrototypeCancelMode(value string) string {
-	if strings.EqualFold(strings.TrimSpace(value), "prominent") {
-		return "prominent"
-	}
-	return "quiet"
 }
 
 func prototypeActiveRuns(runs []PrototypeRun) []PrototypeRun {
@@ -421,8 +403,6 @@ func prototypeEventView(ev event.Event) PrototypeEventView {
 		Family:     eventFamily(ev.Type),
 		StageType:  stageType,
 		StageLabel: stageLabel(stageType),
-		ActorLabel: actorLabel(ev.Actor),
-		DataFields: prototypeDataFields(ev.Data),
 	}
 }
 
@@ -449,22 +429,6 @@ func prototypeStageSummary(stage store.Stage, events []PrototypeEventView) strin
 	default:
 		return stageLabel(stage.StageType) + " is " + stage.Status + "."
 	}
-}
-
-func prototypeDataFields(data map[string]any) []PrototypeDataField {
-	if len(data) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(data))
-	for key := range data {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	fields := make([]PrototypeDataField, 0, len(keys))
-	for _, key := range keys {
-		fields = append(fields, PrototypeDataField{Key: key, Value: fmt.Sprint(data[key])})
-	}
-	return fields
 }
 
 func prototypeDiffLines(preview string) []PrototypeDiffLine {
@@ -569,20 +533,6 @@ func eventFamily(eventType string) string {
 		return eventType[:i]
 	}
 	return eventType
-}
-
-func actorLabel(actor event.Actor) string {
-	if actor.ID == "" {
-		return actor.Kind
-	}
-	switch actor.Kind {
-	case event.ActorKindAdapter:
-		return "agent profile/" + actor.ID
-	case event.ActorKindWorkflowEngine:
-		return "workflow engine/" + actor.ID
-	default:
-		return actor.Kind + "/" + actor.ID
-	}
 }
 
 func stageLabel(stageType string) string {

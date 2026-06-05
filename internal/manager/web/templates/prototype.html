@@ -4,7 +4,6 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.Title}}</title>
-  <script type="module" src="/assets/datastar.min.js"></script>
   <style>{{template "prototype-styles" .}}</style>
 </head>
 <body class="prototype-body">
@@ -16,8 +15,8 @@
       </div>
 
       <nav class="sidebar-nav" aria-label="Primary">
-        <a class="{{if eq .View "runs"}}active{{end}}" href="/prototype?run={{.Selected.View.Run.ID}}{{if eq .CancelMode "prominent"}}&amp;cancel=prominent{{end}}">Runs</a>
-        <a class="{{if eq .View "runners"}}active{{end}}" href="/prototype?view=runners&amp;run={{.Selected.View.Run.ID}}{{if eq .Tab "review"}}&amp;tab=review{{end}}{{if eq .CancelMode "prominent"}}&amp;cancel=prominent{{end}}">Runners</a>
+        <a class="{{if eq .View "runs"}}active{{end}}" href="/prototype?run={{.Selected.View.Run.ID}}">Runs</a>
+        <a class="{{if eq .View "runners"}}active{{end}}" href="/prototype?view=runners&amp;run={{.Selected.View.Run.ID}}{{if eq .Tab "review"}}&amp;tab=review{{end}}">Runners</a>
       </nav>
 
       <section class="run-group" aria-labelledby="active-runs-heading">
@@ -25,7 +24,7 @@
         <ul class="sidebar-run-list">
           {{range .ActiveRuns}}
           <li>
-            <a class="run-row {{if and (eq $.View "runs") (eq $.Selected.View.Run.ID .View.Run.ID)}}selected{{end}}" href="/prototype?run={{.View.Run.ID}}{{if eq $.Tab "review"}}&amp;tab=review{{end}}{{if eq $.CancelMode "prominent"}}&amp;cancel=prominent{{end}}">
+            <a class="run-row {{if and (eq $.View "runs") (eq $.Selected.View.Run.ID .View.Run.ID)}}selected{{end}}" href="/prototype?run={{.View.Run.ID}}{{if eq $.Tab "review"}}&amp;tab=review{{end}}">
               <span class="status-dot {{statusClass .View.Run.Status}}" aria-hidden="true"></span>
               <span class="run-row-copy">
                 <strong>{{.View.Run.Idea}}</strong>
@@ -44,7 +43,7 @@
         <ul class="sidebar-run-list">
           {{range .RecentRuns}}
           <li>
-            <a class="run-row {{if and (eq $.View "runs") (eq $.Selected.View.Run.ID .View.Run.ID)}}selected{{end}}" href="/prototype?run={{.View.Run.ID}}{{if eq $.Tab "review"}}&amp;tab=review{{end}}{{if eq $.CancelMode "prominent"}}&amp;cancel=prominent{{end}}">
+            <a class="run-row {{if and (eq $.View "runs") (eq $.Selected.View.Run.ID .View.Run.ID)}}selected{{end}}" href="/prototype?run={{.View.Run.ID}}{{if eq $.Tab "review"}}&amp;tab=review{{end}}">
               <span class="status-dot {{statusClass .View.Run.Status}}" aria-hidden="true"></span>
               <span class="run-row-copy">
                 <strong>{{.View.Run.Idea}}</strong>
@@ -56,7 +55,7 @@
         </ul>
       </section>
 
-      <a class="runner-summary" href="/prototype?view=runners&amp;run={{.Selected.View.Run.ID}}{{if eq .Tab "review"}}&amp;tab=review{{end}}{{if eq .CancelMode "prominent"}}&amp;cancel=prominent{{end}}" aria-label="Open runner health view">
+      <a class="runner-summary" href="/prototype?view=runners&amp;run={{.Selected.View.Run.ID}}{{if eq .Tab "review"}}&amp;tab=review{{end}}" aria-label="Open runner health view">
         <span class="runner-summary-dots" aria-hidden="true">
           {{range .Runners}}<span class="status-dot {{statusClass .Runner.Status}}"></span>{{end}}
         </span>
@@ -76,12 +75,12 @@
           <div>
             <p class="eyebrow">Runner health</p>
             <h1 id="runners-title">{{.RunnerSummary.Label}}</h1>
-            <p class="lede">Runner lifecycle is visible outside any single run: connected, suspect, and down stay distinct.</p>
+            <p class="lede">Runner health is visible outside any single run: connected, suspect, and down stay distinct.</p>
           </div>
-          <a class="secondary-link" href="/prototype?run={{.Selected.View.Run.ID}}{{if eq .Tab "review"}}&amp;tab=review{{end}}{{if eq .CancelMode "prominent"}}&amp;cancel=prominent{{end}}">Back to runs</a>
+          <a class="secondary-link" href="/prototype?run={{.Selected.View.Run.ID}}{{if eq .Tab "review"}}&amp;tab=review{{end}}">Back to runs</a>
         </header>
 
-        <section class="runner-rows" aria-label="Runner registry">
+        <section class="runner-rows" aria-label="Runners">
           {{range .Runners}}
           <article class="runner-row-detail">
             <div class="runner-title-row">
@@ -96,30 +95,19 @@
               <div><dt>Origin</dt><dd>{{.Runner.Origin}}</dd></div>
               <div><dt>Missed heartbeats</dt><dd>{{.Runner.MissedHeartbeats}}</dd></div>
               <div><dt>Updated</dt><dd>{{timeLabel .Runner.UpdatedAt}}</dd></div>
-              <div><dt>Current run</dt><dd><a href="/prototype?run={{.CurrentRunID}}{{if eq $.CancelMode "prominent"}}&amp;cancel=prominent{{end}}">{{short .CurrentRunID}}</a></dd></div>
+              <div><dt>Current run</dt><dd><a href="/prototype?run={{.CurrentRunID}}">{{short .CurrentRunID}}</a></dd></div>
             </dl>
           </article>
           {{end}}
         </section>
 
         <section class="runner-events" aria-labelledby="runner-events-heading">
-          <h2 id="runner-events-heading">Runner event trail</h2>
+          <h2 id="runner-events-heading">Recent runner activity</h2>
           <ol class="event-list system-events">
             {{range .RunnerEvents}}
-            <li>
-              <details class="event-details">
-                <summary>
-                  <span class="event-summary-text">{{.Event.Summary}}</span>
-                  <span class="event-meta">{{timeLabel .Event.Timestamp}}</span>
-                  <code class="raw-tag">{{.Event.Type}}</code>
-                  <span class="view-more">view more</span>
-                </summary>
-                <dl class="event-payload">
-                  <div><dt>Raw type</dt><dd><code>{{.Event.Type}}</code></dd></div>
-                  <div><dt>Actor</dt><dd>{{.ActorLabel}}</dd></div>
-                  {{range .DataFields}}<div><dt>{{.Key}}</dt><dd>{{.Value}}</dd></div>{{end}}
-                </dl>
-              </details>
+            <li class="event-row">
+              <span class="event-summary-text">{{.Event.Summary}}</span>
+              <span class="event-meta">{{timeLabel .Event.Timestamp}}</span>
             </li>
             {{end}}
           </ol>
@@ -142,14 +130,13 @@
 
           <div class="header-action">
             {{if .Selected.CancelEnabled}}
-            <form method="get" action="/prototype" class="cancel-form {{if eq .CancelMode "prominent"}}prominent{{end}}">
+            <form method="get" action="/prototype" class="cancel-form">
               <input type="hidden" name="run" value="{{.Selected.View.Run.ID}}">
               {{if eq .Tab "review"}}<input type="hidden" name="tab" value="review">{{end}}
-              {{if eq .CancelMode "prominent"}}<input type="hidden" name="cancel" value="prominent">{{end}}
               <input type="hidden" name="mock" value="cancel">
-              <button type="submit" class="secondary-button" onclick="this.textContent='Cancelling…'; this.setAttribute('aria-busy','true')">Cancel</button>
-              <p>If the run is already finishing, it'll complete.</p>
-              {{if eq .CancelMode "prominent"}}<strong>Cancellation is best effort; the natural terminal wins if the run finishes first.</strong>{{end}}
+              <p class="cancel-heading">Stop this run</p>
+              <button type="submit" class="secondary-button danger" onclick="this.textContent='Cancelling…'; this.setAttribute('aria-busy','true')">Cancel run</button>
+              <p class="cancel-note"><strong>Cancels the run if it's still working.</strong> If it just finished on its own, you'll get that result — not a cancel.</p>
             </form>
             {{else}}
             <details class="create-run-panel">
@@ -157,7 +144,6 @@
               <form method="get" action="/prototype">
                 <input type="hidden" name="run" value="{{.Selected.View.Run.ID}}">
                 {{if eq .Tab "review"}}<input type="hidden" name="tab" value="review">{{end}}
-                {{if eq .CancelMode "prominent"}}<input type="hidden" name="cancel" value="prominent">{{end}}
                 <input type="hidden" name="mock" value="create">
                 <label for="prototype-idea">Idea</label>
                 <textarea id="prototype-idea" name="idea" rows="3" placeholder="Describe the change Parley should run."></textarea>
@@ -171,24 +157,23 @@
         </header>
 
         <nav class="run-tabs" aria-label="Run detail tabs">
-          <a class="{{if eq .Tab "story"}}active{{end}}" href="/prototype?run={{.Selected.View.Run.ID}}{{if eq .CancelMode "prominent"}}&amp;cancel=prominent{{end}}">Story</a>
-          <a class="{{if eq .Tab "review"}}active{{end}}" href="/prototype?run={{.Selected.View.Run.ID}}&amp;tab=review{{if eq .CancelMode "prominent"}}&amp;cancel=prominent{{end}}">Review</a>
+          <a class="{{if eq .Tab "story"}}active{{end}}" href="/prototype?run={{.Selected.View.Run.ID}}">Story</a>
+          <a class="{{if eq .Tab "review"}}active{{end}}" href="/prototype?run={{.Selected.View.Run.ID}}&amp;tab=review">Review</a>
         </nav>
 
         {{if eq .Tab "review"}}
-        <section class="review-layout" aria-label="Review console">
+        <section class="review-layout" aria-label="Review">
           <section class="review-section diff-section">
-            <header class="section-heading">
+            <div class="section-heading">
               <div>
                 <p class="eyebrow">Review</p>
                 <h2>Diff</h2>
               </div>
-              {{if .Selected.View.DiffPatch.ID}}<span class="artifact-meta">artifact <code>{{.Selected.View.DiffPatch.ID}}</code></span>{{end}}
-            </header>
+            </div>
             {{if .Selected.View.DiffPatch.ID}}
               {{if .Selected.DiffIsLong}}
               <details class="diff-disclosure">
-                <summary>Show diff.patch</summary>
+                <summary>Show diff</summary>
                 <pre class="diff-pre">{{range .Selected.DiffLines}}<span class="diff-line {{.Class}}">{{.Text}}</span>
 {{end}}</pre>
               </details>
@@ -197,29 +182,64 @@
 {{end}}</pre>
               {{end}}
             {{else}}
-            <p class="empty-state">No diff.patch artifact yet.</p>
+            <p class="empty-state">No changes captured yet.</p>
             {{end}}
           </section>
 
           <aside class="review-side">
-            <section class="review-section">
+            <section class="review-section" id="artifacts">
               <h2>Artifacts</h2>
-              {{template "prototype-artifacts" .Selected}}
+              {{if .Selected.View.ArtifactViews}}
+              <ul class="artifact-list">
+                {{range .Selected.View.ArtifactViews}}
+                <li>
+                  <a class="artifact-open" href="#artifact-{{.ID}}">
+                    <strong>{{artifactLabel .Kind}}</strong>
+                    <span class="artifact-kind">{{.MediaType}}</span>
+                  </a>
+                  {{if .DownloadOnly}}<span class="safety-tag small">download only</span>{{end}}
+                </li>
+                {{end}}
+              </ul>
+              {{else}}
+              <p class="empty-state">No artifacts yet.</p>
+              {{end}}
             </section>
 
             {{if .Selected.View.PRReady.Ready}}
             <section class="review-section pr-ready-panel">
               <h2>PR-ready</h2>
-              <p>Diff ready for review on <code>{{.Selected.View.PRReady.Branch}}</code>.</p>
+              <p>Changes ready for review on <code>{{.Selected.View.PRReady.Branch}}</code>.</p>
               {{if .Selected.View.PRReady.CommitSHA}}<p class="muted">Commit <code>{{.Selected.View.PRReady.CommitSHA}}</code></p>{{end}}
             </section>
             {{end}}
 
             <section class="review-section safety-note">
-              <h2>Viewer constraints</h2>
-              <p>Artifact IDs only; diff.patch is escaped text; raw HTML artifacts are download-only and never rendered inline.</p>
+              <h2>How outputs are shown</h2>
+              <p>Artifacts open in a viewer; the diff is shown as escaped text, and raw HTML artifacts are download-only and never rendered inline.</p>
             </section>
           </aside>
+
+          {{range .Selected.View.ArtifactViews}}
+          <div id="artifact-{{.ID}}" class="artifact-modal" role="dialog" aria-modal="true" aria-label="{{artifactLabel .Kind}}">
+            <a class="artifact-modal-backdrop" href="#artifacts" aria-label="Close"></a>
+            <div class="artifact-modal-card">
+              <header class="artifact-modal-head">
+                <div>
+                  <strong>{{artifactLabel .Kind}}</strong>
+                  <span class="artifact-kind">{{.Kind}} · {{.MediaType}}</span>
+                </div>
+                <a class="modal-close" href="#artifacts" aria-label="Close">×</a>
+              </header>
+              <div class="artifact-modal-body">
+                {{if .DownloadOnly}}
+                <p class="safety-tag">raw HTML treated as download; never rendered inline</p>
+                {{else}}{{if .Preview}}<pre class="artifact-preview">{{.Preview}}</pre>{{end}}{{end}}
+                <p class="muted artifact-id">artifact <code>{{.ID}}</code></p>
+              </div>
+            </div>
+          </div>
+          {{end}}
         </section>
         {{else}}
         <section class="story-layout" aria-label="Run story">
@@ -229,7 +249,7 @@
                 <p class="eyebrow">Story</p>
                 <h2 id="timeline-heading">Stage timeline</h2>
               </div>
-              <p class="section-note">Finished stages stay collapsed; open a stage or event when you need the raw detail.</p>
+              <p class="section-note">Finished stages stay collapsed; open a stage to see what happened inside it.</p>
             </div>
 
             <ol class="stage-timeline">
@@ -248,25 +268,14 @@
                     {{if .Events}}
                     <ol class="event-list">
                       {{range .Events}}
-                      <li>
-                        <details class="event-details">
-                          <summary>
-                            <span class="event-summary-text">{{.Event.Summary}}</span>
-                            <span class="event-meta">{{timeLabel .Event.Timestamp}}</span>
-                            <code class="raw-tag">{{.Event.Type}}</code>
-                            <span class="view-more">view more</span>
-                          </summary>
-                          <dl class="event-payload">
-                            <div><dt>Raw type</dt><dd><code>{{.Event.Type}}</code></dd></div>
-                            <div><dt>Actor</dt><dd>{{.ActorLabel}}</dd></div>
-                            {{range .DataFields}}<div><dt>{{.Key}}</dt><dd>{{.Value}}</dd></div>{{end}}
-                          </dl>
-                        </details>
+                      <li class="event-row">
+                        <span class="event-summary-text">{{.Event.Summary}}</span>
+                        <span class="event-meta">{{timeLabel .Event.Timestamp}}</span>
                       </li>
                       {{end}}
                     </ol>
                     {{else}}
-                    <p class="empty-state">No stage-scoped events yet.</p>
+                    <p class="empty-state">Nothing happened in this stage yet.</p>
                     {{end}}
                   </div>
                 </details>
@@ -276,17 +285,21 @@
           </section>
 
           <aside class="story-side">
-            <details class="quiet-panel">
-              <summary>Task plan</summary>
-              <p>{{.Selected.TaskPlan}}</p>
-              <ul>
-                {{range .Selected.DoneWhen}}<li>{{.}}</li>{{end}}
-              </ul>
-            </details>
-            <details class="quiet-panel">
-              <summary>Run outcome</summary>
-              <p>{{.Selected.OutcomeNote}}</p>
-            </details>
+            <section class="side-panel">
+              <h3>Task plan</h3>
+              <div class="side-panel-body">
+                <p>{{.Selected.TaskPlan}}</p>
+                <ul>
+                  {{range .Selected.DoneWhen}}<li>{{.}}</li>{{end}}
+                </ul>
+              </div>
+            </section>
+            <section class="side-panel">
+              <h3>Run outcome</h3>
+              <div class="side-panel-body">
+                <p>{{.Selected.OutcomeNote}}</p>
+              </div>
+            </section>
           </aside>
         </section>
         {{end}}
@@ -296,26 +309,3 @@
   </div>
 </body>
 </html>
-
-{{define "prototype-artifacts"}}
-{{if .View.ArtifactViews}}
-<ul class="artifact-list">
-  {{range .View.ArtifactViews}}
-  <li>
-    <div class="artifact-title-row">
-      <strong>{{artifactLabel .Kind}}</strong>
-      <span class="artifact-kind">{{.Kind}}</span>
-    </div>
-    <p class="artifact-meta">artifact <code>{{.ID}}</code> · {{.MediaType}}</p>
-    {{if .DownloadOnly}}
-    <p class="safety-tag">raw HTML treated as download; never rendered inline</p>
-    {{else}}
-      {{if .Preview}}<pre class="artifact-preview">{{.Preview}}</pre>{{end}}
-    {{end}}
-  </li>
-  {{end}}
-</ul>
-{{else}}
-<p class="empty-state">No artifacts yet.</p>
-{{end}}
-{{end}}

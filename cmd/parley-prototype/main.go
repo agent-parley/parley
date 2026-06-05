@@ -33,11 +33,10 @@ func main() {
 		}
 		query := r.URL.Query()
 		writePage(w, renderer, "prototype.html", web.NewPrototypeDataWithOptions(web.PrototypeOptions{
-			RunID:      query.Get("run"),
-			Tab:        query.Get("tab"),
-			View:       query.Get("view"),
-			Mock:       query.Get("mock"),
-			CancelMode: query.Get("cancel"),
+			RunID: query.Get("run"),
+			Tab:   query.Get("tab"),
+			View:  query.Get("view"),
+			Mock:  query.Get("mock"),
 		}))
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

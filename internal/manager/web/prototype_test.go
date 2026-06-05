@@ -121,6 +121,12 @@ func TestPrototypeTemplateIsSingleLinearDirection(t *testing.T) {
 			t.Fatalf("single-direction prototype rendered forbidden variation marker %q", forbidden)
 		}
 	}
+	// End-user UI: raw event taxonomy and actor internals must not surface.
+	for _, internal := range []string{"Raw type", "stage_type", "workflow engine/manager", "stage.started"} {
+		if strings.Contains(html, internal) {
+			t.Fatalf("operator UI leaked implementation detail %q", internal)
+		}
+	}
 	if !strings.Contains(html, "Stage timeline") || !strings.Contains(html, "Review") || !strings.Contains(html, "3 runners · 1 down") {
 		t.Fatalf("linear shell missing expected run tabs, timeline, or runner summary")
 	}
