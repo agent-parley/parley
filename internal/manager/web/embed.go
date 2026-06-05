@@ -76,7 +76,7 @@ func NewRunView(bundle store.RunBundle) RunView {
 }
 
 func NewRenderer() (*TemplateRenderer, error) {
-	funcs := template.FuncMap{"short": short, "statusClass": statusClass, "stageLabel": stageLabel, "eventFamily": eventFamily}
+	funcs := template.FuncMap{"short": short, "statusClass": statusClass, "statusLabel": statusLabel, "runnerStatusLabel": runnerStatusLabel, "stageLabel": stageLabel, "eventFamily": eventFamily, "timeLabel": timeLabel, "artifactLabel": artifactLabel}
 	tmpl, err := template.New("").Funcs(funcs).ParseFS(Embedded, "templates/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("parse templates: %w", err)

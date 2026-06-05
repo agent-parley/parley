@@ -2,6 +2,7 @@ package web
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/agent-parley/parley/internal/manager/store"
@@ -10,20 +11,34 @@ import (
 )
 
 type PrototypeData struct {
-	Title        string
-	Variation    string
-	Variations   []PrototypeVariation
-	Feedback     string
-	Runs         []PrototypeRun
-	Runners      []PrototypeRunnerView
-	RunnerEvents []PrototypeEventView
-	Selected     PrototypeRun
+	Title         string
+	Feedback      string
+	Runs          []PrototypeRun
+	ActiveRuns    []PrototypeRun
+	RecentRuns    []PrototypeRun
+	Runners       []PrototypeRunnerView
+	RunnerEvents  []PrototypeEventView
+	RunnerSummary PrototypeRunnerSummary
+	Selected      PrototypeRun
+	Tab           string
+	View          string
+	CancelMode    string
 }
 
-type PrototypeVariation struct {
-	ID      string
-	Name    string
-	Summary string
+type PrototypeOptions struct {
+	RunID      string
+	Tab        string
+	View       string
+	Mock       string
+	CancelMode string
+}
+
+type PrototypeRunnerSummary struct {
+	Total     int
+	Connected int
+	Suspect   int
+	Down      int
+	Label     string
 }
 
 type PrototypeRun struct {
@@ -37,6 +52,8 @@ type PrototypeRun struct {
 	StageGroups      []PrototypeStageGroup
 	RunEvents        []PrototypeEventView
 	EventViews       []PrototypeEventView
+	DiffLines        []PrototypeDiffLine
+	DiffIsLong       bool
 	SafetyHighlights []string
 }
 
@@ -50,6 +67,8 @@ type PrototypeStageGroup struct {
 	Stage     store.Stage
 	Label     string
 	Performer string
+	Summary   string
+	Expanded  bool
 	Events    []PrototypeEventView
 }
 
@@ -59,46 +78,46 @@ type PrototypeEventView struct {
 	StageType  string
 	StageLabel string
 	ActorLabel string
+	DataFields []PrototypeDataField
 }
 
-func NewPrototypeData(variation, runID, mock string) PrototypeData {
-	variation = normalizePrototypeVariation(variation)
+type PrototypeDataField struct {
+	Key   string
+	Value string
+}
+
+type PrototypeDiffLine struct {
+	Text  string
+	Class string
+}
+
+func NewPrototypeData(_ string, runID, mock string) PrototypeData {
+	return NewPrototypeDataWithOptions(PrototypeOptions{RunID: runID, Mock: mock})
+}
+
+func NewPrototypeDataWithOptions(options PrototypeOptions) PrototypeData {
 	runs := prototypeRuns()
 	selected := runs[0]
 	for _, run := range runs {
-		if run.View.Run.ID == runID {
+		if run.View.Run.ID == options.RunID {
 			selected = run
 			break
 		}
 	}
+	runners := prototypeRunners()
 	return PrototypeData{
-		Title:        "Parley UI prototype",
-		Variation:    variation,
-		Variations:   prototypeVariations(),
-		Feedback:     prototypeFeedback(mock),
-		Runs:         runs,
-		Runners:      prototypeRunners(),
-		RunnerEvents: prototypeRunnerEvents(),
-		Selected:     selected,
-	}
-}
-
-func normalizePrototypeVariation(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "2", "lanes", "swimlanes":
-		return "2"
-	case "3", "safety", "review":
-		return "3"
-	default:
-		return "1"
-	}
-}
-
-func prototypeVariations() []PrototypeVariation {
-	return []PrototypeVariation{
-		{ID: "1", Name: "Command center", Summary: "Dense operations dashboard: run outcomes, runner health, and the active run stay visible together."},
-		{ID: "2", Name: "Stage/event map", Summary: "Timeline-first layout: each stage owns its local events so causality is easier to scan."},
-		{ID: "3", Name: "Safety review", Summary: "Review-console layout: diff, outputs, cancellation, and safety constraints are promoted above raw chronology."},
+		Title:         "Parley UI prototype",
+		Feedback:      prototypeFeedback(options.Mock),
+		Runs:          runs,
+		ActiveRuns:    prototypeActiveRuns(runs),
+		RecentRuns:    prototypeRecentRuns(runs),
+		Runners:       runners,
+		RunnerEvents:  prototypeRunnerEvents(),
+		RunnerSummary: prototypeRunnerSummary(runners),
+		Selected:      selected,
+		Tab:           normalizePrototypeTab(options.Tab),
+		View:          normalizePrototypeView(options.View),
+		CancelMode:    normalizePrototypeCancelMode(options.CancelMode),
 	}
 }
 
@@ -107,10 +126,72 @@ func prototypeFeedback(mock string) string {
 	case "create":
 		return "Mock only: Create run would freeze the task plan and enqueue a run. No run was started."
 	case "cancel":
-		return "Mock only: Cancel run would send a user cancel intent to the harness. The seeded run stays running for comparison."
+		return "Run finished before cancel took effect. Mock only: the seeded run stays running for comparison."
 	default:
 		return ""
 	}
+}
+
+func normalizePrototypeTab(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), "review") {
+		return "review"
+	}
+	return "story"
+}
+
+func normalizePrototypeView(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), "runners") {
+		return "runners"
+	}
+	return "runs"
+}
+
+func normalizePrototypeCancelMode(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), "prominent") {
+		return "prominent"
+	}
+	return "quiet"
+}
+
+func prototypeActiveRuns(runs []PrototypeRun) []PrototypeRun {
+	active := []PrototypeRun{}
+	for _, run := range runs {
+		if run.View.Run.Status == "running" {
+			active = append(active, run)
+		}
+	}
+	return active
+}
+
+func prototypeRecentRuns(runs []PrototypeRun) []PrototypeRun {
+	recent := []PrototypeRun{}
+	for _, run := range runs {
+		if run.View.Run.Status != "running" {
+			recent = append(recent, run)
+		}
+	}
+	return recent
+}
+
+func prototypeRunnerSummary(runners []PrototypeRunnerView) PrototypeRunnerSummary {
+	summary := PrototypeRunnerSummary{Total: len(runners)}
+	for _, runner := range runners {
+		switch runner.Runner.Status {
+		case store.RunnerStatusConnected:
+			summary.Connected++
+		case store.RunnerStatusSuspect:
+			summary.Suspect++
+		case store.RunnerStatusDown:
+			summary.Down++
+		}
+	}
+	summary.Label = fmt.Sprintf("%d runners", summary.Total)
+	if summary.Down > 0 {
+		summary.Label += fmt.Sprintf(" · %d down", summary.Down)
+	} else if summary.Suspect > 0 {
+		summary.Label += fmt.Sprintf(" · %d suspect", summary.Suspect)
+	}
+	return summary
 }
 
 func prototypeRuns() []PrototypeRun {
@@ -260,6 +341,7 @@ func prototypeRun(runID, taskID, attemptID, status, idea, note, runnerID, runner
 		DiffPatch:     diff,
 		PRReady:       prReady,
 	}
+	diffLines := prototypeDiffLines(diff.Preview)
 	return PrototypeRun{
 		View:          view,
 		OutcomeNote:   note,
@@ -271,6 +353,8 @@ func prototypeRun(runID, taskID, attemptID, status, idea, note, runnerID, runner
 		StageGroups:   prototypeStageGroups(stages, events),
 		RunEvents:     prototypeRunEvents(events),
 		EventViews:    prototypeEventViews(events),
+		DiffLines:     diffLines,
+		DiffIsLong:    len(diffLines) > 16,
 		SafetyHighlights: []string{
 			"Outputs are referenced by artifact ID only.",
 			"diff.patch is escaped preformatted text, not rendered markup.",
@@ -305,6 +389,8 @@ func prototypeStageGroups(stages []store.Stage, events []event.Event) []Prototyp
 				group.Events = append(group.Events, prototypeEventView(ev))
 			}
 		}
+		group.Summary = prototypeStageSummary(stage, group.Events)
+		group.Expanded = stage.Status == "running"
 		groups = append(groups, group)
 	}
 	return groups
@@ -336,6 +422,7 @@ func prototypeEventView(ev event.Event) PrototypeEventView {
 		StageType:  stageType,
 		StageLabel: stageLabel(stageType),
 		ActorLabel: actorLabel(ev.Actor),
+		DataFields: prototypeDataFields(ev.Data),
 	}
 }
 
@@ -344,6 +431,129 @@ func prototypePerformer(stage store.Stage) string {
 		return "Agent profile " + stage.Adapter
 	}
 	return "Harness"
+}
+
+func prototypeStageSummary(stage store.Stage, events []PrototypeEventView) string {
+	if len(events) > 0 {
+		return events[len(events)-1].Event.Summary
+	}
+	switch stage.Status {
+	case "pending":
+		return "Waiting for the previous stage."
+	case "running":
+		return stageLabel(stage.StageType) + " is running."
+	case "completed":
+		return stageLabel(stage.StageType) + " completed."
+	case "failed":
+		return stageLabel(stage.StageType) + " failed."
+	default:
+		return stageLabel(stage.StageType) + " is " + stage.Status + "."
+	}
+}
+
+func prototypeDataFields(data map[string]any) []PrototypeDataField {
+	if len(data) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(data))
+	for key := range data {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	fields := make([]PrototypeDataField, 0, len(keys))
+	for _, key := range keys {
+		fields = append(fields, PrototypeDataField{Key: key, Value: fmt.Sprint(data[key])})
+	}
+	return fields
+}
+
+func prototypeDiffLines(preview string) []PrototypeDiffLine {
+	if preview == "" {
+		return nil
+	}
+	rawLines := strings.Split(strings.TrimRight(preview, "\n"), "\n")
+	lines := make([]PrototypeDiffLine, 0, len(rawLines))
+	for _, line := range rawLines {
+		lines = append(lines, PrototypeDiffLine{Text: line, Class: prototypeDiffLineClass(line)})
+	}
+	return lines
+}
+
+func prototypeDiffLineClass(line string) string {
+	switch {
+	case strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++"):
+		return "diff-add"
+	case strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---"):
+		return "diff-del"
+	case strings.HasPrefix(line, "diff "), strings.HasPrefix(line, "index "), strings.HasPrefix(line, "@@"), strings.HasPrefix(line, "---"), strings.HasPrefix(line, "+++"):
+		return "diff-meta"
+	default:
+		return ""
+	}
+}
+
+func statusLabel(status string) string {
+	switch status {
+	case "running":
+		return "Running"
+	case "completed":
+		return "Completed"
+	case "connected":
+		return "Connected"
+	case "failed":
+		return "Failed"
+	case "down":
+		return "Down"
+	case "cancelled":
+		return "Cancelled"
+	case "abandoned":
+		return "Abandoned"
+	case "suspect":
+		return "Suspect"
+	case "pending":
+		return "Pending"
+	case "invalid":
+		return "Invalid"
+	case "needs_input":
+		return "Needs input"
+	default:
+		return status
+	}
+}
+
+func runnerStatusLabel(status string) string {
+	switch status {
+	case store.RunnerStatusConnected:
+		return "Connected"
+	case store.RunnerStatusSuspect:
+		return "Suspect"
+	case store.RunnerStatusDown:
+		return "Down"
+	default:
+		return statusLabel(status)
+	}
+}
+
+func timeLabel(value string) string {
+	if len(value) >= 16 && value[10] == 'T' {
+		return value[11:16]
+	}
+	return value
+}
+
+func artifactLabel(kind string) string {
+	switch kind {
+	case "diff_patch":
+		return "Diff patch"
+	case "task_plan":
+		return "Task plan"
+	case "agent_output":
+		return "Agent output"
+	case "report":
+		return "Run report"
+	default:
+		return strings.ReplaceAll(kind, "_", " ")
+	}
 }
 
 func stageTypeFromEvent(ev event.Event) string {
@@ -386,7 +596,7 @@ func stageLabel(stageType string) string {
 	case contract.StageTypeCommit:
 		return "Commit"
 	case contract.StageTypePRReady:
-		return "PR-ready stop"
+		return "PR-ready"
 	case "":
 		return "Run lifecycle"
 	default:

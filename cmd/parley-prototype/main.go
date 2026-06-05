@@ -32,7 +32,13 @@ func main() {
 			return
 		}
 		query := r.URL.Query()
-		writePage(w, renderer, "prototype.html", web.NewPrototypeData(query.Get("v"), query.Get("run"), query.Get("mock")))
+		writePage(w, renderer, "prototype.html", web.NewPrototypeDataWithOptions(web.PrototypeOptions{
+			RunID:      query.Get("run"),
+			Tab:        query.Get("tab"),
+			View:       query.Get("view"),
+			Mock:       query.Get("mock"),
+			CancelMode: query.Get("cancel"),
+		}))
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {

@@ -9,22 +9,25 @@ import (
 	"github.com/agent-parley/parley/internal/manager/web"
 )
 
-func TestPrototypeRouteRendersVariationsFromSeedData(t *testing.T) {
+func TestPrototypeRouteRendersSingleLinearDesignFromSeedData(t *testing.T) {
 	renderer, err := web.NewRenderer()
 	if err != nil {
 		t.Fatalf("new renderer: %v", err)
 	}
 	srv := NewServer("127.0.0.1:8080", nil, nil, NewHub(), renderer)
-	for _, variation := range []string{"1", "2", "3"} {
+	for _, path := range []string{"/prototype", "/prototype?tab=review", "/prototype?view=runners", "/prototype?cancel=prominent"} {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/prototype?v="+variation, nil)
+		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080"+path, nil)
 		srv.routes().ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("variation %s status = %d body=%s", variation, rec.Code, rec.Body.String())
+			t.Fatalf("%s status = %d body=%s", path, rec.Code, rec.Body.String())
 		}
 		body := rec.Body.String()
-		if !strings.Contains(body, "Parley operator UI prototype") || !strings.Contains(body, "run_proto_running") {
-			t.Fatalf("variation %s did not render seeded prototype body", variation)
+		if !strings.Contains(body, "Operator prototype") || !strings.Contains(body, "run_proto_running") {
+			t.Fatalf("%s did not render seeded prototype body", path)
+		}
+		if strings.Contains(body, "?v=") || strings.Contains(body, "Command center") {
+			t.Fatalf("%s rendered retired variation UI", path)
 		}
 	}
 }
