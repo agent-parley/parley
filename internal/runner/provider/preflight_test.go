@@ -21,10 +21,9 @@ func TestPreflightRejectsUnsafeInvocation(t *testing.T) {
 			want: nil,
 		},
 		{
-			name: "host home mount",
-			mutate: func(inv *PreparedInvocation, policy *PreflightPolicy) {
+			name: "host home mount outside registered roots",
+			mutate: func(inv *PreparedInvocation, _ *PreflightPolicy) {
 				inv.Mounts[0].Host = fixture.homeRepo
-				policy.WorktreeRoots = append(policy.WorktreeRoots, fixture.home)
 			},
 			want: ErrHostHomeMount,
 		},
@@ -145,6 +144,57 @@ func TestPreflightRejectsUnsafeInvocation(t *testing.T) {
 			if tc.mutate != nil {
 				tc.mutate(&inv, &policy)
 			}
+			err := Preflight(inv, policy)
+			if tc.want == nil {
+				if err != nil {
+					t.Fatalf("Preflight() error = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("Preflight() error = %v, want errors.Is(..., %v)", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestPreflightHostHomeRejectionIsRootAware(t *testing.T) {
+	fixture := newPreflightFixture(t)
+
+	cases := []struct {
+		name   string
+		mutate func(*PreparedInvocation, *PreflightPolicy)
+		want   error
+	}{
+		{
+			name: "home path inside registered root allowed",
+			mutate: func(inv *PreparedInvocation, policy *PreflightPolicy) {
+				inv.Mounts[0].Host = fixture.homeRepo
+				policy.WorktreeRoots = append(policy.WorktreeRoots, fixture.home)
+			},
+			want: nil,
+		},
+		{
+			name: "home path outside registered roots rejected",
+			mutate: func(inv *PreparedInvocation, _ *PreflightPolicy) {
+				inv.Mounts[0].Host = fixture.homeRepo
+			},
+			want: ErrHostHomeMount,
+		},
+		{
+			name: "non-home registered path allowed",
+			want: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inv := fixture.invocation()
+			policy := fixture.policy()
+			if tc.mutate != nil {
+				tc.mutate(&inv, &policy)
+			}
+
 			err := Preflight(inv, policy)
 			if tc.want == nil {
 				if err != nil {
