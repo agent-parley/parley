@@ -50,14 +50,17 @@ const (
 
 var ErrSessionClosed = errors.New("protocol session closed")
 
+// ArtifactChunkBytes is the raw byte budget for one artifact chunk. The JSON
+// transport base64-encodes []byte fields, so each websocket frame is larger
+// than this raw chunk size.
+const ArtifactChunkBytes = 1 << 20
+
 // MaxMessageBytes bounds a single protocol message. coder/websocket defaults
-// the read limit to 32 KiB, which is far too small for this channel: artifacts
-// (diffs, validation logs, reports) are carried inline as base64 JSON (see
-// ArtifactPayload), so any non-trivial diff trips the limit and drops the
-// session with StatusMessageTooBig. 64 MiB is a generous bound for the
-// skeleton; chunked artifact transfer is the documented later refinement for
-// anything larger.
-const MaxMessageBytes = 64 << 20
+// the read limit to 32 KiB, which is far too small for this channel: artifact
+// chunks are carried inline as base64 JSON (see ArtifactPayload). The limit
+// only needs to cover one chunk plus envelope overhead; whole artifacts are
+// split across TypeArtifact frames.
+const MaxMessageBytes = 4 * ArtifactChunkBytes
 
 // Message is the symmetric Manager<->Runner JSON envelope.
 type Message struct {
@@ -89,8 +92,9 @@ type CancelPayload struct {
 type EventPayload = event.Event
 
 // ArtifactPayload transfers a durable artifact from Runner to Manager over the
-// session. Content is carried inline (base64 in JSON) for the skeleton; chunked
-// transfer is a later refinement behind this same message type.
+// session. Large artifacts are split across ordered TypeArtifact frames with
+// Seq starting at 0 and Last marking the terminal chunk. Content is the raw
+// bytes for this chunk, carried inline as base64 JSON.
 type ArtifactPayload struct {
 	RunID      string `json:"run_id"`
 	TaskID     string `json:"task_id"`
@@ -99,6 +103,8 @@ type ArtifactPayload struct {
 	Name       string `json:"name"`
 	Kind       string `json:"kind"`
 	MediaType  string `json:"media_type"`
+	Seq        int    `json:"seq"`
+	Last       bool   `json:"last"`
 	Content    []byte `json:"content"`
 }
 
