@@ -154,7 +154,7 @@ func ListUntrackedFiles(ctx context.Context, worktreePath string) ([]string, err
 // the `baseline` snapshot — i.e. files created since the snapshot was taken.
 // It is used to strip artifacts a validation command leaves in the worktree
 // (e.g. the binary `go build ./...` writes), which would otherwise pollute the
-// captured diff and the commit. Callers MUST pass a baseline taken from a
+// validation-stage diff artifact. Callers MUST pass a baseline taken from a
 // successful ListUntrackedFiles; never call with a baseline from a failed
 // snapshot, or worker-created files would be removed. It does not revert
 // modifications to already-tracked files. Returns the removed relative paths.

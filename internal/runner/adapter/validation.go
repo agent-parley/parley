@@ -64,10 +64,9 @@ func (a Validation) Run(ctx context.Context, disp contract.Dispatch, sink runner
 
 	// Snapshot untracked files so we can strip whatever the validation command
 	// writes into the worktree (e.g. `go build ./...` drops a compiled binary)
-	// before capturing the diff. Otherwise that build output pollutes both the
-	// diff.patch artifact and the hook-free commit (`git add -A`), which must
-	// reflect only the worker's changes (ADR 0072). A failed snapshot disables
-	// cleanup — never strip against an empty baseline, or worker files go too.
+	// before capturing the validation-stage diff. Otherwise that build output
+	// pollutes diff.patch. A failed snapshot disables cleanup — never strip
+	// against an empty baseline, or worker files go too.
 	baseline, baselineErr := worktree.ListUntrackedFiles(ctx, prepared.WorktreePath)
 
 	result, runErr := a.opts.Provider.Run(ctx, prepared.Invocation, sink)

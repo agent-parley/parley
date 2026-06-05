@@ -61,6 +61,14 @@ type EngineOptions struct {
 	GitExecutable         string
 }
 
+type workerSnapshot struct {
+	WorktreePath   string
+	BaseSHA        string
+	BaseTreeSHA    string
+	WorkerTreeSHA  string
+	DiffArtifactID string
+}
+
 func NewEngine(st *store.Store, runner Runner, renderer FragmentRenderer, broadcast Broadcaster) *Engine {
 	return NewEngineWithOptions(st, runner, renderer, broadcast, EngineOptions{})
 }
@@ -332,6 +340,8 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 		return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after implementation")
 	}
 
+	workerSnapshot, snapshotErr := e.snapshotWorktree(ctx, wr, implementationReport)
+
 	validationReport, err := e.dispatchStage(ctx, wr, wr.ValidationStage, e.validationAdapter, contract.StageTypeValidation, map[string]any{"idea": wr.Run.Idea})
 	if err != nil {
 		return err
@@ -347,7 +357,7 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 		return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after validation")
 	}
 
-	commitReport, err := e.runCommit(ctx, wr, validationReport)
+	commitReport, err := e.runCommit(ctx, wr, validationReport, workerSnapshot, snapshotErr)
 	if err != nil {
 		return err
 	}
@@ -476,29 +486,31 @@ func (e *Engine) dispatchStage(ctx context.Context, wr store.WorkflowRun, stage 
 	return rep, nil
 }
 
-func (e *Engine) runCommit(ctx context.Context, wr store.WorkflowRun, validationReport report.Report) (report.Report, error) {
+func (e *Engine) runCommit(ctx context.Context, wr store.WorkflowRun, validationReport report.Report, snapshot workerSnapshot, snapshotErr error) (report.Report, error) {
 	stage := wr.CommitStage
 	if err := e.startStage(ctx, wr, stage, "commit stage started"); err != nil {
 		return report.Report{}, err
 	}
-	worktreePath, err := worktree.Locate(e.dataRoot, e.projectID, wr.Run.ID, wr.Task.ID, wr.Attempt.ID)
-	if err != nil {
-		rep := commitFailureReport(wr, stage, err, validationReport)
+	if snapshotErr != nil {
+		rep := commitFailureReport(wr, stage, snapshotErr, snapshot.DiffArtifactID)
 		return rep, e.completeStage(context.Background(), wr, stage, rep)
 	}
 	result, err := commitWorktree(ctx, commitOptions{
-		WorktreePath:   worktreePath,
+		WorktreePath:   snapshot.WorktreePath,
+		BaseSHA:        snapshot.BaseSHA,
+		BaseTreeSHA:    snapshot.BaseTreeSHA,
+		WorkerTreeSHA:  snapshot.WorkerTreeSHA,
 		RunID:          wr.Run.ID,
 		TaskID:         wr.Task.ID,
 		Idea:           wr.Run.Idea,
 		ReportSummary:  validationReport.Summary,
-		DiffArtifactID: payloadString(validationReport.Payload, "diff_artifact_id"),
+		DiffArtifactID: snapshot.DiffArtifactID,
 		Git:            e.gitExecutable,
 		AuthorName:     e.gitAuthorName,
 		AuthorEmail:    e.gitAuthorEmail,
 	})
 	if err != nil {
-		rep := commitFailureReport(wr, stage, err, validationReport)
+		rep := commitFailureReport(wr, stage, err, snapshot.DiffArtifactID)
 		return rep, e.completeStage(context.Background(), wr, stage, rep)
 	}
 	rep := report.Report{
@@ -511,11 +523,11 @@ func (e *Engine) runCommit(ctx context.Context, wr store.WorkflowRun, validation
 		Actor:         report.Actor{Kind: report.ActorKindHarness, ID: "commit"},
 		Status:        report.StatusCompleted,
 		Summary:       "committed worktree to " + result.Branch,
-		EvidenceRefs:  []string{payloadString(validationReport.Payload, "diff_artifact_id")},
+		EvidenceRefs:  []string{snapshot.DiffArtifactID},
 		Payload: map[string]any{
 			"branch":           result.Branch,
 			"commit_sha":       result.CommitSHA,
-			"diff_artifact_id": payloadString(validationReport.Payload, "diff_artifact_id"),
+			"diff_artifact_id": snapshot.DiffArtifactID,
 			"no_verify":        true,
 			"hooks_disabled":   true,
 			"author_name":      result.AuthorName,
@@ -527,6 +539,23 @@ func (e *Engine) runCommit(ctx context.Context, wr store.WorkflowRun, validation
 		return report.Report{}, err
 	}
 	return rep, nil
+}
+
+func (e *Engine) snapshotWorktree(ctx context.Context, wr store.WorkflowRun, implementationReport report.Report) (workerSnapshot, error) {
+	snapshot := workerSnapshot{DiffArtifactID: payloadString(implementationReport.Payload, "diff_artifact_id")}
+	worktreePath, err := worktree.Locate(e.dataRoot, e.projectID, wr.Run.ID, wr.Task.ID, wr.Attempt.ID)
+	if err != nil {
+		return snapshot, err
+	}
+	snapshot.WorktreePath = worktreePath
+	baseSHA, baseTreeSHA, workerTreeSHA, err := snapshotGitWorktree(ctx, e.gitExecutable, worktreePath)
+	if err != nil {
+		return snapshot, err
+	}
+	snapshot.BaseSHA = baseSHA
+	snapshot.BaseTreeSHA = baseTreeSHA
+	snapshot.WorkerTreeSHA = workerTreeSHA
+	return snapshot, nil
 }
 
 func (e *Engine) runPRReady(ctx context.Context, wr store.WorkflowRun, commitReport report.Report) (report.Report, error) {
@@ -756,7 +785,7 @@ func dispatchFailedReport(wr store.WorkflowRun, stage store.Stage, adapterName s
 	}
 }
 
-func commitFailureReport(wr store.WorkflowRun, stage store.Stage, err error, validationReport report.Report) report.Report {
+func commitFailureReport(wr store.WorkflowRun, stage store.Stage, err error, diffArtifactID string) report.Report {
 	return report.Report{
 		SchemaVersion: report.SchemaVersion,
 		RunID:         wr.Run.ID,
@@ -768,7 +797,7 @@ func commitFailureReport(wr store.WorkflowRun, stage store.Stage, err error, val
 		Status:        report.StatusFailed,
 		Summary:       "commit failed",
 		Payload: map[string]any{
-			"diff_artifact_id": payloadString(validationReport.Payload, "diff_artifact_id"),
+			"diff_artifact_id": diffArtifactID,
 		},
 		Errors: []string{err.Error()},
 	}
