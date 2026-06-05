@@ -99,7 +99,9 @@ func Preflight(inv PreparedInvocation, policy PreflightPolicy) error {
 		}
 
 		cleanHost, realHost, resolveErr := resolveMountPath(mount.Host)
-		if strings.HasPrefix(strings.TrimSpace(mount.Host), "~") || pathWithin(home.clean, cleanHost) || pathWithin(home.real, realHost) {
+		registeredRootLexical, registeredRootReal := pathWithinAnyRoot(registeredRoots, cleanHost, realHost)
+		underHome := pathWithin(home.clean, cleanHost) || pathWithin(home.real, realHost)
+		if strings.HasPrefix(strings.TrimSpace(mount.Host), "~") || (underHome && !registeredRootLexical && !registeredRootReal) {
 			errs = append(errs, fmt.Errorf("%w: %s", ErrHostHomeMount, prefix))
 		}
 		if runtimeSocketPath(cleanHost) || runtimeSocketPath(realHost) || runtimeSocketPath(mount.Container) {
@@ -130,12 +132,8 @@ func Preflight(inv PreparedInvocation, policy PreflightPolicy) error {
 			errs = append(errs, fmt.Errorf("%w: %s no registered roots configured", ErrPathOutsideRegisteredRoots, prefix))
 			continue
 		}
-		lexical := false
-		real := false
-		for _, root := range registeredRoots {
-			lexical = lexical || pathWithin(root.clean, cleanHost)
-			real = real || pathWithin(root.real, realHost)
-		}
+		lexical := registeredRootLexical
+		real := registeredRootReal
 		if lexical && !real {
 			errs = append(errs, fmt.Errorf("%w: %s", ErrSymlinkEscape, prefix))
 		}
@@ -238,6 +236,16 @@ func resolveHome(override string) canonicalPath {
 		real = clean
 	}
 	return canonicalPath{clean: filepath.Clean(clean), real: filepath.Clean(real)}
+}
+
+func pathWithinAnyRoot(roots []canonicalPath, cleanPath, realPath string) (bool, bool) {
+	lexical := false
+	real := false
+	for _, root := range roots {
+		lexical = lexical || pathWithin(root.clean, cleanPath)
+		real = real || pathWithin(root.real, realPath)
+	}
+	return lexical, real
 }
 
 func pathWithin(root, path string) bool {
