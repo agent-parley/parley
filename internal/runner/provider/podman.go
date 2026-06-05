@@ -148,29 +148,46 @@ func podmanRunArgs(inv PreparedInvocation, containerName string) []string {
 }
 
 func streamOutput(ctx context.Context, sink runnerio.Sink, adapterID, stream string, r io.Reader, errCh chan<- error) {
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if err := sink.Emit(ctx, event.Event{
-			SchemaVersion: event.SchemaVersion,
-			Type:          "adapter.output",
-			Actor:         event.Actor{Kind: event.ActorKindAdapter, ID: adapterID},
-			Summary:       line,
-			Data: map[string]any{
-				"provider": "podman",
-				"stream":   stream,
-				"line":     line,
-			},
-		}); err != nil {
-			errCh <- fmt.Errorf("emit podman %s output: %w", stream, err)
-			return
+	reader := bufio.NewReader(r)
+	for {
+		line, readErr := reader.ReadString('\n')
+		if len(line) > 0 {
+			line = trimScannerLineEnding(line)
+			if err := sink.Emit(ctx, event.Event{
+				SchemaVersion: event.SchemaVersion,
+				Type:          "adapter.output",
+				Actor:         event.Actor{Kind: event.ActorKindAdapter, ID: adapterID},
+				Summary:       line,
+				Data: map[string]any{
+					"provider": "podman",
+					"stream":   stream,
+					"line":     line,
+				},
+			}); err != nil {
+				errCh <- fmt.Errorf("emit podman %s output: %w", stream, err)
+				return
+			}
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		errCh <- fmt.Errorf("scan podman %s output: %w", stream, err)
+		if readErr == nil {
+			continue
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		errCh <- fmt.Errorf("read podman %s output: %w", stream, readErr)
 		return
 	}
 	errCh <- nil
+}
+
+func trimScannerLineEnding(line string) string {
+	if len(line) > 0 && line[len(line)-1] == '\n' {
+		line = line[:len(line)-1]
+	}
+	if len(line) > 0 && line[len(line)-1] == '\r' {
+		line = line[:len(line)-1]
+	}
+	return line
 }
 
 func exitCode(err error) int {

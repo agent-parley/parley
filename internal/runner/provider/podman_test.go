@@ -5,7 +5,11 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/agent-parley/parley/internal/runner/runnerio"
+	"github.com/agent-parley/parley/internal/shared/event"
 )
 
 func TestPodmanRunCallsPreflightBeforeExec(t *testing.T) {
@@ -54,3 +58,43 @@ func TestPodmanRunArgsUseRootlessEphemeralContainer(t *testing.T) {
 		t.Fatalf("args tail = %#v, want %#v", args[len(args)-len(wantTail):], wantTail)
 	}
 }
+
+func TestStreamOutputHandlesLineLongerThanScannerLimit(t *testing.T) {
+	longLine := strings.Repeat("x", 70*1024)
+	sink := &recordingOutputSink{}
+	errCh := make(chan error, 1)
+
+	streamOutput(context.Background(), sink, "container_sample", "stdout", strings.NewReader(longLine), errCh)
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("streamOutput() error = %v, want nil", err)
+	}
+	if len(sink.events) != 1 {
+		t.Fatalf("streamOutput() emitted %d events, want 1", len(sink.events))
+	}
+	ev := sink.events[0]
+	if ev.Summary != longLine {
+		t.Fatalf("event summary length = %d, want %d", len(ev.Summary), len(longLine))
+	}
+	gotLine, ok := ev.Data["line"].(string)
+	if !ok {
+		t.Fatalf("event line type = %T, want string", ev.Data["line"])
+	}
+	if gotLine != longLine {
+		t.Fatalf("event line length = %d, want %d", len(gotLine), len(longLine))
+	}
+	if got := ev.Data["stream"]; got != "stdout" {
+		t.Fatalf("event stream = %v, want stdout", got)
+	}
+}
+
+type recordingOutputSink struct {
+	events []event.Event
+}
+
+func (s *recordingOutputSink) Emit(_ context.Context, ev event.Event) error {
+	s.events = append(s.events, ev)
+	return nil
+}
+
+func (s *recordingOutputSink) Artifact(context.Context, runnerio.Artifact) error { return nil }
