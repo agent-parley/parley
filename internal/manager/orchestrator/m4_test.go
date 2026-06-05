@@ -10,7 +10,9 @@ import (
 	"testing"
 
 	"github.com/agent-parley/parley/internal/manager/store"
+	rworktree "github.com/agent-parley/parley/internal/runner/worktree"
 	"github.com/agent-parley/parley/internal/shared/event"
+	"github.com/agent-parley/parley/internal/shared/report"
 )
 
 func TestIdeaIntakeFreezesVerbatimIdeaIntoContractAndSnapshot(t *testing.T) {
@@ -60,14 +62,98 @@ func TestIdeaIntakeFreezesVerbatimIdeaIntoContractAndSnapshot(t *testing.T) {
 	}
 }
 
-func TestCommitWorktreeCreatesAgentBranchWithIdentityAndNoHooks(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available")
-	}
+func TestCommitWorktreeUsesWorkerSnapshotAndExcludesValidatorTrackedEdits(t *testing.T) {
+	requireGit(t)
 	ctx := context.Background()
-	source := initCommitSourceRepo(t, ctx)
-	worktreePath := filepath.Join(t.TempDir(), "wt")
-	runCommitGit(t, ctx, source, "worktree", "add", "--detach", worktreePath, "HEAD")
+	source := initCommitSourceRepo(t, ctx, map[string]string{
+		"go.sum":  "base sum\n",
+		"main.go": "package main\n\nfunc main() {}\n",
+	})
+	worktreePath := addDetachedWorktree(t, ctx, source)
+	workerMain := "package main\n\nfunc main() { println(\"worker\") }\n"
+	if err := os.WriteFile(filepath.Join(worktreePath, "main.go"), []byte(workerMain), 0o600); err != nil {
+		t.Fatalf("write worker main.go: %v", err)
+	}
+	opts := snapshotCommitOptions(t, ctx, worktreePath, "run_test", "task_test", "artifact_impl")
+	if err := os.WriteFile(filepath.Join(worktreePath, "go.sum"), []byte("validation dirtied sum\n"), 0o600); err != nil {
+		t.Fatalf("dirty go.sum: %v", err)
+	}
+
+	result, err := commitWorktree(ctx, opts)
+	if err != nil {
+		t.Fatalf("commitWorktree() error = %v", err)
+	}
+	commitTree := strings.TrimSpace(string(runCommitGitOutput(t, ctx, worktreePath, "show", "-s", "--format=%T", result.CommitSHA)))
+	if commitTree != opts.WorkerTreeSHA {
+		t.Fatalf("commit tree = %s, want worker tree %s", commitTree, opts.WorkerTreeSHA)
+	}
+	goSum := string(runCommitGitOutput(t, ctx, worktreePath, "show", result.CommitSHA+":go.sum"))
+	if goSum != "base sum\n" {
+		t.Fatalf("committed go.sum = %q, want base content", goSum)
+	}
+	mainGo := string(runCommitGitOutput(t, ctx, worktreePath, "show", result.CommitSHA+":main.go"))
+	if mainGo != workerMain {
+		t.Fatalf("committed main.go = %q, want worker content", mainGo)
+	}
+	branchSHA := strings.TrimSpace(string(runCommitGitOutput(t, ctx, worktreePath, "rev-parse", "refs/heads/"+result.Branch)))
+	if branchSHA != result.CommitSHA {
+		t.Fatalf("branch ref = %s, want %s", branchSHA, result.CommitSHA)
+	}
+}
+
+func TestCommitWorktreeNoChangesUsesSnapshotNotValidationDirtyWorktree(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	source := initCommitSourceRepo(t, ctx, map[string]string{
+		"go.sum":  "base sum\n",
+		"main.go": "package main\n\nfunc main() {}\n",
+	})
+	worktreePath := addDetachedWorktree(t, ctx, source)
+	opts := snapshotCommitOptions(t, ctx, worktreePath, "run_no_changes", "task_test", "artifact_impl")
+	if opts.WorkerTreeSHA != opts.BaseTreeSHA {
+		t.Fatalf("snapshot should have no worker changes: worker=%s base=%s", opts.WorkerTreeSHA, opts.BaseTreeSHA)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, "go.sum"), []byte("validation dirtied sum\n"), 0o600); err != nil {
+		t.Fatalf("dirty go.sum: %v", err)
+	}
+
+	_, err := commitWorktree(ctx, opts)
+	if err == nil || !strings.Contains(err.Error(), "no changes to commit") {
+		t.Fatalf("commitWorktree() error = %v, want no changes to commit", err)
+	}
+}
+
+func TestCommitWorktreeCommitsWorkerDeletion(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	source := initCommitSourceRepo(t, ctx, map[string]string{
+		"keep.txt":   "keep\n",
+		"delete.txt": "delete\n",
+	})
+	worktreePath := addDetachedWorktree(t, ctx, source)
+	if err := os.Remove(filepath.Join(worktreePath, "delete.txt")); err != nil {
+		t.Fatalf("delete worker file: %v", err)
+	}
+	opts := snapshotCommitOptions(t, ctx, worktreePath, "run_delete", "task_test", "artifact_impl")
+
+	result, err := commitWorktree(ctx, opts)
+	if err != nil {
+		t.Fatalf("commitWorktree() error = %v", err)
+	}
+	names := string(runCommitGitOutput(t, ctx, worktreePath, "ls-tree", "-r", "--name-only", result.CommitSHA))
+	if strings.Contains(names, "delete.txt") {
+		t.Fatalf("deleted file still present in commit tree:\n%s", names)
+	}
+	if !strings.Contains(names, "keep.txt") {
+		t.Fatalf("kept file missing from commit tree:\n%s", names)
+	}
+}
+
+func TestCommitWorktreeCreatesAgentBranchWithIdentityAndNoHooks(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	source := initCommitSourceRepo(t, ctx, map[string]string{"README.md": "hello\n"})
+	worktreePath := addDetachedWorktree(t, ctx, source)
 	if err := os.WriteFile(filepath.Join(worktreePath, "feature.txt"), []byte("feature\n"), 0o600); err != nil {
 		t.Fatalf("write feature: %v", err)
 	}
@@ -77,31 +163,27 @@ func TestCommitWorktreeCreatesAgentBranchWithIdentityAndNoHooks(t *testing.T) {
 	installFailingHook(t, filepath.Join(source, ".git", "hooks", "commit-msg"), sentinel)
 	installFailingHook(t, filepath.Join(source, ".git", "hooks", "prepare-commit-msg"), sentinel)
 
-	result, err := commitWorktree(ctx, commitOptions{
-		WorktreePath:   worktreePath,
-		RunID:          "run_test",
-		TaskID:         "task_test",
-		Idea:           "Add file\nsecond line",
-		ReportSummary:  "validation passed",
-		DiffArtifactID: "artifact_diff",
-		AuthorName:     "Harness Bot",
-		AuthorEmail:    "bot@example.invalid",
-	})
+	opts := snapshotCommitOptions(t, ctx, worktreePath, "run_test", "task_test", "artifact_diff")
+	opts.Idea = "Add file\nsecond line"
+	opts.ReportSummary = "validation passed"
+	opts.AuthorName = "Harness Bot"
+	opts.AuthorEmail = "bot@example.invalid"
+	result, err := commitWorktree(ctx, opts)
 	if err != nil {
 		t.Fatalf("commitWorktree() error = %v", err)
 	}
 	if result.Branch != "agent/run_test/task_test" {
 		t.Fatalf("branch = %s", result.Branch)
 	}
-	branch := strings.TrimSpace(string(runCommitGitOutput(t, ctx, worktreePath, "rev-parse", "--abbrev-ref", "HEAD")))
-	if branch != result.Branch {
-		t.Fatalf("git branch = %s, want %s", branch, result.Branch)
+	branchSHA := strings.TrimSpace(string(runCommitGitOutput(t, ctx, worktreePath, "rev-parse", "refs/heads/"+result.Branch)))
+	if branchSHA != result.CommitSHA {
+		t.Fatalf("branch ref = %s, want %s", branchSHA, result.CommitSHA)
 	}
-	author := strings.TrimSpace(string(runCommitGitOutput(t, ctx, worktreePath, "log", "-1", "--format=%an <%ae>")))
-	if author != "Harness Bot <bot@example.invalid>" {
-		t.Fatalf("author = %s", author)
+	identity := strings.TrimSpace(string(runCommitGitOutput(t, ctx, worktreePath, "show", "-s", "--format=%an <%ae>|%cn <%ce>", result.CommitSHA)))
+	if identity != "Harness Bot <bot@example.invalid>|Harness Bot <bot@example.invalid>" {
+		t.Fatalf("identity = %s", identity)
 	}
-	message := string(runCommitGitOutput(t, ctx, worktreePath, "log", "-1", "--format=%B"))
+	message := string(runCommitGitOutput(t, ctx, worktreePath, "show", "-s", "--format=%B", result.CommitSHA))
 	for _, want := range []string{"parley: Add file", "validation passed", "Run ID: run_test", "Task ID: task_test", "Diff artifact ID: artifact_diff"} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("commit message missing %q:\n%s", want, message)
@@ -110,19 +192,74 @@ func TestCommitWorktreeCreatesAgentBranchWithIdentityAndNoHooks(t *testing.T) {
 	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
 		t.Fatalf("repo hook ran or sentinel stat failed: %v", err)
 	}
-	args := gitCommitArgs(gitIdentity{Name: "n", Email: "e"}, "/tmp/no-hooks", "s", "b")
-	if !containsArg(args, "--no-verify") || !containsArg(args, "core.hooksPath=/tmp/no-hooks") {
-		t.Fatalf("commit args do not disable verification/hooks: %#v", args)
+}
+
+func TestRunCommitUsesImplementationDiffArtifact(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRun(ctx, "record the clean diff")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	dataRoot := t.TempDir()
+	projectID := "p1"
+	source := initCommitSourceRepo(t, ctx, map[string]string{"main.go": "package main\n\nfunc main() {}\n"})
+	wt, err := rworktree.Create(ctx, rworktree.CreateOptions{
+		DataRoot:   dataRoot,
+		ProjectID:  projectID,
+		RunID:      wr.Run.ID,
+		TaskID:     wr.Task.ID,
+		AttemptID:  wr.Attempt.ID,
+		SourceRepo: source,
+	})
+	if err != nil {
+		t.Fatalf("create worktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wt.Path, "main.go"), []byte("package main\n\nfunc main() { println(\"worker\") }\n"), 0o600); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{
+		DataRoot:       dataRoot,
+		ProjectID:      projectID,
+		GitAuthorName:  "Harness Bot",
+		GitAuthorEmail: "bot@example.invalid",
+	})
+	snapshot, err := engine.snapshotWorktree(ctx, wr, report.Report{Payload: map[string]any{"diff_artifact_id": "implementation_diff"}})
+	if err != nil {
+		t.Fatalf("snapshotWorktree() error = %v", err)
+	}
+	validationReport := report.Report{Summary: "validation passed", Payload: map[string]any{"diff_artifact_id": "validation_diff"}}
+
+	rep, err := engine.runCommit(ctx, wr, validationReport, snapshot, nil)
+	if err != nil {
+		t.Fatalf("runCommit() error = %v", err)
+	}
+	if got := payloadString(rep.Payload, "diff_artifact_id"); got != "implementation_diff" {
+		t.Fatalf("commit diff_artifact_id = %s, want implementation_diff", got)
+	}
+	if len(rep.EvidenceRefs) != 1 || rep.EvidenceRefs[0] != "implementation_diff" {
+		t.Fatalf("evidence refs = %#v, want implementation_diff", rep.EvidenceRefs)
+	}
+	if rep.Payload["no_verify"] != true || rep.Payload["hooks_disabled"] != true {
+		t.Fatalf("commit flags missing: %+v", rep.Payload)
+	}
+	commitSHA := payloadString(rep.Payload, "commit_sha")
+	message := string(runCommitGitOutput(t, ctx, wt.Path, "show", "-s", "--format=%B", commitSHA))
+	if !strings.Contains(message, "Diff artifact ID: implementation_diff") || strings.Contains(message, "validation_diff") {
+		t.Fatalf("commit message references wrong diff artifact:\n%s", message)
 	}
 }
 
-func containsArg(args []string, want string) bool {
-	for _, arg := range args {
-		if arg == want {
-			return true
-		}
+func requireGit(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
 	}
-	return false
 }
 
 type fakeFragmentRenderer struct{}
@@ -133,18 +270,52 @@ type fakeBroadcaster struct{}
 
 func (fakeBroadcaster) Broadcast(string, event.Event, string) {}
 
-func initCommitSourceRepo(t *testing.T, ctx context.Context) string {
+func initCommitSourceRepo(t *testing.T, ctx context.Context, files map[string]string) string {
 	t.Helper()
 	dir := t.TempDir()
 	runCommitGit(t, ctx, dir, "init")
 	runCommitGit(t, ctx, dir, "config", "user.email", "test@example.invalid")
 	runCommitGit(t, ctx, dir, "config", "user.name", "Parley Test")
-	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hello\n"), 0o600); err != nil {
-		t.Fatalf("write README: %v", err)
+	for name, content := range files {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("create parent for %s: %v", name, err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
 	}
-	runCommitGit(t, ctx, dir, "add", "README.md")
+	runCommitGit(t, ctx, dir, "add", "-A")
 	runCommitGit(t, ctx, dir, "commit", "-m", "initial")
 	return dir
+}
+
+func addDetachedWorktree(t *testing.T, ctx context.Context, source string) string {
+	t.Helper()
+	worktreePath := filepath.Join(t.TempDir(), "wt")
+	runCommitGit(t, ctx, source, "worktree", "add", "--detach", worktreePath, "HEAD")
+	return worktreePath
+}
+
+func snapshotCommitOptions(t *testing.T, ctx context.Context, worktreePath, runID, taskID, diffArtifactID string) commitOptions {
+	t.Helper()
+	baseSHA, baseTreeSHA, workerTreeSHA, err := snapshotGitWorktree(ctx, "git", worktreePath)
+	if err != nil {
+		t.Fatalf("snapshotGitWorktree() error = %v", err)
+	}
+	return commitOptions{
+		WorktreePath:   worktreePath,
+		BaseSHA:        baseSHA,
+		BaseTreeSHA:    baseTreeSHA,
+		WorkerTreeSHA:  workerTreeSHA,
+		RunID:          runID,
+		TaskID:         taskID,
+		Idea:           "Change worktree",
+		ReportSummary:  "validation passed",
+		DiffArtifactID: diffArtifactID,
+		AuthorName:     "Harness Bot",
+		AuthorEmail:    "bot@example.invalid",
+	}
 }
 
 func installFailingHook(t *testing.T, path, sentinel string) {

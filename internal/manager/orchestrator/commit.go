@@ -3,10 +3,10 @@ package orchestrator
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -17,6 +17,9 @@ const (
 
 type commitOptions struct {
 	WorktreePath   string
+	BaseSHA        string
+	BaseTreeSHA    string
+	WorkerTreeSHA  string
 	RunID          string
 	TaskID         string
 	Idea           string
@@ -43,6 +46,9 @@ func commitWorktree(ctx context.Context, opts commitOptions) (commitResult, erro
 	if opts.WorktreePath == "" {
 		return commitResult{}, fmt.Errorf("worktree path is required")
 	}
+	if opts.BaseSHA == "" || opts.BaseTreeSHA == "" || opts.WorkerTreeSHA == "" {
+		return commitResult{}, fmt.Errorf("base sha, base tree sha, and worker tree sha are required")
+	}
 	if opts.RunID == "" || opts.TaskID == "" {
 		return commitResult{}, fmt.Errorf("run_id and task_id are required")
 	}
@@ -53,37 +59,67 @@ func commitWorktree(ctx context.Context, opts commitOptions) (commitResult, erro
 	branch := "agent/" + opts.RunID + "/" + opts.TaskID
 	identity := configuredGitIdentity(opts.AuthorName, opts.AuthorEmail)
 
-	if _, err := runGitCommand(ctx, git, opts.WorktreePath, "checkout", "-B", branch); err != nil {
-		return commitResult{}, fmt.Errorf("checkout commit branch: %w", err)
-	}
-	if _, err := runGitCommand(ctx, git, opts.WorktreePath, "add", "-A"); err != nil {
-		return commitResult{}, fmt.Errorf("stage worktree changes: %w", err)
-	}
-	hasChanges, err := gitHasStagedChanges(ctx, git, opts.WorktreePath)
-	if err != nil {
-		return commitResult{}, err
-	}
-	if !hasChanges {
+	if opts.WorkerTreeSHA == opts.BaseTreeSHA {
 		return commitResult{}, fmt.Errorf("no changes to commit")
 	}
 
-	hookDir, err := os.MkdirTemp("", "parley-hooks-disabled-*")
-	if err != nil {
-		return commitResult{}, fmt.Errorf("create disabled hooks dir: %w", err)
-	}
-	defer os.RemoveAll(hookDir)
-
 	subject := commitSubject(opts.Idea)
 	body := commitBody(opts.ReportSummary, opts.RunID, opts.TaskID, opts.DiffArtifactID)
-	args := gitCommitArgs(identity, hookDir, subject, body)
-	if _, err := runGitCommand(ctx, git, opts.WorktreePath, args...); err != nil {
-		return commitResult{}, fmt.Errorf("git commit --no-verify: %w", err)
+	commitEnv := []string{
+		"GIT_AUTHOR_NAME=" + identity.Name,
+		"GIT_AUTHOR_EMAIL=" + identity.Email,
+		"GIT_COMMITTER_NAME=" + identity.Name,
+		"GIT_COMMITTER_EMAIL=" + identity.Email,
 	}
-	shaBytes, err := runGitCommand(ctx, git, opts.WorktreePath, "rev-parse", "HEAD")
+	shaBytes, err := runGitCommandEnv(ctx, git, opts.WorktreePath, commitEnv, "commit-tree", opts.WorkerTreeSHA, "-p", opts.BaseSHA, "-m", subject, "-m", body)
 	if err != nil {
-		return commitResult{}, fmt.Errorf("read commit sha: %w", err)
+		return commitResult{}, fmt.Errorf("git commit-tree: %w", err)
 	}
-	return commitResult{Branch: branch, CommitSHA: strings.TrimSpace(string(shaBytes)), AuthorName: identity.Name, AuthorEmail: identity.Email}, nil
+	commitSHA := strings.TrimSpace(string(shaBytes))
+	if commitSHA == "" {
+		return commitResult{}, fmt.Errorf("git commit-tree returned empty commit sha")
+	}
+	if _, err := runGitCommand(ctx, git, opts.WorktreePath, "update-ref", "refs/heads/"+branch, commitSHA); err != nil {
+		return commitResult{}, fmt.Errorf("update commit branch: %w", err)
+	}
+	return commitResult{Branch: branch, CommitSHA: commitSHA, AuthorName: identity.Name, AuthorEmail: identity.Email}, nil
+}
+
+func snapshotGitWorktree(ctx context.Context, git, worktreePath string) (string, string, string, error) {
+	if worktreePath == "" {
+		return "", "", "", fmt.Errorf("worktree path is required")
+	}
+	if git == "" {
+		git = "git"
+	}
+	baseBytes, err := runGitCommand(ctx, git, worktreePath, "rev-parse", "HEAD")
+	if err != nil {
+		return "", "", "", fmt.Errorf("read base sha: %w", err)
+	}
+	baseSHA := strings.TrimSpace(string(baseBytes))
+	baseTreeBytes, err := runGitCommand(ctx, git, worktreePath, "rev-parse", "HEAD^{tree}")
+	if err != nil {
+		return "", "", "", fmt.Errorf("read base tree sha: %w", err)
+	}
+	baseTreeSHA := strings.TrimSpace(string(baseTreeBytes))
+
+	tempDir, err := os.MkdirTemp("", "parley-worker-index-*")
+	if err != nil {
+		return "", "", "", fmt.Errorf("create worker snapshot index dir: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	tempIndex := filepath.Join(tempDir, "index")
+	env := []string{"GIT_INDEX_FILE=" + tempIndex}
+	if _, err := runGitCommandEnv(ctx, git, worktreePath, env, "add", "-A"); err != nil {
+		return "", "", "", fmt.Errorf("snapshot worker tree: %w", err)
+	}
+	workerTreeBytes, err := runGitCommandEnv(ctx, git, worktreePath, env, "write-tree")
+	if err != nil {
+		return "", "", "", fmt.Errorf("write worker tree: %w", err)
+	}
+	workerTreeSHA := strings.TrimSpace(string(workerTreeBytes))
+	return baseSHA, baseTreeSHA, workerTreeSHA, nil
 }
 
 func configuredGitIdentity(name, email string) gitIdentity {
@@ -132,37 +168,16 @@ func commitBody(summary, runID, taskID, diffArtifactID string) string {
 	return b.String()
 }
 
-func gitCommitArgs(identity gitIdentity, hooksPath, subject, body string) []string {
-	return []string{
-		"-c", "user.name=" + identity.Name,
-		"-c", "user.email=" + identity.Email,
-		"-c", "core.hooksPath=" + hooksPath,
-		"commit", "--no-verify", "-m", subject, "-m", body,
-	}
-}
-
-func gitHasStagedChanges(ctx context.Context, git, dir string) (bool, error) {
-	cmd := exec.CommandContext(ctx, git, "diff", "--cached", "--quiet", "--no-ext-diff", "--")
-	cmd.Dir = dir
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	if err == nil {
-		return false, nil
-	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-		return true, nil
-	}
-	if stderr.Len() > 0 {
-		return false, fmt.Errorf("git diff --cached --quiet: %w: %s", err, stderr.String())
-	}
-	return false, fmt.Errorf("git diff --cached --quiet: %w", err)
-}
-
 func runGitCommand(ctx context.Context, git, dir string, args ...string) ([]byte, error) {
+	return runGitCommandEnv(ctx, git, dir, nil, args...)
+}
+
+func runGitCommandEnv(ctx context.Context, git, dir string, env []string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, git, args...)
 	cmd.Dir = dir
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
