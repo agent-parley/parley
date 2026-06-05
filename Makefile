@@ -1,4 +1,4 @@
-.PHONY: build test vet run clean test-race test-integration test-live-m4 test-live-m5
+.PHONY: build test vet run clean test-race test-integration test-live-m4 test-live-m5 test-live-m5-loop
 
 BIN_DIR := bin
 MANAGER := $(BIN_DIR)/parley
@@ -14,6 +14,8 @@ export GOTOOLCHAIN := auto
 VALIDATION_IMAGE   ?= docker.io/library/golang:1.26
 VALIDATION_NETWORK ?= bridge
 PI_AUTH_VOLUME     ?= pi-auth
+PI_IMAGE           ?= localhost/parley-pi-worker:0.78.0
+PI_NETWORK         ?= bridge
 M5_CANCEL_IMAGE    ?= docker.io/library/alpine:3.20
 
 build:
@@ -51,6 +53,16 @@ test-live-m5: build
 	PARLEY_RUNNER_BIN=$$(pwd)/$(RUNNER) \
 	PARLEY_M5_CANCEL_IMAGE=$(M5_CANCEL_IMAGE) \
 	go test -tags=integration ./internal/manager/runnerclient ./internal/runner/provider -run TestM5Live -count=1 -v
+
+# Guarded M5 end-to-end runner-death race: real manager + spawned runner + Pi container.
+# Needs podman, the Pi worker image, and the $(PI_AUTH_VOLUME) volume.
+test-live-m5-loop: build
+	PARLEY_M5_LOOP_LIVE=1 \
+	PARLEY_RUNNER_BIN=$$(pwd)/$(RUNNER) \
+	PARLEY_PI_AUTH_JSON="$$(podman volume inspect $(PI_AUTH_VOLUME) --format '{{ .Mountpoint }}')/agent/auth.json" \
+	PARLEY_PI_IMAGE=$(PI_IMAGE) \
+	PARLEY_PI_NETWORK=$(PI_NETWORK) \
+	go test -tags=integration ./internal/manager -run TestM5LivePiRunnerKillInFlight -count=1 -v
 
 run: build
 	PARLEY_RUNNER_BIN=$$(pwd)/$(RUNNER) ./$(MANAGER)

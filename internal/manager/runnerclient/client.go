@@ -230,6 +230,13 @@ func (c *Client) Ready() protocol.ReadyPayload { return c.ready }
 
 func (c *Client) RunnerID() string { return c.runnerID }
 
+func (c *Client) ChildPID() (int, bool) {
+	if c == nil || c.cmd == nil || c.cmd.Process == nil {
+		return 0, false
+	}
+	return c.cmd.Process.Pid, true
+}
+
 func (c *Client) SetHandlers(onEvent EventHandler, onArtifact ArtifactHandler, onReport ReportHandler, onResult ResultHandler, onLog LogHandler) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
