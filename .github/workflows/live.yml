@@ -1,0 +1,101 @@
+name: Live
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 8 * * *"
+
+permissions:
+  contents: read
+
+env:
+  PI_IMAGE: localhost/parley-pi-worker:0.78.0
+  M5_CANCEL_IMAGE: docker.io/library/alpine:3.20
+  VALIDATION_IMAGE: docker.io/library/golang:1.26
+
+jobs:
+  m5-cancel:
+    name: M5 cancel live
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs
+          podman --version
+          podman info
+
+      - name: Pull cancel image
+        run: podman pull "${M5_CANCEL_IMAGE}"
+
+      - name: Run M5 cancel live suite
+        run: make test-live-m5
+
+  # This credentialed Pi job intentionally targets GitHub-hosted ubuntu-latest:
+  # it installs podman and runs it rootless as the Actions runner user. If that
+  # proves unreliable, move this job to a self-hosted runner label and keep the
+  # credential-free m5-cancel job on ubuntu-latest.
+  pi-live:
+    name: Pi live
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      HAS_PI_AUTH_JSON: ${{ secrets.PI_AUTH_JSON != '' }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs
+          podman --version
+          podman info
+
+      - name: Skip credentialed Pi live tests
+        if: ${{ env.HAS_PI_AUTH_JSON != 'true' }}
+        run: echo "PI_AUTH_JSON is not configured; skipping credentialed Pi live tests."
+
+      - name: Build Pi worker image
+        if: ${{ env.HAS_PI_AUTH_JSON == 'true' }}
+        run: podman build -t "${PI_IMAGE}" build/pi
+
+      - name: Pull validation image
+        if: ${{ env.HAS_PI_AUTH_JSON == 'true' }}
+        run: podman pull "${VALIDATION_IMAGE}"
+
+      - name: Provision pi-auth volume
+        if: ${{ env.HAS_PI_AUTH_JSON == 'true' }}
+        env:
+          PI_AUTH_JSON: ${{ secrets.PI_AUTH_JSON }}
+        run: |
+          set -euo pipefail
+          podman volume create pi-auth
+          mountpoint="$(podman volume inspect pi-auth --format '{{ .Mountpoint }}')"
+          mkdir -p "${mountpoint}/agent"
+          printf '%s' "${PI_AUTH_JSON}" > "${mountpoint}/agent/auth.json"
+          chmod 600 "${mountpoint}/agent/auth.json"
+
+      - name: Run M4 Pi live suite
+        if: ${{ env.HAS_PI_AUTH_JSON == 'true' }}
+        run: make test-live-m4
+
+      - name: Run M5 Pi loop live suite
+        if: ${{ env.HAS_PI_AUTH_JSON == 'true' }}
+        run: make test-live-m5-loop
