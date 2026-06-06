@@ -349,6 +349,32 @@ func (s *Store) ListRuns(ctx context.Context) ([]Run, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list runs: %w", err)
 	}
+	return scanRuns(rows)
+}
+
+func (s *Store) ListRunsByStatus(ctx context.Context, status string, limit int) ([]Run, error) {
+	query := `SELECT id, idea, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE status = ? ORDER BY created_at ASC`
+	args := []any{status}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list runs by status: %w", err)
+	}
+	return scanRuns(rows)
+}
+
+func (s *Store) CountRunsByStatus(ctx context.Context, status string) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE status = ?`, status).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count runs by status: %w", err)
+	}
+	return count, nil
+}
+
+func scanRuns(rows *sql.Rows) ([]Run, error) {
 	defer rows.Close()
 	var runs []Run
 	for rows.Next() {
@@ -450,6 +476,18 @@ func (s *Store) UpdateRunStatusIfOpen(ctx context.Context, runID, status string)
 	return changed > 0, nil
 }
 
+func (s *Store) UpdateRunStatusFrom(ctx context.Context, runID, fromStatus, toStatus string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE runs SET status = ?, updated_at = ? WHERE id = ? AND status = ?`, toStatus, nowRFC3339(), runID, fromStatus)
+	if err != nil {
+		return false, fmt.Errorf("update run status from %s to %s: %w", fromStatus, toStatus, err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read rows affected: %w", err)
+	}
+	return changed > 0, nil
+}
+
 func RunStatusIsTerminal(status string) bool {
 	switch status {
 	case RunStatusCompleted, RunStatusFailed, RunStatusInvalid, RunStatusNeedsInput, RunStatusCancelled:
@@ -511,6 +549,57 @@ func (s *Store) GetArtifact(ctx context.Context, artifactID string) (Artifact, [
 func (s *Store) AppendEvent(ctx context.Context, ev event.Event) (event.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return event.Event{}, fmt.Errorf("begin append event: %w", err)
+	}
+	defer rollback(tx)
+	ev, err = s.appendEventTx(ctx, tx, ev)
+	if err != nil {
+		return event.Event{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return event.Event{}, fmt.Errorf("commit append event: %w", err)
+	}
+	return ev, nil
+}
+
+func (s *Store) UpdateRunStatusFromAndAppendSystemEvent(ctx context.Context, runID, fromStatus, toStatus string, ev event.Event) (event.Event, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ev.RunID != "" {
+		return event.Event{}, false, fmt.Errorf("system event must not carry run_id")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return event.Event{}, false, fmt.Errorf("begin status/event transaction: %w", err)
+	}
+	defer rollback(tx)
+	res, err := tx.ExecContext(ctx, `UPDATE runs SET status = ?, updated_at = ? WHERE id = ? AND status = ?`, toStatus, nowRFC3339(), runID, fromStatus)
+	if err != nil {
+		return event.Event{}, false, fmt.Errorf("update run status from %s to %s: %w", fromStatus, toStatus, err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return event.Event{}, false, fmt.Errorf("read rows affected: %w", err)
+	}
+	if changed == 0 {
+		if err := tx.Commit(); err != nil {
+			return event.Event{}, false, fmt.Errorf("commit unchanged status/event transaction: %w", err)
+		}
+		return event.Event{}, false, nil
+	}
+	ev, err = s.appendEventTx(ctx, tx, ev)
+	if err != nil {
+		return event.Event{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return event.Event{}, false, fmt.Errorf("commit status/event transaction: %w", err)
+	}
+	return ev, true, nil
+}
+
+func (s *Store) appendEventTx(ctx context.Context, tx *sql.Tx, ev event.Event) (event.Event, error) {
 	if ev.SchemaVersion == 0 {
 		ev.SchemaVersion = event.SchemaVersion
 	}
@@ -524,11 +613,6 @@ func (s *Store) AppendEvent(ctx context.Context, ev event.Event) (event.Event, e
 		ev.Data = map[string]any{}
 	}
 	scope := eventScope(ev)
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return event.Event{}, fmt.Errorf("begin append event: %w", err)
-	}
-	defer rollback(tx)
 	var last sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `SELECT MAX(sequence) FROM events WHERE scope = ?`, scope).Scan(&last); err != nil {
 		return event.Event{}, fmt.Errorf("query last event sequence: %w", err)
@@ -577,9 +661,6 @@ func (s *Store) AppendEvent(ctx context.Context, ev event.Event) (event.Event, e
 		if err := f.Close(); err != nil {
 			return event.Event{}, fmt.Errorf("close event jsonl artifact: %w", err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return event.Event{}, fmt.Errorf("commit append event: %w", err)
 	}
 	return ev, nil
 }

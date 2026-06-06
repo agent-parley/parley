@@ -1,12 +1,14 @@
 package managerhttp
 
 import (
+	"errors"
 	"fmt"
 	"html/template"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/web"
 	"github.com/agent-parley/parley/internal/shared/event"
 )
@@ -35,7 +37,12 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.writePage(w, "index.html", web.IndexData{Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, CSRF: csrfFromContext(r.Context()), Title: "Parley"})
+	queueState, err := s.engine.QueueState(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.writePage(w, "index.html", web.IndexData{Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, Queue: web.NewQueueView(queueState), CSRF: csrfFromContext(r.Context()), Title: "Parley"})
 }
 
 func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
@@ -54,6 +61,11 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	runID, err := s.engine.StartRun(r.Context(), idea)
 	if err != nil {
+		var backlogErr orchestrator.QueueBacklogFullError
+		if errors.As(err, &backlogErr) {
+			http.Error(w, err.Error(), http.StatusTooManyRequests)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -74,6 +86,10 @@ func (s *Server) handleRunPath(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 2 && parts[1] == "cancel" {
 		s.handleCancelRun(w, r, runID)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "start" {
+		s.handleStartQueuedRun(w, r, runID)
 		return
 	}
 	if len(parts) == 1 {
@@ -102,6 +118,22 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request, runID s
 		return
 	}
 	if err := s.engine.CancelRun(r.Context(), runID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/runs/"+runID, http.StatusSeeOther)
+}
+
+func (s *Server) handleStartQueuedRun(w http.ResponseWriter, r *http.Request, runID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.engine.StartQueuedRun(r.Context(), runID); err != nil {
+		if errors.Is(err, orchestrator.ErrNoRunnerSlots) || errors.Is(err, orchestrator.ErrRunNotPending) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

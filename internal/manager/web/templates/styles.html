@@ -7,6 +7,12 @@ a { color: #93c5fd; }
 textarea, button { width: 100%; box-sizing: border-box; border-radius: 8px; border: 1px solid #4b5563; padding: 12px; font: inherit; }
 textarea { background: #111827; color: #f9fafb; margin: 8px 0 12px; }
 button { background: #2563eb; color: white; border: 0; cursor: pointer; font-weight: 700; }
+.inline-form { display: inline-block; margin-top: 8px; }
+.inline-form button { width: auto; padding: 6px 10px; font-size: .9rem; }
+.policy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 0; }
+.policy-grid div { background: #111827; border: 1px solid #374151; border-radius: 8px; padding: 10px; }
+.policy-grid dt { color: #9ca3af; font-size: .85rem; }
+.policy-grid dd { margin: 4px 0 0; font-weight: 700; }
 button:hover { background: #1d4ed8; }
 button.danger { background: #b91c1c; }
 button.danger:hover { background: #991b1b; }

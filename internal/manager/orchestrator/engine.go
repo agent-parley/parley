@@ -29,6 +29,35 @@ type Broadcaster interface {
 	Broadcast(runID string, ev event.Event, fragment string)
 }
 
+type QueuePolicy struct {
+	AutoWhenReady bool
+	MaxConcurrent int
+	BacklogCap    int
+}
+
+type QueueState struct {
+	Policy                 QueuePolicy
+	Pending                int
+	Running                int
+	RunnerSlots            int
+	ReadyRunnerSlots       int
+	EffectiveMaxConcurrent int
+}
+
+type QueueBacklogFullError struct {
+	Pending int
+	Cap     int
+}
+
+func (e QueueBacklogFullError) Error() string {
+	return fmt.Sprintf("queue backlog full: %d pending runs at cap %d", e.Pending, e.Cap)
+}
+
+var (
+	ErrNoRunnerSlots = errors.New("no runner slot available")
+	ErrRunNotPending = errors.New("run is not pending")
+)
+
 type Engine struct {
 	store     *store.Store
 	runner    Runner
@@ -41,7 +70,10 @@ type Engine struct {
 	activeStage map[string]store.Stage
 	cancelling  map[string]bool
 	runnerDown  map[string]string
+	queueMu     sync.Mutex
 
+	queuePolicy           QueuePolicy
+	runnerSlots           int
 	implementationAdapter string
 	validationAdapter     string
 	dataRoot              string
@@ -59,6 +91,8 @@ type EngineOptions struct {
 	GitAuthorName         string
 	GitAuthorEmail        string
 	GitExecutable         string
+	QueuePolicy           *QueuePolicy
+	RunnerSlots           int
 }
 
 type workerSnapshot struct {
@@ -71,6 +105,21 @@ type workerSnapshot struct {
 
 func NewEngine(st *store.Store, runner Runner, renderer FragmentRenderer, broadcast Broadcaster) *Engine {
 	return NewEngineWithOptions(st, runner, renderer, broadcast, EngineOptions{})
+}
+
+func defaultQueuePolicy() QueuePolicy {
+	return QueuePolicy{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 100}
+}
+
+func normalizeQueuePolicy(policy QueuePolicy) QueuePolicy {
+	defaults := defaultQueuePolicy()
+	if policy.MaxConcurrent < 1 {
+		policy.MaxConcurrent = defaults.MaxConcurrent
+	}
+	if policy.BacklogCap < 1 {
+		policy.BacklogCap = defaults.BacklogCap
+	}
+	return policy
 }
 
 func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRenderer, broadcast Broadcaster, opts EngineOptions) *Engine {
@@ -90,6 +139,14 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 	if projectID == "" {
 		projectID = "default"
 	}
+	queuePolicy := defaultQueuePolicy()
+	if opts.QueuePolicy != nil {
+		queuePolicy = normalizeQueuePolicy(*opts.QueuePolicy)
+	}
+	runnerSlots := opts.RunnerSlots
+	if runnerSlots <= 0 {
+		runnerSlots = 1
+	}
 	return &Engine{
 		store:                 st,
 		runner:                runner,
@@ -100,6 +157,8 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 		activeStage:           map[string]store.Stage{},
 		cancelling:            map[string]bool{},
 		runnerDown:            map[string]string{},
+		queuePolicy:           queuePolicy,
+		runnerSlots:           runnerSlots,
 		implementationAdapter: implementationAdapter,
 		validationAdapter:     validationAdapter,
 		dataRoot:              dataRoot,
@@ -111,38 +170,83 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 }
 
 func (e *Engine) StartRun(ctx context.Context, idea string) (string, error) {
+	e.queueMu.Lock()
+	pending, err := e.store.CountRunsByStatus(ctx, store.RunStatusPending)
+	if err != nil {
+		e.queueMu.Unlock()
+		return "", err
+	}
+	if pending >= e.queuePolicy.BacklogCap {
+		_ = e.emitQueueEvent(ctx, "queue.rejected_backlog_full", "queue backlog full", map[string]any{"pending": pending, "backlog_cap": e.queuePolicy.BacklogCap})
+		e.queueMu.Unlock()
+		return "", QueueBacklogFullError{Pending: pending, Cap: e.queuePolicy.BacklogCap}
+	}
+	wr, err := e.createQueuedRun(ctx, idea)
+	if err != nil {
+		e.queueMu.Unlock()
+		return "", err
+	}
+	if _, err := e.emit(ctx, runEvent(wr, "run.created", event.Actor{Kind: event.ActorKindUser, ID: "local"}, "run created", map[string]any{"idea": idea})); err != nil {
+		e.queueMu.Unlock()
+		return "", err
+	}
+	if err := e.emitQueueEvent(ctx, "queue.enqueued", "run enqueued", map[string]any{"run_id": wr.Run.ID, "pending": pending + 1, "backlog_cap": e.queuePolicy.BacklogCap}); err != nil {
+		e.queueMu.Unlock()
+		return "", err
+	}
+	e.queueMu.Unlock()
+	if e.queuePolicy.AutoWhenReady {
+		go func() {
+			if err := e.DispatchPending(context.Background()); err != nil {
+				log.Printf("dispatch pending failed: %v", err)
+			}
+		}()
+	}
+	return wr.Run.ID, nil
+}
+
+func (e *Engine) createQueuedRun(ctx context.Context, idea string) (store.WorkflowRun, error) {
 	wr, err := e.store.CreateWorkflowRun(ctx, idea)
 	if err != nil {
-		return "", err
+		return store.WorkflowRun{}, err
 	}
 	wr.ImplementationStage.Adapter = e.implementationAdapter
 	wr.ValidationStage.Adapter = e.validationAdapter
 	if err := e.store.UpdateStageAdapter(ctx, wr.ImplementationStage.ID, e.implementationAdapter); err != nil {
-		return "", err
+		return store.WorkflowRun{}, err
 	}
 	if err := e.store.UpdateStageAdapter(ctx, wr.ValidationStage.ID, e.validationAdapter); err != nil {
-		return "", err
+		return store.WorkflowRun{}, err
 	}
 	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, "", false)); err != nil {
-		return "", err
+		return store.WorkflowRun{}, err
 	}
-	if _, err := e.emit(ctx, runEvent(wr, "run.created", event.Actor{Kind: event.ActorKindUser, ID: "local"}, "run created", map[string]any{"idea": idea})); err != nil {
-		return "", err
-	}
-	runCtx, cancel := context.WithCancel(context.Background())
-	e.registerActiveRun(wr.Run.ID, cancel)
-	go e.executeRun(runCtx, wr.Run.ID)
-	return wr.Run.ID, nil
+	return wr, nil
+}
+
+func (e *Engine) StartQueuedRun(ctx context.Context, runID string) error {
+	e.queueMu.Lock()
+	defer e.queueMu.Unlock()
+	return e.dispatchRunLocked(ctx, runID, "manual")
 }
 
 func (e *Engine) CancelRun(ctx context.Context, runID string) error {
+	e.queueMu.Lock()
 	wr, err := e.store.GetWorkflowRun(ctx, runID)
 	if err != nil {
+		e.queueMu.Unlock()
 		return err
 	}
 	if store.RunStatusIsTerminal(wr.Run.Status) {
+		e.queueMu.Unlock()
 		return nil
 	}
+	if wr.Run.Status == store.RunStatusPending {
+		err := e.cancelQueuedRunLocked(ctx, wr)
+		e.queueMu.Unlock()
+		return err
+	}
+	e.queueMu.Unlock()
 	e.markCancelling(runID)
 	if cancel := e.activeCancel(runID); cancel != nil {
 		cancel()
@@ -154,6 +258,197 @@ func (e *Engine) CancelRun(ctx context.Context, runID string) error {
 		return err
 	}
 	return nil
+}
+
+func (e *Engine) cancelQueuedRunLocked(ctx context.Context, wr store.WorkflowRun) error {
+	changed, err := e.store.UpdateRunStatusFrom(ctx, wr.Run.ID, store.RunStatusPending, store.RunStatusCancelled)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return ErrRunNotPending
+	}
+	_, err = e.emit(ctx, runEvent(wr, "run.cancelled", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "queued run cancelled", map[string]any{"terminal_status": store.RunStatusCancelled}))
+	return err
+}
+
+func (e *Engine) QueueState(ctx context.Context) (QueueState, error) {
+	pending, err := e.store.CountRunsByStatus(ctx, store.RunStatusPending)
+	if err != nil {
+		return QueueState{}, err
+	}
+	running, err := e.store.CountRunsByStatus(ctx, store.RunStatusRunning)
+	if err != nil {
+		return QueueState{}, err
+	}
+	readySlots := e.readyRunnerSlots()
+	return QueueState{
+		Policy:                 e.queuePolicy,
+		Pending:                pending,
+		Running:                running,
+		RunnerSlots:            e.runnerSlots,
+		ReadyRunnerSlots:       readySlots,
+		EffectiveMaxConcurrent: minInt(e.queuePolicy.MaxConcurrent, readySlots),
+	}, nil
+}
+
+func (e *Engine) RecoverAndDispatch(ctx context.Context) error {
+	if err := e.failInterruptedRunning(ctx); err != nil {
+		return err
+	}
+	return e.DispatchPending(ctx)
+}
+
+func (e *Engine) failInterruptedRunning(ctx context.Context) error {
+	runs, err := e.store.ListRunsByStatus(ctx, store.RunStatusRunning, 0)
+	if err != nil {
+		return err
+	}
+	var joined []error
+	for _, run := range runs {
+		wr, err := e.store.GetWorkflowRun(ctx, run.ID)
+		if err != nil {
+			joined = append(joined, err)
+			continue
+		}
+		changed, err := e.store.UpdateRunStatusFrom(ctx, run.ID, store.RunStatusRunning, store.RunStatusFailed)
+		if err != nil {
+			joined = append(joined, err)
+			continue
+		}
+		if !changed {
+			continue
+		}
+		_, err = e.emit(ctx, runEvent(wr, "run.failed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "run failed during manager restart recovery", map[string]any{
+			"terminal_status": store.RunStatusFailed,
+			"reason":          "manager_restarted",
+			"retryable":       true,
+		}))
+		if err != nil {
+			joined = append(joined, err)
+		}
+	}
+	return errors.Join(joined...)
+}
+
+func (e *Engine) DispatchPending(ctx context.Context) error {
+	if !e.queuePolicy.AutoWhenReady {
+		return nil
+	}
+	e.queueMu.Lock()
+	defer e.queueMu.Unlock()
+	return e.dispatchPendingLocked(ctx)
+}
+
+func (e *Engine) dispatchPendingLocked(ctx context.Context) error {
+	for {
+		available, err := e.availableDispatchSlots(ctx)
+		if err != nil || available <= 0 {
+			return err
+		}
+		pending, err := e.store.ListRunsByStatus(ctx, store.RunStatusPending, 1)
+		if err != nil || len(pending) == 0 {
+			return err
+		}
+		if err := e.dispatchRunLocked(ctx, pending[0].ID, "auto"); err != nil {
+			if errors.Is(err, ErrRunNotPending) {
+				continue
+			}
+			return err
+		}
+	}
+}
+
+func (e *Engine) dispatchRunLocked(ctx context.Context, runID, trigger string) error {
+	run, err := e.store.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if run.Status != store.RunStatusPending {
+		return ErrRunNotPending
+	}
+	allowed, err := e.dispatchGateAllowsRun(ctx, run)
+	if err != nil || !allowed {
+		return err
+	}
+	available, err := e.availableDispatchSlots(ctx)
+	if err != nil {
+		return err
+	}
+	if available <= 0 {
+		return ErrNoRunnerSlots
+	}
+	queueEvent := newQueueEvent("queue.dispatched", "queued run dispatched", map[string]any{"run_id": run.ID, "trigger": trigger, "max_concurrent": e.queuePolicy.MaxConcurrent, "runner_slots": e.runnerSlots})
+	persisted, changed, err := e.store.UpdateRunStatusFromAndAppendSystemEvent(ctx, run.ID, store.RunStatusPending, store.RunStatusRunning, queueEvent)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return ErrRunNotPending
+	}
+	e.broadcast.Broadcast("", persisted, "")
+	runCtx, cancel := context.WithCancel(context.Background())
+	e.registerActiveRun(run.ID, cancel)
+	go e.executeRun(runCtx, run.ID)
+	return nil
+}
+
+func (e *Engine) dispatchGateAllowsRun(context.Context, store.Run) (bool, error) {
+	// Gate-aware seam: auto-queue must reach execution through this dispatch boundary.
+	// Track B approval gates can return false here to hold a pending run without
+	// changing queue policy or bypassing the existing deterministic stage graph.
+	return true, nil
+}
+
+func (e *Engine) availableDispatchSlots(ctx context.Context) (int, error) {
+	readySlots := e.readyRunnerSlots()
+	if readySlots <= 0 {
+		return 0, nil
+	}
+	capacity := minInt(e.queuePolicy.MaxConcurrent, readySlots)
+	running, err := e.store.CountRunsByStatus(ctx, store.RunStatusRunning)
+	if err != nil {
+		return 0, err
+	}
+	if running >= capacity {
+		return 0, nil
+	}
+	return capacity - running, nil
+}
+
+func (e *Engine) readyRunnerSlots() int {
+	if e.runner == nil {
+		return 0
+	}
+	if ready, ok := e.runner.(interface{ Ready() bool }); ok && !ready.Ready() {
+		return 0
+	}
+	return e.runnerSlots
+}
+
+func (e *Engine) emitQueueEvent(ctx context.Context, typ, summary string, data map[string]any) error {
+	_, err := e.emit(ctx, newQueueEvent(typ, summary, data))
+	return err
+}
+
+func newQueueEvent(typ, summary string, data map[string]any) event.Event {
+	if data == nil {
+		data = map[string]any{}
+	}
+	return event.Event{
+		SchemaVersion: event.SchemaVersion,
+		Type:          typ,
+		Actor:         event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"},
+		Summary:       summary,
+		Data:          data,
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (e *Engine) registerActiveRun(runID string, cancel context.CancelFunc) {
@@ -280,7 +575,16 @@ func (e *Engine) HandleRunnerDown(ctx context.Context, runnerID, reason string) 
 }
 
 func (e *Engine) executeRun(ctx context.Context, runID string) {
-	defer e.unregisterActiveRun(runID)
+	defer func() {
+		e.unregisterActiveRun(runID)
+		if e.queuePolicy.AutoWhenReady {
+			go func() {
+				if err := e.DispatchPending(context.Background()); err != nil {
+					log.Printf("dispatch pending failed: %v", err)
+				}
+			}()
+		}
+	}()
 	if err := e.executeRunErr(ctx, runID); err != nil {
 		if e.isCancelling(runID) {
 			if wr, getErr := e.store.GetWorkflowRun(context.Background(), runID); getErr == nil {
@@ -299,11 +603,7 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 	if err != nil {
 		return err
 	}
-	changed, err := e.store.UpdateRunStatusIfOpen(context.Background(), wr.Run.ID, store.RunStatusRunning)
-	if err != nil {
-		return err
-	}
-	if !changed {
+	if wr.Run.Status != store.RunStatusRunning {
 		return nil
 	}
 	if _, err := e.emit(context.Background(), runEvent(wr, "run.started", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "run started", map[string]any{"status": store.RunStatusRunning})); err != nil {
@@ -386,7 +686,7 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 	if e.isCancelling(wr.Run.ID) {
 		return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after pr_ready")
 	}
-	changed, err = e.store.UpdateRunStatusIfOpen(context.Background(), wr.Run.ID, store.RunStatusCompleted)
+	changed, err := e.store.UpdateRunStatusIfOpen(context.Background(), wr.Run.ID, store.RunStatusCompleted)
 	if err != nil {
 		return err
 	}

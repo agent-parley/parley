@@ -10,6 +10,7 @@ import (
 	managerhttp "github.com/agent-parley/parley/internal/manager/http"
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/runnerclient"
+	"github.com/agent-parley/parley/internal/manager/settings"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
 	"github.com/agent-parley/parley/internal/shared/contract"
@@ -28,6 +29,7 @@ type Config struct {
 	DataDir   string
 	RunnerBin string
 	Adapter   string
+	Settings  settings.Settings
 }
 
 type App struct {
@@ -54,6 +56,12 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	if cfg.Adapter == "" {
 		cfg.Adapter = "noop"
 	}
+	if cfg.Settings == (settings.Settings{}) {
+		cfg.Settings = settings.Defaults()
+	}
+	if err := settings.Validate(cfg.Settings); err != nil {
+		return nil, err
+	}
 
 	st, err := store.Open(ctx, cfg.DataDir)
 	if err != nil {
@@ -66,11 +74,18 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	}
 	hub := managerhttp.NewHub()
 	runner := newRunnerProxy()
+	queuePolicy := orchestrator.QueuePolicy{
+		AutoWhenReady: cfg.Settings.Queue.AutoWhenReady,
+		MaxConcurrent: cfg.Settings.Queue.MaxConcurrent,
+		BacklogCap:    cfg.Settings.Queue.BacklogCap,
+	}
 	engine := orchestrator.NewEngineWithOptions(st, runner, renderer, hub, orchestrator.EngineOptions{
 		ImplementationAdapter: cfg.Adapter,
 		ValidationAdapter:     "validation",
 		DataRoot:              cfg.DataDir,
 		ProjectID:             getenv("PARLEY_PROJECT_ID", "default"),
+		QueuePolicy:           &queuePolicy,
+		RunnerSlots:           1,
 	})
 	app := &App{
 		cfg:    cfg,
@@ -89,6 +104,10 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	engineRunner := engine
 	httpServer := managerhttp.NewServer(cfg.Addr, st, engineRunner, hub, renderer)
 	app.http = httpServer
+	if err := engine.RecoverAndDispatch(ctx); err != nil {
+		_ = app.close(context.Background())
+		return nil, err
+	}
 	return app, nil
 }
 
@@ -119,7 +138,15 @@ func (a *App) startRunnerChild(ctx context.Context, restarted bool) error {
 		}
 		return a.appendRunnerEvent(ctx, runnerID, "runner.ready", "spawned runner ready", map[string]any{"status": store.RunnerStatusConnected, "capabilities": client.Ready().Capabilities})
 	}
-	return a.appendRunnerEvent(ctx, runnerID, "runner.reconnected", "spawned runner reconnected", map[string]any{"status": store.RunnerStatusConnected})
+	if err := a.appendRunnerEvent(ctx, runnerID, "runner.reconnected", "spawned runner reconnected", map[string]any{"status": store.RunnerStatusConnected}); err != nil {
+		return err
+	}
+	go func() {
+		if err := a.engine.DispatchPending(context.Background()); err != nil {
+			fmt.Fprintf(os.Stderr, "parley: dispatch pending after runner reconnect: %v\n", err)
+		}
+	}()
+	return nil
 }
 
 func (a *App) Run(ctx context.Context) error {
@@ -354,6 +381,12 @@ func (p *runnerProxy) waitClient(ctx context.Context) (*runnerclient.Client, err
 			return nil, ctx.Err()
 		}
 	}
+}
+
+func (p *runnerProxy) Ready() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.client != nil && p.downErr == nil
 }
 
 func (p *runnerProxy) current() *runnerclient.Client {

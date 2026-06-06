@@ -16,8 +16,17 @@
         <input type="hidden" name="_csrf" value="{{.CSRF}}">
         <label for="idea">Software idea</label>
         <textarea id="idea" name="idea" required rows="5" placeholder="Describe the change you want Parley to drive through the workflow."></textarea>
-        <button type="submit">Start run</button>
+        <button type="submit">Queue run</button>
       </form>
+    </section>
+    <section class="card">
+      <h2>Queue policy</h2>
+      <dl class="policy-grid">
+        <div><dt>Queued depth</dt><dd>{{.Queue.Pending}} pending / cap {{.Queue.BacklogCap}}</dd></div>
+        <div><dt>Running</dt><dd>{{.Queue.Running}}</dd></div>
+        <div><dt>Auto when ready</dt><dd>{{.Queue.AutoWhenReady}}</dd></div>
+        <div><dt>Concurrency</dt><dd>effective {{.Queue.EffectiveMaxConcurrent}} · configured {{.Queue.MaxConcurrent}} · ready slots {{.Queue.ReadyRunnerSlots}}/{{.Queue.RunnerSlots}}</dd></div>
+      </dl>
     </section>
     <section class="card">
       <h2>Runner health</h2>
@@ -31,7 +40,7 @@
       <p>No runners registered.</p>
       {{end}}
       {{if .RunnerEventPage.Events}}
-      <h3 id="runner-timeline">Runner timeline</h3>
+      <h3 id="runner-timeline">System timeline</h3>
       <ol class="events">
         {{range .RunnerEventPage.Events}}
         <li><span class="seq">#{{.Event.Sequence}}</span> <strong>{{.Event.Type}}</strong> <span class="muted">{{.Event.Actor.Kind}}/{{.Event.Actor.ID}}</span><br>{{.Event.Summary}}</li>
@@ -47,7 +56,7 @@
       {{if .Runs}}
       <ul class="run-list">
         {{range .Runs}}
-        <li><a href="/runs/{{.ID}}"><strong>{{short .ID}}</strong></a> <span class="pill {{statusClass .Status}}">{{.Status}}</span><br><span>{{.Idea}}</span></li>
+        <li><a href="/runs/{{.ID}}"><strong>{{short .ID}}</strong></a> <span class="pill {{statusClass .Status}}">{{statusLabel .Status}}</span>{{if eq .Status "pending"}} <span class="muted">waiting for a free runner slot{{if not $.Queue.AutoWhenReady}} · manual start required{{end}}</span>{{end}}<br><span>{{.Idea}}</span>{{if and (eq .Status "pending") (not $.Queue.AutoWhenReady)}}<form class="inline-form" method="post" action="/runs/{{.ID}}/start"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><button type="submit">Start queued run</button></form>{{end}}</li>
         {{end}}
       </ul>
       {{else}}
