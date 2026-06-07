@@ -130,7 +130,9 @@ func (s *Server) handleStartQueuedRun(w http.ResponseWriter, r *http.Request, ru
 		return
 	}
 	if err := s.engine.StartQueuedRun(r.Context(), runID); err != nil {
-		if errors.Is(err, orchestrator.ErrNoRunnerSlots) || errors.Is(err, orchestrator.ErrRunNotPending) {
+		if errors.Is(err, orchestrator.ErrNoRunnerSlots) ||
+			errors.Is(err, orchestrator.ErrRunNotPending) ||
+			errors.Is(err, orchestrator.ErrRunHeld) {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}

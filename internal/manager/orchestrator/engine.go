@@ -56,6 +56,7 @@ func (e QueueBacklogFullError) Error() string {
 var (
 	ErrNoRunnerSlots = errors.New("no runner slot available")
 	ErrRunNotPending = errors.New("run is not pending")
+	ErrRunHeld       = errors.New("run held by dispatch gate")
 )
 
 type Engine struct {
@@ -74,6 +75,7 @@ type Engine struct {
 
 	queuePolicy           QueuePolicy
 	runnerSlots           int
+	gate                  func(context.Context, store.Run) (bool, error)
 	implementationAdapter string
 	validationAdapter     string
 	dataRoot              string
@@ -341,22 +343,35 @@ func (e *Engine) DispatchPending(ctx context.Context) error {
 }
 
 func (e *Engine) dispatchPendingLocked(ctx context.Context) error {
-	for {
+	// Walk the pending backlog once, oldest first (FIFO). Iterating a finite
+	// snapshot — rather than repeatedly re-selecting the oldest pending run —
+	// means a gate-held run can never make the dispatcher spin under queueMu,
+	// and it is skipped instead of blocking younger runs (no head-of-line block).
+	pending, err := e.store.ListRunsByStatus(ctx, store.RunStatusPending, 0)
+	if err != nil {
+		return err
+	}
+	for _, p := range pending {
 		available, err := e.availableDispatchSlots(ctx)
-		if err != nil || available <= 0 {
+		if err != nil {
 			return err
 		}
-		pending, err := e.store.ListRunsByStatus(ctx, store.RunStatusPending, 1)
-		if err != nil || len(pending) == 0 {
-			return err
+		if available <= 0 {
+			return nil
 		}
-		if err := e.dispatchRunLocked(ctx, pending[0].ID, "auto"); err != nil {
-			if errors.Is(err, ErrRunNotPending) {
-				continue
-			}
+		switch err := e.dispatchRunLocked(ctx, p.ID, "auto"); {
+		case err == nil:
+		case errors.Is(err, ErrRunHeld), errors.Is(err, ErrRunNotPending):
+			// Held by a future approval gate, or already claimed by another
+			// path; skip it so the rest of the backlog still dispatches.
+			continue
+		case errors.Is(err, ErrNoRunnerSlots):
+			return nil
+		default:
 			return err
 		}
 	}
+	return nil
 }
 
 func (e *Engine) dispatchRunLocked(ctx context.Context, runID, trigger string) error {
@@ -368,8 +383,11 @@ func (e *Engine) dispatchRunLocked(ctx context.Context, runID, trigger string) e
 		return ErrRunNotPending
 	}
 	allowed, err := e.dispatchGateAllowsRun(ctx, run)
-	if err != nil || !allowed {
+	if err != nil {
 		return err
+	}
+	if !allowed {
+		return ErrRunHeld
 	}
 	available, err := e.availableDispatchSlots(ctx)
 	if err != nil {
@@ -393,10 +411,15 @@ func (e *Engine) dispatchRunLocked(ctx context.Context, runID, trigger string) e
 	return nil
 }
 
-func (e *Engine) dispatchGateAllowsRun(context.Context, store.Run) (bool, error) {
+func (e *Engine) dispatchGateAllowsRun(ctx context.Context, run store.Run) (bool, error) {
 	// Gate-aware seam: auto-queue must reach execution through this dispatch boundary.
 	// Track B approval gates can return false here to hold a pending run without
 	// changing queue policy or bypassing the existing deterministic stage graph.
+	// A held run (false) is skipped by the dispatcher and reported as ErrRunHeld by
+	// manual start — it is never silently treated as dispatched.
+	if e.gate != nil {
+		return e.gate(ctx, run)
+	}
 	return true, nil
 }
 

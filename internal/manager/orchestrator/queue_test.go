@@ -175,6 +175,44 @@ func TestRecoverAndDispatchFailsInterruptedRunningAndStartsPending(t *testing.T)
 	t.Fatalf("interrupted events = %#v, want retryable manager_restarted failure", events)
 }
 
+func TestDispatchSkipsGateHeldRunWithoutBlockingOthers(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	runner := newBlockingRunner()
+	policy := QueuePolicy{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 10}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &policy, RunnerSlots: 1})
+	engine.gate = func(_ context.Context, run store.Run) (bool, error) {
+		return run.Idea != "held", nil
+	}
+	heldID, err := engine.StartRun(ctx, "held")
+	if err != nil {
+		t.Fatalf("StartRun(held) error = %v", err)
+	}
+	readyID, err := engine.StartRun(ctx, "ready")
+	if err != nil {
+		t.Fatalf("StartRun(ready) error = %v", err)
+	}
+	// The younger, un-gated run must dispatch even though an older run is held:
+	// the test reaching this point at all proves the dispatcher does not spin.
+	<-runner.started
+	waitForRunStatus(t, st, readyID, store.RunStatusRunning)
+	held, err := st.GetRun(ctx, heldID)
+	if err != nil {
+		t.Fatalf("get held run: %v", err)
+	}
+	if held.Status != store.RunStatusPending {
+		t.Fatalf("held run status = %s, want pending", held.Status)
+	}
+	// Manual start of a gate-held run must report held, not a false success.
+	if err := engine.StartQueuedRun(ctx, heldID); !errors.Is(err, ErrRunHeld) {
+		t.Fatalf("StartQueuedRun(held) error = %v, want ErrRunHeld", err)
+	}
+}
+
 func assertNoDispatch(t *testing.T, ch <-chan contract.Dispatch) {
 	t.Helper()
 	select {
