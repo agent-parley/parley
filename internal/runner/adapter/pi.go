@@ -470,8 +470,8 @@ func workerInputMarkdown(disp contract.Dispatch) string {
 	}
 	b.WriteString(contractText)
 	b.WriteString("\n\n")
-	if contextText := inputString(disp.Input, "curated_context", "context_markdown", "context"); contextText != "" {
-		b.WriteString("## Curated Context\n\n")
+	if contextText := inputString(disp.Input, "stage_brief_markdown", "curated_context", "context_markdown", "context"); contextText != "" {
+		b.WriteString("## Stage Brief\n\n")
 		b.WriteString(contextText)
 		b.WriteString("\n\n")
 	}

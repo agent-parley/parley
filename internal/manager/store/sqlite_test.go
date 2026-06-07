@@ -52,6 +52,39 @@ func TestStorePersistence(t *testing.T) {
 	}
 }
 
+func TestStageCanReferenceStageBriefArtifact(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRun(ctx, "build context")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	artifact, err := st.SaveArtifact(ctx, wr.Run.ID, "stage_brief", "text/markdown", []byte("# Stage brief\n"), ".md")
+	if err != nil {
+		t.Fatalf("save stage brief: %v", err)
+	}
+	if err := st.UpdateStageBriefArtifactID(ctx, wr.ImplementationStage.ID, artifact.ID); err != nil {
+		t.Fatalf("update stage brief ref: %v", err)
+	}
+	stages, err := st.ListStages(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	for _, stage := range stages {
+		if stage.ID == wr.ImplementationStage.ID {
+			if stage.StageBriefArtifactID != artifact.ID {
+				t.Fatalf("stage brief ref = %s, want %s", stage.StageBriefArtifactID, artifact.ID)
+			}
+			return
+		}
+	}
+	t.Fatal("implementation stage not found")
+}
+
 func TestProjectWorkspaceAndNoOrphanWorkflowRecords(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

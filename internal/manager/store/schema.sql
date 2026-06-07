@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS stages (
   stage_type TEXT NOT NULL,
   adapter TEXT,
   status TEXT NOT NULL,
+  stage_brief_artifact_id TEXT REFERENCES artifacts(id),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY(project_id, run_id, attempt_id) REFERENCES attempts(project_id, run_id, id),
