@@ -8,7 +8,7 @@
 
 Parley is a **control-plane harness**, not a coding agent. It owns run state, runner coordination, sandbox setup, artifacts, events, and delivery policy; agents are the workers it dispatches.
 
-The current repo contains a live-validated walking skeleton, not the full configurable workflow product. Today a manually submitted idea runs through a deterministic local path, creates a commit from the worker snapshot, and stops at a **PR-ready human handoff**. Parley does **not** push branches or open pull requests yet.
+The current repo contains a live-validated walking skeleton, not the full configurable workflow product. A manually submitted idea runs through a deterministic local path: implementation in an isolated worktree, containerized validation, a commit built from the worker snapshot, and a stop at a **PR-ready human handoff**. The end-to-end commit → PR-ready loop requires a diff-producing adapter (the **Pi** agent); the default `noop` adapter runs the path but makes no changes, so the run stops at the commit stage with *no changes to commit*. Parley does **not** push branches or open pull requests yet.
 
 > [!warning]
 > Parley is early. The walking skeleton runs, but the product surface and workflow model will keep changing. This README separates what works today from intended direction.
@@ -22,11 +22,12 @@ Walking skeleton status:
 - **Built and live-validated:** rootless Podman sandbox provider, isolated git worktrees, SQLite + filesystem artifacts, durable events, and per-run JSONL logs.
 - **Built and live-validated:** one real agent family, **Pi**, behind the runner adapter interface.
 - **Built and live-validated:** embedded hypermedia web UI using Datastar + SSE, including run events, artifacts, cancellation, and runner-health/supervision surfaces.
+- **Built:** optional TOML project/global settings and a local auto-queue — `POST /runs` enqueues runs that auto-dispatch to free runner slots (approval gates preserved), with a backlog cap and crash/startup recovery. Capacity equals the number of local runner slots (currently one).
 - **Not yet built:** push/PR creation. The workflow stops at PR-ready metadata for a human/operator.
-- **Not yet built:** queueing, auto-pickup, issue polling, settings, profiles, workflow templates, project memory, semantic review verdicts, or human-stage parity.
+- **Not yet built:** auto-pickup, issue polling, agent profiles, workflow templates, project memory, semantic review verdicts, or human-stage parity.
 - **No published release yet.** Expect sharp edges.
 
-The skeleton is designed and validated for one manually triggered local run at a time. There is no scheduler or auto-dispatch queue yet.
+The skeleton runs a single local runner slot, so one run executes at a time; additional submitted runs are queued and auto-dispatched as the slot frees. There is no external scheduler or issue auto-pickup yet.
 
 ## What works today
 
@@ -40,9 +41,13 @@ Idea intake         (manager creates the run and task contract)
   → PR-ready stop   (branch/commit/diff metadata; no forge push, no PR)
 ```
 
+The full commit → PR-ready loop requires an adapter that produces changes (the Pi agent). With the default `noop` adapter the implementation step writes nothing, so the run reaches the commit stage and stops there with *no changes to commit*.
+
 Routing is based on structured `status` values only. There is no resident coordinator LLM, semantic verdict engine, review stage, configurable fix loop, or human approval stage in the skeleton.
 
 The web UI lets you submit a run, watch stage/event progress over SSE, inspect artifacts and diffs, cancel a run, and see runner health. Runs and artifacts are persisted under `.parley-data` by default.
+
+Submitted runs are enqueued and auto-dispatched to the local runner slot as it frees; the UI shows queue depth and the effective policy. Optional TOML settings (`.parley/config.toml`) select defaults such as the queue policy (`auto_when_ready`, `max_concurrent`, `backlog_cap`); settings change which defaults apply, never the deterministic routing.
 
 ## Intended direction
 
@@ -52,7 +57,7 @@ The long-term product direction is still a configurable workflow harness:
 - agent-or-human stages for planning, implementation, review, validation, commit, PR creation, and memory update
 - semantic review verdicts and fix loops
 - configurable delivery policy, including real push/PR creation
-- project settings, agent profiles, context packets, queueing, auto-pickup, and curated memory
+- agent profiles, context packets, auto-pickup, and curated memory
 - additional agent families and sandbox substrates beyond Pi/rootless Podman
 
 Those are direction, not current behavior.
@@ -75,6 +80,12 @@ Parley curates the dispatch contract and reads structured reports back from adap
 
 ## Build, run, and test
 
+Prerequisites:
+
+- Go 1.26 (see `go.mod`)
+- `make`
+- rootless Podman (required for submitted-run validation and the live test targets)
+
 Build both binaries:
 
 ```sh
@@ -89,7 +100,7 @@ make run
 
 `make run` builds first, starts the web UI at `http://127.0.0.1:8080` by default, and stores local state in `.parley-data`. Override with environment variables such as `PARLEY_ADDR`, `PARLEY_DATA_DIR`, and `PARLEY_RUNNER_BIN`.
 
-The default implementation adapter is `noop`. To run the real Pi adapter, provide the Pi worker image/auth configuration and opt in explicitly, for example:
+The default implementation adapter is `noop`, which makes no file changes — useful as a smoke test, but a run using it stops at the commit stage with *no changes to commit*. To exercise the full commit → PR-ready loop, run the real Pi adapter by providing the Pi worker image/auth configuration and opting in explicitly, for example:
 
 ```sh
 PARLEY_ADAPTER=pi \
