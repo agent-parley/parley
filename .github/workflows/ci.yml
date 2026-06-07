@@ -80,9 +80,6 @@ jobs:
         run: make test-integration
 
   race:
-    # TODO(https://github.com/agent-parley/parley/issues/21): re-arm (remove continue-on-error) once the
-    # artifact -race timeout fix lands.
-    continue-on-error: true
     name: make test-race
     runs-on: ubuntu-latest
     steps:
