@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -93,7 +94,12 @@ func mergeFile(dst *Settings, sourceName, path string) error {
 		return err
 	}
 	var file fileSettings
-	if err := toml.Unmarshal(content, &file); err != nil {
+	// Strict decode: an unknown key or table is a typo, and the contract is that
+	// malformed settings fail loudly rather than silently falling back to a default
+	// (e.g. "backlog_caps" must not be ignored in favour of the built-in value).
+	dec := toml.NewDecoder(bytes.NewReader(content))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&file); err != nil {
 		return fmt.Errorf("parse %s settings %s: %w", sourceName, path, err)
 	}
 	if err := validateFileSettings(file, sourceName, path); err != nil {

@@ -57,6 +57,27 @@ func TestLoadRejectsInvalidQueuePolicy(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsUnknownKeys(t *testing.T) {
+	t.Run("queue-level typo", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		writeFile(t, path, "[queue]\nbacklog_caps = 10\n")
+		_, err := Load(LoadOptions{ProjectPath: path})
+		if err == nil {
+			t.Fatal("Load() error = nil, want typo to fail loudly instead of falling back to default")
+		}
+		if !strings.Contains(err.Error(), "parse project settings") {
+			t.Fatalf("error = %q, want parse error for unknown key", err.Error())
+		}
+	})
+	t.Run("unknown table", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		writeFile(t, path, "[queue]\nbacklog_cap = 10\n\n[unknown]\nfoo = 1\n")
+		if _, err := Load(LoadOptions{ProjectPath: path}); err == nil {
+			t.Fatal("Load() error = nil, want unknown-table failure")
+		}
+	})
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
