@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/store"
 )
 
@@ -27,8 +28,39 @@ type IndexData struct {
 	Runs            []store.Run
 	Runners         []store.Runner
 	RunnerEventPage store.SystemEventPage
+	Queue           QueueView
+	Notice          *Notice
 	CSRF            string
 	Title           string
+}
+
+type Notice struct {
+	Title   string
+	Message string
+}
+
+type QueueView struct {
+	Pending                int
+	Running                int
+	AutoWhenReady          bool
+	MaxConcurrent          int
+	BacklogCap             int
+	RunnerSlots            int
+	ReadyRunnerSlots       int
+	EffectiveMaxConcurrent int
+}
+
+func NewQueueView(state orchestrator.QueueState) QueueView {
+	return QueueView{
+		Pending:                state.Pending,
+		Running:                state.Running,
+		AutoWhenReady:          state.Policy.AutoWhenReady,
+		MaxConcurrent:          state.Policy.MaxConcurrent,
+		BacklogCap:             state.Policy.BacklogCap,
+		RunnerSlots:            state.RunnerSlots,
+		ReadyRunnerSlots:       state.ReadyRunnerSlots,
+		EffectiveMaxConcurrent: state.EffectiveMaxConcurrent,
+	}
 }
 
 type RunData struct {
@@ -76,7 +108,7 @@ func NewRunView(bundle store.RunBundle) RunView {
 }
 
 func NewRenderer() (*TemplateRenderer, error) {
-	funcs := template.FuncMap{"short": short, "statusClass": statusClass}
+	funcs := template.FuncMap{"short": short, "statusClass": statusClass, "statusLabel": statusLabel}
 	tmpl, err := template.New("").Funcs(funcs).ParseFS(Embedded, "templates/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("parse templates: %w", err)
@@ -181,6 +213,13 @@ func statusClass(status string) string {
 	default:
 		return "status-pending"
 	}
+}
+
+func statusLabel(status string) string {
+	if status == "pending" {
+		return "queued"
+	}
+	return status
 }
 
 func compactHTML(in string) string {

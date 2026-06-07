@@ -246,3 +246,44 @@ func TestGetWorkflowRunSelectsLatestAttemptStages(t *testing.T) {
 		t.Fatalf("PRReadyStage = %+v, want latest attempt stage", got.PRReadyStage)
 	}
 }
+
+func TestUpdateRunStatusFromAndAppendSystemEventIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRun(ctx, "dispatch atomically")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	ev, changed, err := st.UpdateRunStatusFromAndAppendSystemEvent(ctx, wr.Run.ID, RunStatusPending, RunStatusRunning, event.Event{Type: "queue.dispatched", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "queued run dispatched", Data: map[string]any{"run_id": wr.Run.ID}})
+	if err != nil {
+		t.Fatalf("transition with event: %v", err)
+	}
+	if !changed || ev.Sequence != 1 || ev.RunID != "" {
+		t.Fatalf("event=%+v changed=%v, want system event sequence 1 with changed=true", ev, changed)
+	}
+	run, err := st.GetRun(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Status != RunStatusRunning {
+		t.Fatalf("status = %s, want running", run.Status)
+	}
+	_, changed, err = st.UpdateRunStatusFromAndAppendSystemEvent(ctx, wr.Run.ID, RunStatusPending, RunStatusRunning, event.Event{Type: "queue.dispatched", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "should not persist", Data: map[string]any{"run_id": wr.Run.ID}})
+	if err != nil {
+		t.Fatalf("unchanged transition: %v", err)
+	}
+	if changed {
+		t.Fatal("changed=true for stale pending->running transition")
+	}
+	page, err := st.ListSystemEventsPage(ctx, 0, 20)
+	if err != nil {
+		t.Fatalf("list system events: %v", err)
+	}
+	if len(page.Events) != 1 || page.Events[0].Event.Type != "queue.dispatched" {
+		t.Fatalf("system events = %#v, want exactly one queue.dispatched", page.Events)
+	}
+}

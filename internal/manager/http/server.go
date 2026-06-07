@@ -6,13 +6,16 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
 )
 
 type RunController interface {
 	StartRun(context.Context, string) (string, error)
+	StartQueuedRun(context.Context, string) error
 	CancelRun(context.Context, string) error
+	QueueState(context.Context) (orchestrator.QueueState, error)
 }
 
 type Server struct {
