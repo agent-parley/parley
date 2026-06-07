@@ -124,7 +124,8 @@ func sendArtifactAndCollect(t *testing.T, payload protocol.ArtifactPayload, want
 	}))
 	defer ts.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Large artifacts must tolerate -race overhead on 2-vCPU CI runners.
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http"), nil)
 	if err != nil {
