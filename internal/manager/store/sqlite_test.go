@@ -85,6 +85,39 @@ func TestStageCanReferenceStageBriefArtifact(t *testing.T) {
 	t.Fatal("implementation stage not found")
 }
 
+func TestRunPersistsRefinementLevelAndStageCanReferenceTaskPlanArtifact(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "build context", RefinementLevel: contract.RefinementLevelDeep})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if wr.Run.RefinementLevel != contract.RefinementLevelDeep || wr.Task.RefinementLevel != contract.RefinementLevelDeep {
+		t.Fatalf("refinement not persisted on create: run=%q task=%q", wr.Run.RefinementLevel, wr.Task.RefinementLevel)
+	}
+	artifact, err := st.SaveArtifact(ctx, wr.Run.ID, "task_plan", "text/markdown", []byte("# Task Plan\n"), ".md")
+	if err != nil {
+		t.Fatalf("save task plan: %v", err)
+	}
+	if err := st.UpdateStageTaskPlanArtifactID(ctx, wr.IdeaIntakeStage.ID, artifact.ID); err != nil {
+		t.Fatalf("update task plan ref: %v", err)
+	}
+	loaded, err := st.GetWorkflowRun(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("get workflow run: %v", err)
+	}
+	if loaded.Run.RefinementLevel != contract.RefinementLevelDeep || loaded.Task.RefinementLevel != contract.RefinementLevelDeep {
+		t.Fatalf("refinement not loaded: run=%q task=%q", loaded.Run.RefinementLevel, loaded.Task.RefinementLevel)
+	}
+	if loaded.IdeaIntakeStage.TaskPlanArtifactID != artifact.ID {
+		t.Fatalf("task plan ref = %s, want %s", loaded.IdeaIntakeStage.TaskPlanArtifactID, artifact.ID)
+	}
+}
+
 func TestProjectWorkspaceAndNoOrphanWorkflowRecords(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

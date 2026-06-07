@@ -11,6 +11,7 @@ import (
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
+	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
 )
 
@@ -121,7 +122,13 @@ func (s *Server) handleProjectRuns(w http.ResponseWriter, r *http.Request, proje
 		http.Error(w, "idea is required", http.StatusBadRequest)
 		return
 	}
-	runID, err := s.engine.StartProjectRun(r.Context(), projectID, idea)
+	input := contract.TaskInput{Idea: idea, RefinementLevel: r.Form.Get("refinement_level")}
+	input.RefinementLevel = contract.NormalizeRefinementLevel(input.RefinementLevel)
+	if err := contract.ValidateRefinementLevel(input.RefinementLevel); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	runID, err := s.engine.StartProjectRunInput(r.Context(), projectID, input)
 	if err != nil {
 		var backlogErr orchestrator.QueueBacklogFullError
 		if errors.As(err, &backlogErr) {

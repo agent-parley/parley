@@ -11,6 +11,7 @@ import (
 
 	"github.com/agent-parley/parley/internal/manager/store"
 	rworktree "github.com/agent-parley/parley/internal/runner/worktree"
+	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
@@ -22,7 +23,7 @@ func TestIdeaIntakeFreezesVerbatimIdeaIntoContractAndSnapshot(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	defer st.Close()
-	wr, err := st.CreateWorkflowRun(ctx, "add a thing\n<script>alert(1)</script>")
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "add a thing\n<script>alert(1)</script>", RefinementLevel: contract.RefinementLevelDeep})
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -38,12 +39,36 @@ func TestIdeaIntakeFreezesVerbatimIdeaIntoContractAndSnapshot(t *testing.T) {
 	if contractID == "" {
 		t.Fatalf("missing task contract artifact id: %+v", rep.Payload)
 	}
+	planID, _ := rep.Payload["task_plan_artifact_id"].(string)
+	if planID == "" {
+		t.Fatalf("missing task plan artifact id: %+v", rep.Payload)
+	}
+	if rep.Payload["refinement_level"] != contract.RefinementLevelDeep {
+		t.Fatalf("refinement level = %v, want %s", rep.Payload["refinement_level"], contract.RefinementLevelDeep)
+	}
 	_, contractContent, err := st.GetArtifact(ctx, contractID)
 	if err != nil {
 		t.Fatalf("read task contract: %v", err)
 	}
 	if !strings.Contains(string(contractContent), wr.Run.Idea) {
 		t.Fatalf("task contract did not preserve idea verbatim:\n%s", contractContent)
+	}
+	_, planContent, err := st.GetArtifact(ctx, planID)
+	if err != nil {
+		t.Fatalf("read task plan: %v", err)
+	}
+	planText := string(planContent)
+	for _, want := range []string{"# Task Plan", "Refinement level: `deep`", "## Deep Plan", "This artifact is a task plan, not a workflow definition."} {
+		if !strings.Contains(planText, want) {
+			t.Fatalf("task plan missing %q:\n%s", want, planText)
+		}
+	}
+	loaded, err := st.GetWorkflowRun(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("get workflow run: %v", err)
+	}
+	if loaded.IdeaIntakeStage.TaskPlanArtifactID != planID {
+		t.Fatalf("stage task plan ref = %s, want %s", loaded.IdeaIntakeStage.TaskPlanArtifactID, planID)
 	}
 
 	var rawSnapshot string
@@ -59,6 +84,45 @@ func TestIdeaIntakeFreezesVerbatimIdeaIntoContractAndSnapshot(t *testing.T) {
 	}
 	if snapshot["task_contract_artifact_id"] != contractID {
 		t.Fatalf("snapshot task contract id = %v, want %s", snapshot["task_contract_artifact_id"], contractID)
+	}
+	if snapshot["task_plan_artifact_id"] != planID {
+		t.Fatalf("snapshot task plan id = %v, want %s", snapshot["task_plan_artifact_id"], planID)
+	}
+	if snapshot["refinement_level"] != contract.RefinementLevelDeep {
+		t.Fatalf("snapshot refinement level = %v, want %s", snapshot["refinement_level"], contract.RefinementLevelDeep)
+	}
+}
+
+func TestTaskPlanMarkdownSupportsThreeRefinementLevels(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	cases := []struct {
+		level string
+		want  string
+	}{
+		{contract.RefinementLevelDirect, "## Direct Plan"},
+		{contract.RefinementLevelStandard, "## Standard Plan"},
+		{contract.RefinementLevelDeep, "## Deep Plan"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.level, func(t *testing.T) {
+			wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "ship a change", RefinementLevel: tc.level})
+			if err != nil {
+				t.Fatalf("create run: %v", err)
+			}
+			plan := taskPlanMarkdown(wr)
+			if !strings.Contains(plan, "Refinement level: `"+tc.level+"`") || !strings.Contains(plan, tc.want) {
+				t.Fatalf("plan for %s missing expected content:\n%s", tc.level, plan)
+			}
+			if strings.Contains(plan, "workflow template") || strings.Contains(plan, "add workflow stage") {
+				t.Fatalf("plan appears to define workflow policy:\n%s", plan)
+			}
+		})
 	}
 }
 
