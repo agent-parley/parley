@@ -175,7 +175,10 @@ func (a Pi) Prepare(ctx context.Context, disp contract.Dispatch) (PiPreparedRun,
 	if credentialStrategy == nil {
 		return PiPreparedRun{}, fmt.Errorf("pi credential strategy is required")
 	}
-	projectID := a.opts.ProjectID
+	projectID := disp.ProjectID
+	if projectID == "" {
+		projectID = a.opts.ProjectID
+	}
 	if projectID == "" {
 		projectID = "default"
 	}
@@ -447,6 +450,10 @@ func workerInputMarkdown(disp contract.Dispatch) string {
 	var b strings.Builder
 	b.WriteString("# Parley Worker Input\n\n")
 	b.WriteString("## Identity\n\n")
+	fmt.Fprintf(&b, "- Project ID: `%s`\n", disp.ProjectID)
+	if disp.RepositoryID != "" {
+		fmt.Fprintf(&b, "- Repository ID: `%s`\n", disp.RepositoryID)
+	}
 	fmt.Fprintf(&b, "- Run ID: `%s`\n", disp.RunID)
 	fmt.Fprintf(&b, "- Task ID: `%s`\n", disp.TaskID)
 	fmt.Fprintf(&b, "- Attempt ID: `%s`\n", disp.AttemptID)

@@ -25,11 +25,13 @@ const (
 )
 
 type Config struct {
-	Addr      string
-	DataDir   string
-	RunnerBin string
-	Adapter   string
-	Settings  settings.Settings
+	Addr       string
+	DataDir    string
+	RunnerBin  string
+	Adapter    string
+	ProjectID  string
+	SourceRepo string
+	Settings   settings.Settings
 }
 
 type App struct {
@@ -67,6 +69,31 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	projectID := cfg.ProjectID
+	if projectID == "" {
+		projectID = getenv("PARLEY_PROJECT_ID", store.DefaultProjectID)
+	}
+	sourceRepo := cfg.SourceRepo
+	if sourceRepo == "" {
+		sourceRepo = os.Getenv("PARLEY_SOURCE_REPO")
+	}
+	if sourceRepo == "" {
+		if cwd, getErr := os.Getwd(); getErr == nil {
+			sourceRepo = cwd
+		}
+	}
+	project, err := st.EnsureProject(ctx, store.ProjectSpec{
+		ID:                 projectID,
+		Name:               "Default project",
+		RepositoryPath:     sourceRepo,
+		QueueAutoWhenReady: cfg.Settings.Queue.AutoWhenReady,
+		QueueMaxConcurrent: cfg.Settings.Queue.MaxConcurrent,
+		QueueBacklogCap:    cfg.Settings.Queue.BacklogCap,
+	})
+	if err != nil {
+		_ = st.Close()
+		return nil, err
+	}
 	renderer, err := web.NewRenderer()
 	if err != nil {
 		_ = st.Close()
@@ -75,15 +102,15 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	hub := managerhttp.NewHub()
 	runner := newRunnerProxy()
 	queuePolicy := orchestrator.QueuePolicy{
-		AutoWhenReady: cfg.Settings.Queue.AutoWhenReady,
-		MaxConcurrent: cfg.Settings.Queue.MaxConcurrent,
-		BacklogCap:    cfg.Settings.Queue.BacklogCap,
+		AutoWhenReady: project.QueueAutoWhenReady,
+		MaxConcurrent: project.QueueMaxConcurrent,
+		BacklogCap:    project.QueueBacklogCap,
 	}
 	engine := orchestrator.NewEngineWithOptions(st, runner, renderer, hub, orchestrator.EngineOptions{
 		ImplementationAdapter: cfg.Adapter,
 		ValidationAdapter:     "validation",
 		DataRoot:              cfg.DataDir,
-		ProjectID:             getenv("PARLEY_PROJECT_ID", "default"),
+		ProjectID:             project.ID,
 		QueuePolicy:           &queuePolicy,
 		RunnerSlots:           1,
 	})
@@ -95,6 +122,8 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		runnerEnv: []string{
 			"PARLEY_ADAPTER=" + cfg.Adapter,
 			"PARLEY_DATA_DIR=" + cfg.DataDir,
+			"PARLEY_PROJECT_ID=" + project.ID,
+			"PARLEY_SOURCE_REPO=" + sourceRepo,
 		},
 	}
 	if err := app.startRunnerChild(ctx, false); err != nil {

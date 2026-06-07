@@ -11,13 +11,15 @@ const (
 
 // Dispatch is the Manager -> Runner input for an adapter stage.
 type Dispatch struct {
-	RunID     string         `json:"run_id"`
-	TaskID    string         `json:"task_id"`
-	AttemptID string         `json:"attempt_id"`
-	StageID   string         `json:"stage_id"`
-	StageType string         `json:"stage_type"`
-	Adapter   string         `json:"adapter"`
-	Input     map[string]any `json:"input"`
+	ProjectID    string         `json:"project_id"`
+	RepositoryID string         `json:"repository_id,omitempty"`
+	RunID        string         `json:"run_id"`
+	TaskID       string         `json:"task_id"`
+	AttemptID    string         `json:"attempt_id"`
+	StageID      string         `json:"stage_id"`
+	StageType    string         `json:"stage_type"`
+	Adapter      string         `json:"adapter"`
+	Input        map[string]any `json:"input"`
 }
 
 // TaskInput is the minimal user-submitted task shape.

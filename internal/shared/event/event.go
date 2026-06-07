@@ -26,6 +26,7 @@ type Event struct {
 	ID            string         `json:"id"`
 	Sequence      int64          `json:"sequence"`
 	Timestamp     string         `json:"timestamp"`
+	ProjectID     string         `json:"project_id"`
 	RunID         string         `json:"run_id"`
 	TaskID        string         `json:"task_id"`
 	AttemptID     string         `json:"attempt_id"`
@@ -44,6 +45,7 @@ func (e Event) MarshalJSON() ([]byte, error) {
 		ID            string         `json:"id"`
 		Sequence      int64          `json:"sequence"`
 		Timestamp     string         `json:"timestamp"`
+		ProjectID     any            `json:"project_id"`
 		RunID         any            `json:"run_id"`
 		TaskID        any            `json:"task_id"`
 		AttemptID     any            `json:"attempt_id"`
@@ -57,6 +59,7 @@ func (e Event) MarshalJSON() ([]byte, error) {
 		ID:            e.ID,
 		Sequence:      e.Sequence,
 		Timestamp:     e.Timestamp,
+		ProjectID:     nullableString(e.ProjectID),
 		RunID:         nullableString(e.RunID),
 		TaskID:        nullableString(e.TaskID),
 		AttemptID:     nullableString(e.AttemptID),

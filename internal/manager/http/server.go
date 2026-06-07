@@ -12,7 +12,7 @@ import (
 )
 
 type RunController interface {
-	StartRun(context.Context, string) (string, error)
+	StartProjectRun(context.Context, string, string) (string, error)
 	StartQueuedRun(context.Context, string) error
 	CancelRun(context.Context, string) error
 	QueueState(context.Context) (orchestrator.QueueState, error)

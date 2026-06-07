@@ -9,7 +9,7 @@
 </head>
 <body>
   <main>
-    <header><h1>Parley</h1><p>Local-first manager control plane.</p></header>
+    <header><h1>{{.Project.Name}}</h1><p>Project workspace: <code>{{.Project.WorkspacePath}}</code></p></header>
     {{with .Notice}}
     <section class="notice" role="status" aria-live="polite">
       <strong>{{.Title}}</strong>
@@ -17,8 +17,8 @@
     </section>
     {{end}}
     <section class="card">
-      <h2>New run</h2>
-      <form method="post" action="/runs">
+      <h2>New task run</h2>
+      <form method="post" action="/projects/{{.Project.ID}}/runs">
         <input type="hidden" name="_csrf" value="{{.CSRF}}">
         <label for="idea">Software idea</label>
         <textarea id="idea" name="idea" required rows="5" placeholder="Describe the change you want Parley to drive through the workflow."></textarea>
@@ -53,7 +53,7 @@
         {{end}}
       </ol>
       {{if .RunnerEventPage.HasOlder}}
-      <p><a href="/?runner_events_before={{.RunnerEventPage.OlderCursor}}#runner-timeline">Older runner events</a></p>
+      <p><a href="/projects/{{.Project.ID}}?runner_events_before={{.RunnerEventPage.OlderCursor}}#runner-timeline">Older runner events</a></p>
       {{end}}
       {{end}}
     </section>
@@ -62,7 +62,7 @@
       {{if .Runs}}
       <ul class="run-list">
         {{range .Runs}}
-        <li><a href="/runs/{{.ID}}"><strong>{{short .ID}}</strong></a> <span class="pill {{statusClass .Status}}">{{statusLabel .Status}}</span>{{if eq .Status "pending"}} <span class="muted">waiting for a free runner slot{{if not $.Queue.AutoWhenReady}} · manual start required{{end}}</span>{{end}}<br><span>{{.Idea}}</span>{{if and (eq .Status "pending") (not $.Queue.AutoWhenReady)}}<form class="inline-form" method="post" action="/runs/{{.ID}}/start"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><button type="submit">Start queued run</button></form>{{end}}</li>
+        <li><a href="/projects/{{$.Project.ID}}/runs/{{.ID}}"><strong>{{short .ID}}</strong></a> <span class="pill {{statusClass .Status}}">{{statusLabel .Status}}</span>{{if eq .Status "pending"}} <span class="muted">waiting for a free runner slot{{if not $.Queue.AutoWhenReady}} · manual start required{{end}}</span>{{end}}<br><span>{{.Idea}}</span>{{if and (eq .Status "pending") (not $.Queue.AutoWhenReady)}}<form class="inline-form" method="post" action="/projects/{{$.Project.ID}}/runs/{{.ID}}/start"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><button type="submit">Start queued run</button></form>{{end}}</li>
         {{end}}
       </ul>
       {{else}}

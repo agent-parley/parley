@@ -7,12 +7,12 @@
   <script type="module" src="/assets/datastar.min.js"></script>
   <style>{{template "styles" .}}</style>
 </head>
-<body data-on:load="@get('/runs/{{.View.Run.ID}}/events', {openWhenHidden: true})">
+<body data-on:load="@get('/projects/{{.View.Project.ID}}/runs/{{.View.Run.ID}}/events', {openWhenHidden: true})">
   <main>
-    <nav><a href="/">← Runs</a></nav>
+    <nav><a href="/projects/{{.View.Project.ID}}">← {{.View.Project.Name}}</a></nav>
     {{template "run_summary.html" .View}}
     <section class="card">
-      <form method="post" action="/runs/{{.View.Run.ID}}/cancel">
+      <form method="post" action="/projects/{{.View.Project.ID}}/runs/{{.View.Run.ID}}/cancel">
         <input type="hidden" name="_csrf" value="{{.CSRF}}">
         <button type="submit" class="danger">Cancel run</button>
       </form>

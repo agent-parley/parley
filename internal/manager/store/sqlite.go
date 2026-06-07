@@ -23,6 +23,9 @@ import (
 var schemaFS embed.FS
 
 const (
+	DefaultProjectID    = "default"
+	DefaultRepositoryID = "repo_default"
+
 	RunStatusPending    = "pending"
 	RunStatusRunning    = "running"
 	RunStatusCompleted  = "completed"
@@ -43,13 +46,55 @@ const (
 )
 
 type Store struct {
-	db          *sql.DB
-	artifactDir string
-	mu          sync.Mutex
+	db      *sql.DB
+	dataDir string
+	mu      sync.Mutex
+}
+
+type ProjectSpec struct {
+	ID                 string
+	Name               string
+	Description        string
+	WorkspacePath      string
+	RepositoryPath     string
+	QueueAutoWhenReady bool
+	QueueMaxConcurrent int
+	QueueBacklogCap    int
+}
+
+type Project struct {
+	ID                 string
+	Name               string
+	Description        string
+	WorkspacePath      string
+	QueueAutoWhenReady bool
+	QueueMaxConcurrent int
+	QueueBacklogCap    int
+	CreatedAt          string
+	UpdatedAt          string
+}
+
+type Workspace struct {
+	ProjectID string
+	Path      string
+	CreatedAt string
+	UpdatedAt string
+}
+
+type Repository struct {
+	ID        string
+	ProjectID string
+	Name      string
+	Path      string
+	IsDefault bool
+	CreatedAt string
+	UpdatedAt string
 }
 
 type Run struct {
 	ID                 string
+	ProjectID          string
+	TaskID             string
 	Idea               string
 	Status             string
 	EventLogArtifactID string
@@ -58,16 +103,18 @@ type Run struct {
 }
 
 type Task struct {
-	ID        string
-	RunID     string
-	Idea      string
-	Status    string
-	CreatedAt string
-	UpdatedAt string
+	ID           string
+	ProjectID    string
+	RepositoryID string
+	Idea         string
+	Status       string
+	CreatedAt    string
+	UpdatedAt    string
 }
 
 type Attempt struct {
 	ID        string
+	ProjectID string
 	RunID     string
 	TaskID    string
 	Status    string
@@ -77,6 +124,7 @@ type Attempt struct {
 
 type Stage struct {
 	ID        string
+	ProjectID string
 	RunID     string
 	TaskID    string
 	AttemptID string
@@ -89,7 +137,9 @@ type Stage struct {
 
 type Artifact struct {
 	ID        string
+	ProjectID string
 	RunID     string
+	TaskID    string
 	Kind      string
 	MediaType string
 	Path      string
@@ -119,6 +169,7 @@ type SystemEventPage struct {
 }
 
 type WorkflowRun struct {
+	Project             Project
 	Run                 Run
 	Task                Task
 	Attempt             Attempt
@@ -130,6 +181,7 @@ type WorkflowRun struct {
 }
 
 type RunBundle struct {
+	Project   Project
 	Run       Run
 	Task      Task
 	Attempt   Attempt
@@ -145,16 +197,16 @@ func Open(ctx context.Context, dataDir string) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
-	artifactDir := filepath.Join(dataDir, "artifacts")
-	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create artifact dir: %w", err)
-	}
 	db, err := sql.Open("sqlite", filepath.Join(dataDir, "parley.db"))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	st := &Store{db: db, artifactDir: artifactDir}
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("enable sqlite foreign keys: %w", err)
+	}
+	st := &Store{db: db, dataDir: dataDir}
 	if err := st.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -166,21 +218,32 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) DB() *sql.DB { return s.db }
 
+func (s *Store) DataDir() string { return s.dataDir }
+
 func (s *Store) migrate(ctx context.Context) error {
 	schema, err := schemaFS.ReadFile("schema.sql")
 	if err != nil {
 		return fmt.Errorf("read schema: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, string(schema)); err != nil {
+	if _, err := s.db.ExecContext(ctx, schemaWithoutIndexes(string(schema))); err != nil {
 		return fmt.Errorf("migrate sqlite: %w", err)
 	}
-	if err := s.ensureRunnerRegistrySchema(ctx); err != nil {
+	if err := s.ensureDefaultProject(ctx); err != nil {
 		return err
 	}
 	if err := s.ensureEventsSchema(ctx); err != nil {
 		return err
 	}
-	return nil
+	if err := s.ensureProjectWorkflowSchema(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureRunnerRegistrySchema(ctx); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, string(schema)); err != nil {
+		return fmt.Errorf("refresh sqlite indexes: %w", err)
+	}
+	return s.checkForeignKeys(ctx)
 }
 
 type sqliteColumn struct {
@@ -209,6 +272,121 @@ func (s *Store) tableColumns(ctx context.Context, table string) (map[string]sqli
 	return cols, rows.Err()
 }
 
+func (s *Store) ensureDefaultProject(ctx context.Context) error {
+	_, err := s.EnsureProject(ctx, DefaultProjectSpec(s.dataDir))
+	return err
+}
+
+func DefaultProjectSpec(dataDir string) ProjectSpec {
+	return ProjectSpec{
+		ID:                 DefaultProjectID,
+		Name:               "Default project",
+		WorkspacePath:      defaultWorkspacePath(dataDir, DefaultProjectID),
+		QueueAutoWhenReady: true,
+		QueueMaxConcurrent: 1,
+		QueueBacklogCap:    100,
+	}
+}
+
+func (s *Store) EnsureProject(ctx context.Context, spec ProjectSpec) (Project, error) {
+	spec = s.normalizeProjectSpec(spec)
+	if err := ensureWorkspaceDirs(spec.WorkspacePath); err != nil {
+		return Project{}, err
+	}
+	now := nowRFC3339()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Project{}, fmt.Errorf("begin ensure project: %w", err)
+	}
+	defer rollback(tx)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO projects(id, name, description, queue_auto_when_ready, queue_max_concurrent, queue_backlog_cap, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET name = excluded.name, description = excluded.description, queue_auto_when_ready = excluded.queue_auto_when_ready, queue_max_concurrent = excluded.queue_max_concurrent, queue_backlog_cap = excluded.queue_backlog_cap, updated_at = excluded.updated_at`, spec.ID, spec.Name, spec.Description, boolInt(spec.QueueAutoWhenReady), spec.QueueMaxConcurrent, spec.QueueBacklogCap, now, now); err != nil {
+		return Project{}, fmt.Errorf("upsert project: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO workspaces(project_id, path, created_at, updated_at) VALUES (?, ?, ?, ?)
+ON CONFLICT(project_id) DO UPDATE SET path = excluded.path, updated_at = excluded.updated_at`, spec.ID, spec.WorkspacePath, now, now); err != nil {
+		return Project{}, fmt.Errorf("upsert workspace: %w", err)
+	}
+	if strings.TrimSpace(spec.RepositoryPath) != "" {
+		repoPath := filepath.Clean(spec.RepositoryPath)
+		repositoryID := defaultRepositoryID(spec.ID)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO repositories(id, project_id, name, path, is_default, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)
+ON CONFLICT(id) DO UPDATE SET project_id = excluded.project_id, path = excluded.path, is_default = 1, updated_at = excluded.updated_at`, repositoryID, spec.ID, "Default repository", repoPath, now, now); err != nil {
+			return Project{}, fmt.Errorf("upsert default repository: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Project{}, fmt.Errorf("commit ensure project: %w", err)
+	}
+	return s.GetProject(ctx, spec.ID)
+}
+
+func (s *Store) normalizeProjectSpec(spec ProjectSpec) ProjectSpec {
+	if strings.TrimSpace(spec.ID) == "" {
+		spec.ID = DefaultProjectID
+	}
+	if strings.TrimSpace(spec.Name) == "" {
+		spec.Name = "Default project"
+	}
+	if strings.TrimSpace(spec.WorkspacePath) == "" {
+		spec.WorkspacePath = defaultWorkspacePath(s.dataDir, spec.ID)
+	}
+	if spec.QueueMaxConcurrent < 1 {
+		spec.QueueMaxConcurrent = 1
+	}
+	if spec.QueueBacklogCap < 1 {
+		spec.QueueBacklogCap = 100
+	}
+	return spec
+}
+
+func (s *Store) GetProject(ctx context.Context, projectID string) (Project, error) {
+	var project Project
+	var auto int
+	err := s.db.QueryRowContext(ctx, `SELECT p.id, p.name, p.description, w.path, p.queue_auto_when_ready, p.queue_max_concurrent, p.queue_backlog_cap, p.created_at, p.updated_at
+FROM projects p JOIN workspaces w ON w.project_id = p.id WHERE p.id = ?`, projectID).Scan(&project.ID, &project.Name, &project.Description, &project.WorkspacePath, &auto, &project.QueueMaxConcurrent, &project.QueueBacklogCap, &project.CreatedAt, &project.UpdatedAt)
+	if err != nil {
+		return Project{}, fmt.Errorf("get project %s: %w", projectID, err)
+	}
+	project.QueueAutoWhenReady = auto != 0
+	return project, nil
+}
+
+func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT p.id, p.name, p.description, w.path, p.queue_auto_when_ready, p.queue_max_concurrent, p.queue_backlog_cap, p.created_at, p.updated_at
+FROM projects p JOIN workspaces w ON w.project_id = p.id ORDER BY p.created_at DESC, p.id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list projects: %w", err)
+	}
+	defer rows.Close()
+	var projects []Project
+	for rows.Next() {
+		var project Project
+		var auto int
+		if err := rows.Scan(&project.ID, &project.Name, &project.Description, &project.WorkspacePath, &auto, &project.QueueMaxConcurrent, &project.QueueBacklogCap, &project.CreatedAt, &project.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan project: %w", err)
+		}
+		project.QueueAutoWhenReady = auto != 0
+		projects = append(projects, project)
+	}
+	return projects, rows.Err()
+}
+
+func (s *Store) DefaultRepositoryID(ctx context.Context, projectID string) (string, error) {
+	var repositoryID string
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM repositories WHERE project_id = ? AND is_default = 1 ORDER BY created_at ASC, id ASC LIMIT 1`, projectID).Scan(&repositoryID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", fmt.Errorf("get default repository: %w", err)
+	}
+	return repositoryID, nil
+}
+
 func (s *Store) ensureRunnerRegistrySchema(ctx context.Context) error {
 	cols, err := s.tableColumns(ctx, "runner_registry")
 	if err != nil {
@@ -233,6 +411,9 @@ func (s *Store) ensureEventsSchema(ctx context.Context) error {
 		return err
 	}
 	needsRebuild := false
+	if _, ok := cols["project_id"]; !ok {
+		needsRebuild = true
+	}
 	if _, ok := cols["scope"]; !ok {
 		needsRebuild = true
 	}
@@ -240,7 +421,7 @@ func (s *Store) ensureEventsSchema(ctx context.Context) error {
 		needsRebuild = true
 	}
 	if needsRebuild {
-		if err := s.rebuildEventsTable(ctx); err != nil {
+		if err := s.rebuildEventsTable(ctx, cols); err != nil {
 			return err
 		}
 	}
@@ -250,12 +431,23 @@ func (s *Store) ensureEventsSchema(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_events_scope_sequence ON events(scope, sequence)`); err != nil {
 		return fmt.Errorf("create events scope index: %w", err)
 	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_events_project_sequence ON events(project_id, sequence)`); err != nil {
+		return fmt.Errorf("create events project index: %w", err)
+	}
 	return nil
 }
 
-func (s *Store) rebuildEventsTable(ctx context.Context) error {
+func (s *Store) rebuildEventsTable(ctx context.Context, cols map[string]sqliteColumn) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	projectExpr := "NULL"
+	if _, ok := cols["project_id"]; ok {
+		projectExpr = "project_id"
+	}
+	scopeExpr := "CASE WHEN run_id IS NOT NULL THEN 'run:' || run_id ELSE 'system' END"
+	if _, ok := cols["scope"]; ok {
+		scopeExpr = "COALESCE(NULLIF(scope, ''), CASE WHEN run_id IS NOT NULL THEN 'run:' || run_id ELSE 'system' END)"
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin events rebuild: %w", err)
@@ -264,8 +456,226 @@ func (s *Store) rebuildEventsTable(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `ALTER TABLE events RENAME TO events_legacy`); err != nil {
 		return fmt.Errorf("rename legacy events: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `CREATE TABLE events (
+	if err := createEventsTableTx(ctx, tx); err != nil {
+		return err
+	}
+	query := fmt.Sprintf(`INSERT INTO events(id, project_id, run_id, scope, sequence, timestamp, task_id, attempt_id, type, actor_kind, actor_id, summary, data_json, envelope_json)
+SELECT id, %s, run_id, %s, sequence, timestamp, task_id, attempt_id, type, actor_kind, actor_id, summary, data_json, envelope_json
+FROM events_legacy ORDER BY rowid`, projectExpr, scopeExpr)
+	if _, err := tx.ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("copy legacy events: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE events_legacy`); err != nil {
+		return fmt.Errorf("drop legacy events: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit events rebuild: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ensureProjectWorkflowSchema(ctx context.Context) error {
+	runCols, err := s.tableColumns(ctx, "runs")
+	if err != nil {
+		return err
+	}
+	taskCols, err := s.tableColumns(ctx, "tasks")
+	if err != nil {
+		return err
+	}
+	artifactCols, err := s.tableColumns(ctx, "artifacts")
+	if err != nil {
+		return err
+	}
+	snapshotCols, err := s.tableColumns(ctx, "workflow_snapshots")
+	if err != nil {
+		return err
+	}
+	if _, ok := runCols["project_id"]; ok {
+		if _, ok := runCols["task_id"]; ok {
+			if _, ok := taskCols["project_id"]; ok {
+				if _, legacy := taskCols["run_id"]; !legacy {
+					if _, ok := artifactCols["project_id"]; ok {
+						if _, ok := snapshotCols["project_id"]; ok {
+							return nil
+						}
+					}
+				}
+			}
+		}
+	}
+	return s.rebuildWorkflowTablesForProjects(ctx)
+}
+
+func (s *Store) rebuildWorkflowTablesForProjects(ctx context.Context) error {
+	defaultRepoID, err := s.DefaultRepositoryID(ctx, DefaultProjectID)
+	if err != nil {
+		return err
+	}
+	var repoValue any
+	if defaultRepoID != "" {
+		repoValue = defaultRepoID
+	}
+	if _, err := s.db.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return fmt.Errorf("disable foreign keys for workflow rebuild: %w", err)
+	}
+	defer func() { _, _ = s.db.ExecContext(context.Background(), `PRAGMA foreign_keys = ON`) }()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin workflow rebuild: %w", err)
+	}
+	defer rollback(tx)
+	for _, table := range []string{"tasks", "runs", "attempts", "stages", "workflow_snapshots", "artifacts", "events"} {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s RENAME TO %s_legacy`, table, table)); err != nil {
+			return fmt.Errorf("rename legacy %s: %w", table, err)
+		}
+	}
+	if err := createWorkflowTablesTx(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO tasks(id, project_id, repository_id, idea, status, created_at, updated_at)
+SELECT id, ?, ?, idea, status, created_at, updated_at FROM tasks_legacy`, DefaultProjectID, repoValue); err != nil {
+		return fmt.Errorf("copy legacy tasks: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO tasks(id, project_id, repository_id, idea, status, created_at, updated_at)
+SELECT 'task_' || id, ?, ?, idea, status, created_at, updated_at FROM runs_legacy r
+WHERE NOT EXISTS (SELECT 1 FROM tasks_legacy t WHERE t.run_id = r.id)
+  AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = 'task_' || r.id)`, DefaultProjectID, repoValue); err != nil {
+		return fmt.Errorf("create synthetic tasks: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at)
+SELECT r.id, ?, COALESCE((SELECT t.id FROM tasks_legacy t WHERE t.run_id = r.id ORDER BY t.created_at DESC, t.id DESC LIMIT 1), 'task_' || r.id), r.idea, r.status, r.event_log_artifact_id, r.created_at, r.updated_at
+FROM runs_legacy r`, DefaultProjectID); err != nil {
+		return fmt.Errorf("copy legacy runs: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO attempts(id, project_id, run_id, task_id, status, created_at, updated_at)
+SELECT a.id, ?, a.run_id,
+  CASE WHEN EXISTS (SELECT 1 FROM tasks t WHERE t.id = a.task_id) THEN a.task_id ELSE (SELECT r.task_id FROM runs r WHERE r.id = a.run_id) END,
+  a.status, a.created_at, a.updated_at
+FROM attempts_legacy a`, DefaultProjectID); err != nil {
+		return fmt.Errorf("copy legacy attempts: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO stages(id, project_id, run_id, task_id, attempt_id, stage_type, adapter, status, created_at, updated_at)
+SELECT s.id, ?, s.run_id,
+  CASE WHEN EXISTS (SELECT 1 FROM tasks t WHERE t.id = s.task_id) THEN s.task_id ELSE (SELECT r.task_id FROM runs r WHERE r.id = s.run_id) END,
+  s.attempt_id, s.stage_type, s.adapter, s.status, s.created_at, s.updated_at
+FROM stages_legacy s`, DefaultProjectID); err != nil {
+		return fmt.Errorf("copy legacy stages: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_snapshots(id, project_id, run_id, task_id, snapshot_json, created_at)
+SELECT ws.id, ?, ws.run_id, (SELECT r.task_id FROM runs r WHERE r.id = ws.run_id), ws.snapshot_json, ws.created_at
+FROM workflow_snapshots_legacy ws WHERE EXISTS (SELECT 1 FROM runs r WHERE r.id = ws.run_id)`, DefaultProjectID); err != nil {
+		return fmt.Errorf("copy legacy workflow snapshots: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO artifacts(id, project_id, run_id, task_id, kind, media_type, path, created_at)
+SELECT a.id, ?, a.run_id, (SELECT r.task_id FROM runs r WHERE r.id = a.run_id), a.kind, a.media_type, a.path, a.created_at
+FROM artifacts_legacy a WHERE EXISTS (SELECT 1 FROM runs r WHERE r.id = a.run_id)`, DefaultProjectID); err != nil {
+		return fmt.Errorf("copy legacy artifacts: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO events(id, project_id, run_id, scope, sequence, timestamp, task_id, attempt_id, type, actor_kind, actor_id, summary, data_json, envelope_json)
+SELECT e.id, CASE WHEN e.run_id IS NULL THEN NULL ELSE ? END, e.run_id, e.scope, e.sequence, e.timestamp, e.task_id, e.attempt_id, e.type, e.actor_kind, e.actor_id, e.summary, e.data_json, e.envelope_json
+FROM events_legacy e`, DefaultProjectID); err != nil {
+		return fmt.Errorf("copy legacy events: %w", err)
+	}
+	for _, table := range []string{"events", "artifacts", "workflow_snapshots", "stages", "attempts", "runs", "tasks"} {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DROP TABLE %s_legacy`, table)); err != nil {
+			return fmt.Errorf("drop legacy %s: %w", table, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit workflow rebuild: %w", err)
+	}
+	return nil
+}
+
+func createWorkflowTablesTx(ctx context.Context, tx *sql.Tx) error {
+	statements := []string{
+		`CREATE TABLE tasks (
   id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  repository_id TEXT REFERENCES repositories(id),
+  idea TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(project_id, id)
+)`,
+		`CREATE TABLE runs (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  idea TEXT NOT NULL,
+  status TEXT NOT NULL,
+  event_log_artifact_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
+  UNIQUE(project_id, id)
+)`,
+		`CREATE TABLE attempts (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(project_id, run_id) REFERENCES runs(project_id, id),
+  FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
+  UNIQUE(project_id, run_id, id)
+)`,
+		`CREATE TABLE stages (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  stage_type TEXT NOT NULL,
+  adapter TEXT,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(project_id, run_id, attempt_id) REFERENCES attempts(project_id, run_id, id),
+  FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id)
+)`,
+		`CREATE TABLE workflow_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  snapshot_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(project_id, run_id) REFERENCES runs(project_id, id),
+  FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id)
+)`,
+		`CREATE TABLE artifacts (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  kind TEXT NOT NULL,
+  media_type TEXT NOT NULL,
+  path TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(project_id, run_id) REFERENCES runs(project_id, id),
+  FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id)
+)`,
+	}
+	for _, stmt := range statements {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("create workflow table: %w", err)
+		}
+	}
+	return createEventsTableTx(ctx, tx)
+}
+
+func createEventsTableTx(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `CREATE TABLE events (
+  id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES projects(id),
   run_id TEXT REFERENCES runs(id),
   scope TEXT NOT NULL,
   sequence INTEGER NOT NULL,
@@ -279,37 +689,56 @@ func (s *Store) rebuildEventsTable(ctx context.Context) error {
   data_json TEXT NOT NULL,
   envelope_json TEXT NOT NULL,
   UNIQUE(scope, sequence)
-)`); err != nil {
+)`)
+	if err != nil {
 		return fmt.Errorf("create events table: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO events(id, run_id, scope, sequence, timestamp, task_id, attempt_id, type, actor_kind, actor_id, summary, data_json, envelope_json)
-SELECT id, run_id, 'run:' || run_id, sequence, timestamp, task_id, attempt_id, type, actor_kind, actor_id, summary, data_json, envelope_json
-FROM events_legacy ORDER BY run_id, sequence`); err != nil {
-		return fmt.Errorf("copy legacy events: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `DROP TABLE events_legacy`); err != nil {
-		return fmt.Errorf("drop legacy events: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit events rebuild: %w", err)
 	}
 	return nil
 }
 
+func (s *Store) checkForeignKeys(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		return fmt.Errorf("foreign key check: %w", err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return fmt.Errorf("foreign key check failed after migration")
+	}
+	return rows.Err()
+}
+
 func (s *Store) CreateWorkflowRun(ctx context.Context, idea string) (WorkflowRun, error) {
+	return s.CreateWorkflowRunForProject(ctx, DefaultProjectID, idea)
+}
+
+func (s *Store) CreateWorkflowRunForProject(ctx context.Context, projectID, idea string) (WorkflowRun, error) {
+	project, err := s.GetProject(ctx, projectID)
+	if err != nil {
+		return WorkflowRun{}, err
+	}
+	repositoryID, err := s.DefaultRepositoryID(ctx, projectID)
+	if err != nil {
+		return WorkflowRun{}, err
+	}
 	now := nowRFC3339()
 	wr := WorkflowRun{
-		Run: Run{ID: ids.New("run"), Idea: idea, Status: RunStatusPending, EventLogArtifactID: ids.New("artifact"), CreatedAt: now, UpdatedAt: now},
+		Project: project,
+		Run:     Run{ID: ids.New("run"), ProjectID: project.ID, Idea: idea, Status: RunStatusPending, EventLogArtifactID: ids.New("artifact"), CreatedAt: now, UpdatedAt: now},
 	}
-	wr.Task = Task{ID: ids.New("task"), RunID: wr.Run.ID, Idea: idea, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
-	wr.Attempt = Attempt{ID: ids.New("attempt"), RunID: wr.Run.ID, TaskID: wr.Task.ID, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
-	wr.IdeaIntakeStage = Stage{ID: ids.New("stage"), RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeIdeaIntake, Adapter: "", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
-	wr.ImplementationStage = Stage{ID: ids.New("stage"), RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeImplementation, Adapter: "noop", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
-	wr.ValidationStage = Stage{ID: ids.New("stage"), RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeValidation, Adapter: "validation", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
-	wr.CommitStage = Stage{ID: ids.New("stage"), RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeCommit, Adapter: "", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
-	wr.PRReadyStage = Stage{ID: ids.New("stage"), RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypePRReady, Adapter: "", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
+	wr.Task = Task{ID: ids.New("task"), ProjectID: project.ID, RepositoryID: repositoryID, Idea: idea, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
+	wr.Run.TaskID = wr.Task.ID
+	wr.Attempt = Attempt{ID: ids.New("attempt"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
+	wr.IdeaIntakeStage = Stage{ID: ids.New("stage"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeIdeaIntake, Adapter: "", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
+	wr.ImplementationStage = Stage{ID: ids.New("stage"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeImplementation, Adapter: "noop", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
+	wr.ValidationStage = Stage{ID: ids.New("stage"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeValidation, Adapter: "validation", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
+	wr.CommitStage = Stage{ID: ids.New("stage"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeCommit, Adapter: "", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
+	wr.PRReadyStage = Stage{ID: ids.New("stage"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypePRReady, Adapter: "", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
 
-	eventLogPath := s.artifactPath(wr.Run.EventLogArtifactID, ".jsonl")
+	eventLogPath := artifactPathForWorkspace(project.WorkspacePath, wr.Run.EventLogArtifactID, ".jsonl")
+	if err := os.MkdirAll(filepath.Dir(eventLogPath), 0o700); err != nil {
+		return WorkflowRun{}, fmt.Errorf("create event log artifact dir: %w", err)
+	}
 	if err := os.WriteFile(eventLogPath, nil, 0o600); err != nil {
 		return WorkflowRun{}, fmt.Errorf("create event log artifact: %w", err)
 	}
@@ -321,21 +750,25 @@ func (s *Store) CreateWorkflowRun(ctx context.Context, idea string) (WorkflowRun
 		return WorkflowRun{}, fmt.Errorf("begin create run: %w", err)
 	}
 	defer rollback(tx)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(id, idea, status, event_log_artifact_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`, wr.Run.ID, wr.Run.Idea, wr.Run.Status, wr.Run.EventLogArtifactID, now, now); err != nil {
-		return WorkflowRun{}, fmt.Errorf("insert run: %w", err)
+	var repoValue any
+	if wr.Task.RepositoryID != "" {
+		repoValue = wr.Task.RepositoryID
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO tasks(id, run_id, idea, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`, wr.Task.ID, wr.Task.RunID, wr.Task.Idea, wr.Task.Status, now, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO tasks(id, project_id, repository_id, idea, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, wr.Task.ID, wr.Task.ProjectID, repoValue, wr.Task.Idea, wr.Task.Status, now, now); err != nil {
 		return WorkflowRun{}, fmt.Errorf("insert task: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO attempts(id, run_id, task_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`, wr.Attempt.ID, wr.Attempt.RunID, wr.Attempt.TaskID, wr.Attempt.Status, now, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, wr.Run.ID, wr.Run.ProjectID, wr.Run.TaskID, wr.Run.Idea, wr.Run.Status, wr.Run.EventLogArtifactID, now, now); err != nil {
+		return WorkflowRun{}, fmt.Errorf("insert run: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO attempts(id, project_id, run_id, task_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, wr.Attempt.ID, wr.Attempt.ProjectID, wr.Attempt.RunID, wr.Attempt.TaskID, wr.Attempt.Status, now, now); err != nil {
 		return WorkflowRun{}, fmt.Errorf("insert attempt: %w", err)
 	}
 	for _, stage := range []Stage{wr.IdeaIntakeStage, wr.ImplementationStage, wr.ValidationStage, wr.CommitStage, wr.PRReadyStage} {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO stages(id, run_id, task_id, attempt_id, stage_type, adapter, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, stage.ID, stage.RunID, stage.TaskID, stage.AttemptID, stage.StageType, stage.Adapter, stage.Status, now, now); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO stages(id, project_id, run_id, task_id, attempt_id, stage_type, adapter, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, stage.ID, stage.ProjectID, stage.RunID, stage.TaskID, stage.AttemptID, stage.StageType, stage.Adapter, stage.Status, now, now); err != nil {
 			return WorkflowRun{}, fmt.Errorf("insert stage: %w", err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO artifacts(id, run_id, kind, media_type, path, created_at) VALUES (?, ?, ?, ?, ?, ?)`, wr.Run.EventLogArtifactID, wr.Run.ID, "event_log", "application/x-jsonlines", eventLogPath, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO artifacts(id, project_id, run_id, task_id, kind, media_type, path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, wr.Run.EventLogArtifactID, wr.Run.ProjectID, wr.Run.ID, wr.Task.ID, "event_log", "application/x-jsonlines", eventLogPath, now); err != nil {
 		return WorkflowRun{}, fmt.Errorf("insert event log artifact: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -345,15 +778,23 @@ func (s *Store) CreateWorkflowRun(ctx context.Context, idea string) (WorkflowRun
 }
 
 func (s *Store) ListRuns(ctx context.Context) ([]Run, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, idea, status, event_log_artifact_id, created_at, updated_at FROM runs ORDER BY created_at DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at FROM runs ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list runs: %w", err)
 	}
 	return scanRuns(rows)
 }
 
+func (s *Store) ListRunsForProject(ctx context.Context, projectID string) ([]Run, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE project_id = ? ORDER BY created_at DESC`, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("list project runs: %w", err)
+	}
+	return scanRuns(rows)
+}
+
 func (s *Store) ListRunsByStatus(ctx context.Context, status string, limit int) ([]Run, error) {
-	query := `SELECT id, idea, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE status = ? ORDER BY created_at ASC`
+	query := `SELECT id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE status = ? ORDER BY created_at ASC`
 	args := []any{status}
 	if limit > 0 {
 		query += ` LIMIT ?`
@@ -366,10 +807,32 @@ func (s *Store) ListRunsByStatus(ctx context.Context, status string, limit int) 
 	return scanRuns(rows)
 }
 
+func (s *Store) ListRunsByProjectStatus(ctx context.Context, projectID, status string, limit int) ([]Run, error) {
+	query := `SELECT id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE project_id = ? AND status = ? ORDER BY created_at ASC`
+	args := []any{projectID, status}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list project runs by status: %w", err)
+	}
+	return scanRuns(rows)
+}
+
 func (s *Store) CountRunsByStatus(ctx context.Context, status string) (int, error) {
 	var count int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE status = ?`, status).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count runs by status: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Store) CountRunsByProjectStatus(ctx context.Context, projectID, status string) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE project_id = ? AND status = ?`, projectID, status).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count project runs by status: %w", err)
 	}
 	return count, nil
 }
@@ -379,7 +842,7 @@ func scanRuns(rows *sql.Rows) ([]Run, error) {
 	var runs []Run
 	for rows.Next() {
 		var run Run
-		if err := rows.Scan(&run.ID, &run.Idea, &run.Status, &run.EventLogArtifactID, &run.CreatedAt, &run.UpdatedAt); err != nil {
+		if err := rows.Scan(&run.ID, &run.ProjectID, &run.TaskID, &run.Idea, &run.Status, &run.EventLogArtifactID, &run.CreatedAt, &run.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan run: %w", err)
 		}
 		runs = append(runs, run)
@@ -389,7 +852,7 @@ func scanRuns(rows *sql.Rows) ([]Run, error) {
 
 func (s *Store) GetRun(ctx context.Context, runID string) (Run, error) {
 	var run Run
-	err := s.db.QueryRowContext(ctx, `SELECT id, idea, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE id = ?`, runID).Scan(&run.ID, &run.Idea, &run.Status, &run.EventLogArtifactID, &run.CreatedAt, &run.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE id = ?`, runID).Scan(&run.ID, &run.ProjectID, &run.TaskID, &run.Idea, &run.Status, &run.EventLogArtifactID, &run.CreatedAt, &run.UpdatedAt)
 	if err != nil {
 		return Run{}, fmt.Errorf("get run %s: %w", runID, err)
 	}
@@ -401,19 +864,27 @@ func (s *Store) GetWorkflowRun(ctx context.Context, runID string) (WorkflowRun, 
 	if err != nil {
 		return WorkflowRun{}, err
 	}
-	var task Task
-	if err := s.db.QueryRowContext(ctx, `SELECT id, run_id, idea, status, created_at, updated_at FROM tasks WHERE run_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`, runID).Scan(&task.ID, &task.RunID, &task.Idea, &task.Status, &task.CreatedAt, &task.UpdatedAt); err != nil {
-		return WorkflowRun{}, fmt.Errorf("get task for run %s: %w", runID, err)
-	}
-	var attempt Attempt
-	if err := s.db.QueryRowContext(ctx, `SELECT id, run_id, task_id, status, created_at, updated_at FROM attempts WHERE run_id = ? AND task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`, runID, task.ID).Scan(&attempt.ID, &attempt.RunID, &attempt.TaskID, &attempt.Status, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
-		return WorkflowRun{}, fmt.Errorf("get attempt for run %s: %w", runID, err)
-	}
-	stages, err := s.ListStagesForAttempt(ctx, runID, attempt.ID)
+	project, err := s.GetProject(ctx, run.ProjectID)
 	if err != nil {
 		return WorkflowRun{}, err
 	}
-	wr := WorkflowRun{Run: run, Task: task, Attempt: attempt}
+	var task Task
+	var repo sql.NullString
+	if err := s.db.QueryRowContext(ctx, `SELECT id, project_id, repository_id, idea, status, created_at, updated_at FROM tasks WHERE id = ? AND project_id = ?`, run.TaskID, run.ProjectID).Scan(&task.ID, &task.ProjectID, &repo, &task.Idea, &task.Status, &task.CreatedAt, &task.UpdatedAt); err != nil {
+		return WorkflowRun{}, fmt.Errorf("get task for run %s: %w", runID, err)
+	}
+	if repo.Valid {
+		task.RepositoryID = repo.String
+	}
+	var attempt Attempt
+	if err := s.db.QueryRowContext(ctx, `SELECT id, project_id, run_id, task_id, status, created_at, updated_at FROM attempts WHERE project_id = ? AND run_id = ? AND task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`, run.ProjectID, run.ID, task.ID).Scan(&attempt.ID, &attempt.ProjectID, &attempt.RunID, &attempt.TaskID, &attempt.Status, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
+		return WorkflowRun{}, fmt.Errorf("get attempt for run %s: %w", runID, err)
+	}
+	stages, err := s.ListStagesForAttempt(ctx, run.ID, attempt.ID)
+	if err != nil {
+		return WorkflowRun{}, err
+	}
+	wr := WorkflowRun{Project: project, Run: run, Task: task, Attempt: attempt}
 	for _, stage := range stages {
 		switch stage.StageType {
 		case contract.StageTypeIdeaIntake:
@@ -432,11 +903,11 @@ func (s *Store) GetWorkflowRun(ctx context.Context, runID string) (WorkflowRun, 
 }
 
 func (s *Store) ListStages(ctx context.Context, runID string) ([]Stage, error) {
-	return s.listStages(ctx, `SELECT id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, created_at, updated_at FROM stages WHERE run_id = ? ORDER BY created_at ASC`, runID)
+	return s.listStages(ctx, `SELECT id, project_id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, created_at, updated_at FROM stages WHERE run_id = ? ORDER BY created_at ASC`, runID)
 }
 
 func (s *Store) ListStagesForAttempt(ctx context.Context, runID, attemptID string) ([]Stage, error) {
-	return s.listStages(ctx, `SELECT id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, created_at, updated_at FROM stages WHERE run_id = ? AND attempt_id = ? ORDER BY created_at ASC`, runID, attemptID)
+	return s.listStages(ctx, `SELECT id, project_id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, created_at, updated_at FROM stages WHERE run_id = ? AND attempt_id = ? ORDER BY created_at ASC`, runID, attemptID)
 }
 
 func (s *Store) listStages(ctx context.Context, query string, args ...any) ([]Stage, error) {
@@ -448,7 +919,7 @@ func (s *Store) listStages(ctx context.Context, query string, args ...any) ([]St
 	var stages []Stage
 	for rows.Next() {
 		var stage Stage
-		if err := rows.Scan(&stage.ID, &stage.RunID, &stage.TaskID, &stage.AttemptID, &stage.StageType, &stage.Adapter, &stage.Status, &stage.CreatedAt, &stage.UpdatedAt); err != nil {
+		if err := rows.Scan(&stage.ID, &stage.ProjectID, &stage.RunID, &stage.TaskID, &stage.AttemptID, &stage.StageType, &stage.Adapter, &stage.Status, &stage.CreatedAt, &stage.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan stage: %w", err)
 		}
 		stages = append(stages, stage)
@@ -521,12 +992,19 @@ func (s *Store) SaveArtifactWithID(ctx context.Context, artifactID, runID, kind,
 	if ext == "" {
 		ext = ".json"
 	}
-	artifact := Artifact{ID: artifactID, RunID: runID, Kind: kind, MediaType: mediaType, CreatedAt: nowRFC3339()}
-	artifact.Path = s.artifactPath(artifact.ID, ext)
+	projectID, taskID, workspacePath, err := s.runArtifactContext(ctx, runID)
+	if err != nil {
+		return Artifact{}, err
+	}
+	artifact := Artifact{ID: artifactID, ProjectID: projectID, RunID: runID, TaskID: taskID, Kind: kind, MediaType: mediaType, CreatedAt: nowRFC3339()}
+	artifact.Path = artifactPathForWorkspace(workspacePath, artifact.ID, ext)
+	if err := os.MkdirAll(filepath.Dir(artifact.Path), 0o700); err != nil {
+		return Artifact{}, fmt.Errorf("create artifact dir: %w", err)
+	}
 	if err := os.WriteFile(artifact.Path, content, 0o600); err != nil {
 		return Artifact{}, fmt.Errorf("write artifact: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO artifacts(id, run_id, kind, media_type, path, created_at) VALUES (?, ?, ?, ?, ?, ?)`, artifact.ID, artifact.RunID, artifact.Kind, artifact.MediaType, artifact.Path, artifact.CreatedAt); err != nil {
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO artifacts(id, project_id, run_id, task_id, kind, media_type, path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, artifact.ID, artifact.ProjectID, artifact.RunID, artifact.TaskID, artifact.Kind, artifact.MediaType, artifact.Path, artifact.CreatedAt); err != nil {
 		_ = os.Remove(artifact.Path)
 		return Artifact{}, fmt.Errorf("insert artifact: %w", err)
 	}
@@ -535,7 +1013,7 @@ func (s *Store) SaveArtifactWithID(ctx context.Context, artifactID, runID, kind,
 
 func (s *Store) GetArtifact(ctx context.Context, artifactID string) (Artifact, []byte, error) {
 	var artifact Artifact
-	err := s.db.QueryRowContext(ctx, `SELECT id, run_id, kind, media_type, path, created_at FROM artifacts WHERE id = ?`, artifactID).Scan(&artifact.ID, &artifact.RunID, &artifact.Kind, &artifact.MediaType, &artifact.Path, &artifact.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT id, project_id, run_id, task_id, kind, media_type, path, created_at FROM artifacts WHERE id = ?`, artifactID).Scan(&artifact.ID, &artifact.ProjectID, &artifact.RunID, &artifact.TaskID, &artifact.Kind, &artifact.MediaType, &artifact.Path, &artifact.CreatedAt)
 	if err != nil {
 		return Artifact{}, nil, fmt.Errorf("get artifact: %w", err)
 	}
@@ -575,6 +1053,10 @@ func (s *Store) UpdateRunStatusFromAndAppendSystemEvent(ctx context.Context, run
 		return event.Event{}, false, fmt.Errorf("begin status/event transaction: %w", err)
 	}
 	defer rollback(tx)
+	var projectID string
+	if err := tx.QueryRowContext(ctx, `SELECT project_id FROM runs WHERE id = ?`, runID).Scan(&projectID); err != nil {
+		return event.Event{}, false, fmt.Errorf("get run project: %w", err)
+	}
 	res, err := tx.ExecContext(ctx, `UPDATE runs SET status = ?, updated_at = ? WHERE id = ? AND status = ?`, toStatus, nowRFC3339(), runID, fromStatus)
 	if err != nil {
 		return event.Event{}, false, fmt.Errorf("update run status from %s to %s: %w", fromStatus, toStatus, err)
@@ -588,6 +1070,9 @@ func (s *Store) UpdateRunStatusFromAndAppendSystemEvent(ctx context.Context, run
 			return event.Event{}, false, fmt.Errorf("commit unchanged status/event transaction: %w", err)
 		}
 		return event.Event{}, false, nil
+	}
+	if ev.ProjectID == "" {
+		ev.ProjectID = projectID
 	}
 	ev, err = s.appendEventTx(ctx, tx, ev)
 	if err != nil {
@@ -612,6 +1097,11 @@ func (s *Store) appendEventTx(ctx context.Context, tx *sql.Tx, ev event.Event) (
 	if ev.Data == nil {
 		ev.Data = map[string]any{}
 	}
+	if ev.ProjectID == "" && ev.RunID != "" {
+		if err := tx.QueryRowContext(ctx, `SELECT project_id FROM runs WHERE id = ?`, ev.RunID).Scan(&ev.ProjectID); err != nil {
+			return event.Event{}, fmt.Errorf("get event project: %w", err)
+		}
+	}
 	scope := eventScope(ev)
 	var last sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `SELECT MAX(sequence) FROM events WHERE scope = ?`, scope).Scan(&last); err != nil {
@@ -630,6 +1120,10 @@ func (s *Store) appendEventTx(ctx context.Context, tx *sql.Tx, ev event.Event) (
 	if err != nil {
 		return event.Event{}, fmt.Errorf("marshal event envelope: %w", err)
 	}
+	var projectID any
+	if ev.ProjectID != "" {
+		projectID = ev.ProjectID
+	}
 	var runID any
 	if ev.RunID != "" {
 		runID = ev.RunID
@@ -642,7 +1136,7 @@ func (s *Store) appendEventTx(ctx context.Context, tx *sql.Tx, ev event.Event) (
 	if ev.AttemptID != "" {
 		attemptID = ev.AttemptID
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO events(id, run_id, scope, sequence, timestamp, task_id, attempt_id, type, actor_kind, actor_id, summary, data_json, envelope_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, ev.ID, runID, scope, ev.Sequence, ev.Timestamp, taskID, attemptID, ev.Type, ev.Actor.Kind, ev.Actor.ID, ev.Summary, string(dataJSON), string(envelopeJSON)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO events(id, project_id, run_id, scope, sequence, timestamp, task_id, attempt_id, type, actor_kind, actor_id, summary, data_json, envelope_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, ev.ID, projectID, runID, scope, ev.Sequence, ev.Timestamp, taskID, attemptID, ev.Type, ev.Actor.Kind, ev.Actor.ID, ev.Summary, string(dataJSON), string(envelopeJSON)); err != nil {
 		return event.Event{}, fmt.Errorf("insert event: %w", err)
 	}
 	if ev.RunID != "" {
@@ -692,7 +1186,7 @@ func (s *Store) ListSystemEventsPage(ctx context.Context, before int64, limit in
 		args = append(args, before)
 	}
 	args = append(args, limit+1)
-	rows, err := s.db.QueryContext(ctx, `SELECT rowid, envelope_json FROM events WHERE `+where+` ORDER BY rowid DESC LIMIT ?`, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT rowid, project_id, envelope_json FROM events WHERE `+where+` ORDER BY rowid DESC LIMIT ?`, args...)
 	if err != nil {
 		return SystemEventPage{}, fmt.Errorf("list system events page: %w", err)
 	}
@@ -700,12 +1194,16 @@ func (s *Store) ListSystemEventsPage(ctx context.Context, before int64, limit in
 	entries := make([]SystemEvent, 0, limit+1)
 	for rows.Next() {
 		var entry SystemEvent
+		var project sql.NullString
 		var raw string
-		if err := rows.Scan(&entry.Cursor, &raw); err != nil {
+		if err := rows.Scan(&entry.Cursor, &project, &raw); err != nil {
 			return SystemEventPage{}, fmt.Errorf("scan system event: %w", err)
 		}
 		if err := json.Unmarshal([]byte(raw), &entry.Event); err != nil {
 			return SystemEventPage{}, fmt.Errorf("decode system event envelope: %w", err)
+		}
+		if entry.Event.ProjectID == "" && project.Valid {
+			entry.Event.ProjectID = project.String
 		}
 		entries = append(entries, entry)
 	}
@@ -731,20 +1229,24 @@ func (s *Store) listEventsWhere(ctx context.Context, where string, args []any) (
 }
 
 func (s *Store) listEventsWhereOrdered(ctx context.Context, where string, args []any, orderBy string) ([]event.Event, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT envelope_json FROM events WHERE `+where+` ORDER BY `+orderBy, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT project_id, envelope_json FROM events WHERE `+where+` ORDER BY `+orderBy, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list events: %w", err)
 	}
 	defer rows.Close()
 	var events []event.Event
 	for rows.Next() {
+		var project sql.NullString
 		var raw string
-		if err := rows.Scan(&raw); err != nil {
+		if err := rows.Scan(&project, &raw); err != nil {
 			return nil, fmt.Errorf("scan event: %w", err)
 		}
 		var ev event.Event
 		if err := json.Unmarshal([]byte(raw), &ev); err != nil {
 			return nil, fmt.Errorf("decode event envelope: %w", err)
+		}
+		if ev.ProjectID == "" && project.Valid {
+			ev.ProjectID = project.String
 		}
 		events = append(events, ev)
 	}
@@ -752,7 +1254,7 @@ func (s *Store) listEventsWhereOrdered(ctx context.Context, where string, args [
 }
 
 func (s *Store) ListArtifacts(ctx context.Context, runID string) ([]Artifact, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, kind, media_type, path, created_at FROM artifacts WHERE run_id = ? ORDER BY created_at ASC`, runID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, run_id, task_id, kind, media_type, path, created_at FROM artifacts WHERE run_id = ? ORDER BY created_at ASC`, runID)
 	if err != nil {
 		return nil, fmt.Errorf("list artifacts: %w", err)
 	}
@@ -760,7 +1262,7 @@ func (s *Store) ListArtifacts(ctx context.Context, runID string) ([]Artifact, er
 	var artifacts []Artifact
 	for rows.Next() {
 		var artifact Artifact
-		if err := rows.Scan(&artifact.ID, &artifact.RunID, &artifact.Kind, &artifact.MediaType, &artifact.Path, &artifact.CreatedAt); err != nil {
+		if err := rows.Scan(&artifact.ID, &artifact.ProjectID, &artifact.RunID, &artifact.TaskID, &artifact.Kind, &artifact.MediaType, &artifact.Path, &artifact.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan artifact: %w", err)
 		}
 		artifacts = append(artifacts, artifact)
@@ -769,10 +1271,6 @@ func (s *Store) ListArtifacts(ctx context.Context, runID string) ([]Artifact, er
 }
 
 func (s *Store) RunBundle(ctx context.Context, runID string) (RunBundle, error) {
-	run, err := s.GetRun(ctx, runID)
-	if err != nil {
-		return RunBundle{}, err
-	}
 	wr, err := s.GetWorkflowRun(ctx, runID)
 	if err != nil {
 		return RunBundle{}, err
@@ -789,7 +1287,7 @@ func (s *Store) RunBundle(ctx context.Context, runID string) (RunBundle, error) 
 	if err != nil {
 		return RunBundle{}, err
 	}
-	return RunBundle{Run: run, Task: wr.Task, Attempt: wr.Attempt, Stages: stages, Events: events, Artifacts: artifacts}, nil
+	return RunBundle{Project: wr.Project, Run: wr.Run, Task: wr.Task, Attempt: wr.Attempt, Stages: stages, Events: events, Artifacts: artifacts}, nil
 }
 
 func (s *Store) SaveWorkflowSnapshot(ctx context.Context, runID string, snapshot any) error {
@@ -797,7 +1295,11 @@ func (s *Store) SaveWorkflowSnapshot(ctx context.Context, runID string, snapshot
 	if err != nil {
 		return fmt.Errorf("marshal workflow snapshot: %w", err)
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO workflow_snapshots(run_id, snapshot_json, created_at) VALUES (?, ?, ?)`, runID, string(content), nowRFC3339())
+	projectID, taskID, err := s.runProjectTask(ctx, runID)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO workflow_snapshots(project_id, run_id, task_id, snapshot_json, created_at) VALUES (?, ?, ?, ?, ?)`, projectID, runID, taskID, string(content), nowRFC3339())
 	if err != nil {
 		return fmt.Errorf("insert workflow snapshot: %w", err)
 	}
@@ -868,11 +1370,76 @@ func eventScope(ev event.Event) string {
 	if strings.HasPrefix(ev.Type, "runner.") && ev.Actor.ID != "" {
 		return "runner:" + ev.Actor.ID
 	}
+	if ev.ProjectID != "" {
+		return "project:" + ev.ProjectID
+	}
 	return "system"
 }
 
-func (s *Store) artifactPath(id, ext string) string {
-	return filepath.Join(s.artifactDir, id+ext)
+func (s *Store) runProjectTask(ctx context.Context, runID string) (string, string, error) {
+	var projectID, taskID string
+	if err := s.db.QueryRowContext(ctx, `SELECT project_id, task_id FROM runs WHERE id = ?`, runID).Scan(&projectID, &taskID); err != nil {
+		return "", "", fmt.Errorf("get run project/task: %w", err)
+	}
+	return projectID, taskID, nil
+}
+
+func (s *Store) runArtifactContext(ctx context.Context, runID string) (string, string, string, error) {
+	var projectID, taskID, workspacePath string
+	err := s.db.QueryRowContext(ctx, `SELECT r.project_id, r.task_id, w.path FROM runs r JOIN workspaces w ON w.project_id = r.project_id WHERE r.id = ?`, runID).Scan(&projectID, &taskID, &workspacePath)
+	if err != nil {
+		return "", "", "", fmt.Errorf("get artifact project context: %w", err)
+	}
+	return projectID, taskID, workspacePath, nil
+}
+
+func defaultWorkspacePath(dataDir, projectID string) string {
+	if dataDir == "" {
+		dataDir = ".parley-data"
+	}
+	if projectID == "" {
+		projectID = DefaultProjectID
+	}
+	return filepath.Join(dataDir, "projects", projectID, "workspace")
+}
+
+func ensureWorkspaceDirs(workspacePath string) error {
+	for _, path := range []string{workspacePath, filepath.Join(workspacePath, "artifacts"), filepath.Join(workspacePath, "drafts"), filepath.Join(workspacePath, "memory")} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return fmt.Errorf("create workspace dir %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func artifactPathForWorkspace(workspacePath, id, ext string) string {
+	return filepath.Join(workspacePath, "artifacts", id+ext)
+}
+
+func schemaWithoutIndexes(schema string) string {
+	lines := strings.Split(schema, "\n")
+	kept := lines[:0]
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "CREATE INDEX") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+func defaultRepositoryID(projectID string) string {
+	if projectID == "" || projectID == DefaultProjectID {
+		return DefaultRepositoryID
+	}
+	return "repo_" + projectID
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func rollback(tx *sql.Tx) { _ = tx.Rollback() }

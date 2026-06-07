@@ -150,7 +150,10 @@ func (a Validation) Prepare(disp contract.Dispatch) (ValidationPreparedRun, erro
 	if a.opts.DataRoot == "" {
 		return ValidationPreparedRun{}, fmt.Errorf("validation data root is required")
 	}
-	projectID := a.opts.ProjectID
+	projectID := disp.ProjectID
+	if projectID == "" {
+		projectID = a.opts.ProjectID
+	}
 	if projectID == "" {
 		projectID = "default"
 	}

@@ -202,12 +202,15 @@ func TestRunCommitUsesImplementationDiffArtifact(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	defer st.Close()
-	wr, err := st.CreateWorkflowRun(ctx, "record the clean diff")
+	dataRoot := t.TempDir()
+	projectID := "p1"
+	if _, err := st.EnsureProject(ctx, store.ProjectSpec{ID: projectID, Name: "p1", QueueAutoWhenReady: true, QueueMaxConcurrent: 1, QueueBacklogCap: 100}); err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunForProject(ctx, projectID, "record the clean diff")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
-	dataRoot := t.TempDir()
-	projectID := "p1"
 	source := initCommitSourceRepo(t, ctx, map[string]string{"main.go": "package main\n\nfunc main() {}\n"})
 	wt, err := rworktree.Create(ctx, rworktree.CreateOptions{
 		DataRoot:   dataRoot,
