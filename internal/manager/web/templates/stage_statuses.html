@@ -6,6 +6,7 @@
       <strong>{{.StageType}}</strong>
       {{if .Adapter}}<span class="muted">adapter: {{.Adapter}}</span>{{else}}<span class="muted">actor: harness</span>{{end}}
       <span class="pill {{statusClass .Status}}">{{.Status}}</span>
+      {{if .StageBriefArtifactID}}<span class="muted">brief: <a href="/artifacts/{{.StageBriefArtifactID}}">{{short .StageBriefArtifactID}}</a></span>{{end}}
       <br><small>{{.ID}}</small>
     </li>
     {{end}}

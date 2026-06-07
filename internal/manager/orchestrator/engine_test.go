@@ -1,8 +1,12 @@
 package orchestrator
 
 import (
+	"context"
+	"strings"
 	"testing"
 
+	"github.com/agent-parley/parley/internal/manager/store"
+	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
 
@@ -30,3 +34,69 @@ func TestCompletionEventType(t *testing.T) {
 		})
 	}
 }
+
+func TestDispatchStagePersistsStageBriefAndPassesItToRunner(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRun(ctx, "build a bounded brief")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	runner := &capturingRunner{}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	rep, err := engine.dispatchStage(ctx, wr, wr.ImplementationStage, "capture", contract.StageTypeImplementation, implementationInput(wr, report.Report{}))
+	if err != nil {
+		t.Fatalf("dispatchStage() error = %v", err)
+	}
+	if rep.Status != report.StatusCompleted {
+		t.Fatalf("status = %s", rep.Status)
+	}
+	briefID, _ := runner.disp.Input["stage_brief_artifact_id"].(string)
+	if briefID == "" {
+		t.Fatalf("dispatch input missing stage brief artifact id: %+v", runner.disp.Input)
+	}
+	briefText, _ := runner.disp.Input["stage_brief_markdown"].(string)
+	if !strings.Contains(briefText, "# Stage brief") || !strings.Contains(briefText, "## Source: workflow_snapshot") {
+		t.Fatalf("dispatch input missing source-labeled Stage brief:\n%s", briefText)
+	}
+	stages, err := st.ListStages(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	for _, stage := range stages {
+		if stage.ID == wr.ImplementationStage.ID {
+			if stage.StageBriefArtifactID != briefID {
+				t.Fatalf("stage brief ref = %s, want %s", stage.StageBriefArtifactID, briefID)
+			}
+			return
+		}
+	}
+	t.Fatal("implementation stage not found")
+}
+
+type capturingRunner struct {
+	disp contract.Dispatch
+}
+
+func (r *capturingRunner) Dispatch(_ context.Context, disp contract.Dispatch) (report.Report, error) {
+	r.disp = disp
+	return report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         disp.RunID,
+		TaskID:        disp.TaskID,
+		AttemptID:     disp.AttemptID,
+		StageID:       disp.StageID,
+		StageType:     disp.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: disp.Adapter},
+		Status:        report.StatusCompleted,
+		Summary:       "captured dispatch",
+		Payload:       map[string]any{},
+		Errors:        []string{},
+	}, nil
+}
+
+func (r *capturingRunner) CancelAttempt(context.Context, string, string, string) error { return nil }

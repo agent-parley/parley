@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/agent-parley/parley/internal/manager/contextpack"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/runner/worktree"
 	"github.com/agent-parley/parley/internal/shared/contract"
@@ -84,6 +85,7 @@ type Engine struct {
 	gitAuthorName         string
 	gitAuthorEmail        string
 	gitExecutable         string
+	contextAssembler      *contextpack.Assembler
 }
 
 type EngineOptions struct {
@@ -96,6 +98,7 @@ type EngineOptions struct {
 	GitExecutable         string
 	QueuePolicy           *QueuePolicy
 	RunnerSlots           int
+	ContextAssembler      *contextpack.Assembler
 }
 
 type workerSnapshot struct {
@@ -150,6 +153,10 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 	if runnerSlots <= 0 {
 		runnerSlots = 1
 	}
+	contextAssembler := opts.ContextAssembler
+	if contextAssembler == nil {
+		contextAssembler = contextpack.NewAssembler(contextpack.Options{})
+	}
 	return &Engine{
 		store:                 st,
 		runner:                runner,
@@ -169,6 +176,7 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 		gitAuthorName:         opts.GitAuthorName,
 		gitAuthorEmail:        opts.GitAuthorEmail,
 		gitExecutable:         opts.GitExecutable,
+		contextAssembler:      contextAssembler,
 	}
 }
 
@@ -749,6 +757,11 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 
 func (e *Engine) runIdeaIntake(ctx context.Context, wr store.WorkflowRun) (report.Report, error) {
 	stage := wr.IdeaIntakeStage
+	_, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
+	if err != nil {
+		return report.Report{}, err
+	}
+	stage.StageBriefArtifactID = briefArtifact.ID
 	if err := e.startStage(ctx, wr, stage, "idea_intake stage started"); err != nil {
 		return report.Report{}, err
 	}
@@ -789,11 +802,17 @@ func (e *Engine) runIdeaIntake(ctx context.Context, wr store.WorkflowRun) (repor
 }
 
 func (e *Engine) dispatchStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, adapterName, stageType string, input map[string]any) (report.Report, error) {
+	brief, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
+	if err != nil {
+		return report.Report{}, err
+	}
+	stage.StageBriefArtifactID = briefArtifact.ID
 	e.setActiveStage(wr.Run.ID, stage)
 	defer e.clearActiveStage(wr.Run.ID, stage.ID)
 	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
 		return report.Report{}, err
 	}
+	input = withStageBriefInput(input, brief, briefArtifact.ID)
 	disp := contract.Dispatch{
 		ProjectID:    wr.Run.ProjectID,
 		RepositoryID: wr.Task.RepositoryID,
@@ -835,6 +854,11 @@ func (e *Engine) dispatchStage(ctx context.Context, wr store.WorkflowRun, stage 
 
 func (e *Engine) runCommit(ctx context.Context, wr store.WorkflowRun, validationReport report.Report, snapshot workerSnapshot, snapshotErr error) (report.Report, error) {
 	stage := wr.CommitStage
+	_, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
+	if err != nil {
+		return report.Report{}, err
+	}
+	stage.StageBriefArtifactID = briefArtifact.ID
 	if err := e.startStage(ctx, wr, stage, "commit stage started"); err != nil {
 		return report.Report{}, err
 	}
@@ -907,6 +931,11 @@ func (e *Engine) snapshotWorktree(ctx context.Context, wr store.WorkflowRun, imp
 
 func (e *Engine) runPRReady(ctx context.Context, wr store.WorkflowRun, commitReport report.Report) (report.Report, error) {
 	stage := wr.PRReadyStage
+	_, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
+	if err != nil {
+		return report.Report{}, err
+	}
+	stage.StageBriefArtifactID = briefArtifact.ID
 	if err := e.startStage(ctx, wr, stage, "pr_ready stage started"); err != nil {
 		return report.Report{}, err
 	}
@@ -939,12 +968,84 @@ func (e *Engine) runPRReady(ctx context.Context, wr store.WorkflowRun, commitRep
 	return rep, nil
 }
 
+func (e *Engine) prepareStageBrief(ctx context.Context, wr store.WorkflowRun, stage store.Stage) (contextpack.StageBrief, store.Artifact, error) {
+	bundle, err := e.store.RunBundle(ctx, wr.Run.ID)
+	if err != nil {
+		return contextpack.StageBrief{}, store.Artifact{}, err
+	}
+	repositoryPath, repositoryWarnings := e.repositoryPathForStage(ctx, wr, stage)
+	brief, err := e.contextAssembler.Assemble(ctx, contextpack.Request{
+		Project:            bundle.Project,
+		Run:                bundle.Run,
+		Task:               bundle.Task,
+		Attempt:            bundle.Attempt,
+		Stages:             bundle.Stages,
+		Events:             bundle.Events,
+		Artifacts:          bundle.Artifacts,
+		CurrentStage:       stage,
+		RepositoryPath:     repositoryPath,
+		RepositoryWarnings: repositoryWarnings,
+		ReadArtifact: func(ctx context.Context, artifactID string) ([]byte, error) {
+			_, content, err := e.store.GetArtifact(ctx, artifactID)
+			return content, err
+		},
+	})
+	if err != nil {
+		return contextpack.StageBrief{}, store.Artifact{}, err
+	}
+	artifact, err := e.store.SaveArtifact(ctx, wr.Run.ID, "stage_brief", "text/markdown", []byte(contextpack.Markdown(brief)), ".md")
+	if err != nil {
+		return contextpack.StageBrief{}, store.Artifact{}, err
+	}
+	if err := e.store.UpdateStageBriefArtifactID(ctx, stage.ID, artifact.ID); err != nil {
+		return contextpack.StageBrief{}, store.Artifact{}, err
+	}
+	return brief, artifact, nil
+}
+
+func (e *Engine) repositoryPathForStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage) (string, []string) {
+	var warnings []string
+	if stage.StageType != contract.StageTypeImplementation && e.dataRoot != "" {
+		worktreePath, err := worktree.Locate(e.dataRoot, wr.Run.ProjectID, wr.Run.ID, wr.Task.ID, wr.Attempt.ID)
+		if err == nil {
+			return worktreePath, nil
+		}
+		warnings = append(warnings, "worktree repo evidence unavailable: "+err.Error())
+	}
+	if wr.Task.RepositoryID == "" {
+		return "", warnings
+	}
+	repo, err := e.store.GetRepository(ctx, wr.Task.RepositoryID)
+	if err != nil {
+		warnings = append(warnings, "repository metadata unavailable: "+err.Error())
+		return "", warnings
+	}
+	return repo.Path, warnings
+}
+
+func withStageBriefInput(input map[string]any, brief contextpack.StageBrief, artifactID string) map[string]any {
+	out := map[string]any{}
+	for key, value := range input {
+		out[key] = value
+	}
+	markdown := contextpack.Markdown(brief)
+	out["stage_brief_artifact_id"] = artifactID
+	out["stage_brief"] = brief
+	out["stage_brief_markdown"] = markdown
+	out["curated_context"] = markdown
+	return out
+}
+
 func (e *Engine) startStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, summary string) error {
 	e.setActiveStage(wr.Run.ID, stage)
 	if err := e.store.UpdateStageStatus(ctx, stage.ID, store.StageStatusRunning); err != nil {
 		return err
 	}
-	_, err := e.emit(ctx, stageEvent(wr, stage, "stage.started", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, summary, nil))
+	data := map[string]any{}
+	if stage.StageBriefArtifactID != "" {
+		data["stage_brief_artifact_id"] = stage.StageBriefArtifactID
+	}
+	_, err := e.emit(ctx, stageEvent(wr, stage, "stage.started", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, summary, data))
 	return err
 }
 
@@ -977,6 +1078,9 @@ func (e *Engine) completeStage(ctx context.Context, wr store.WorkflowRun, stage 
 		"stage_type":         stage.StageType,
 		"status":             rep.Status,
 		"report_artifact_id": artifact.ID,
+	}
+	if stage.StageBriefArtifactID != "" {
+		data["stage_brief_artifact_id"] = stage.StageBriefArtifactID
 	}
 	copyPayloadStrings(data, rep.Payload, "branch", "commit_sha", "diff_artifact_id", "task_contract_artifact_id")
 	if typ := completionEventType(rep); typ != "" {

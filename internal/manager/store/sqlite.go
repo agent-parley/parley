@@ -123,16 +123,17 @@ type Attempt struct {
 }
 
 type Stage struct {
-	ID        string
-	ProjectID string
-	RunID     string
-	TaskID    string
-	AttemptID string
-	StageType string
-	Adapter   string
-	Status    string
-	CreatedAt string
-	UpdatedAt string
+	ID                   string
+	ProjectID            string
+	RunID                string
+	TaskID               string
+	AttemptID            string
+	StageType            string
+	Adapter              string
+	Status               string
+	StageBriefArtifactID string
+	CreatedAt            string
+	UpdatedAt            string
 }
 
 type Artifact struct {
@@ -235,6 +236,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureProjectWorkflowSchema(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureStageBriefSchema(ctx); err != nil {
 		return err
 	}
 	if err := s.ensureRunnerRegistrySchema(ctx); err != nil {
@@ -387,6 +391,17 @@ func (s *Store) DefaultRepositoryID(ctx context.Context, projectID string) (stri
 	return repositoryID, nil
 }
 
+func (s *Store) GetRepository(ctx context.Context, repositoryID string) (Repository, error) {
+	var repo Repository
+	var isDefault int
+	err := s.db.QueryRowContext(ctx, `SELECT id, project_id, name, path, is_default, created_at, updated_at FROM repositories WHERE id = ?`, repositoryID).Scan(&repo.ID, &repo.ProjectID, &repo.Name, &repo.Path, &isDefault, &repo.CreatedAt, &repo.UpdatedAt)
+	if err != nil {
+		return Repository{}, fmt.Errorf("get repository %s: %w", repositoryID, err)
+	}
+	repo.IsDefault = isDefault != 0
+	return repo, nil
+}
+
 func (s *Store) ensureRunnerRegistrySchema(ctx context.Context) error {
 	cols, err := s.tableColumns(ctx, "runner_registry")
 	if err != nil {
@@ -505,6 +520,20 @@ func (s *Store) ensureProjectWorkflowSchema(ctx context.Context) error {
 		}
 	}
 	return s.rebuildWorkflowTablesForProjects(ctx)
+}
+
+func (s *Store) ensureStageBriefSchema(ctx context.Context) error {
+	cols, err := s.tableColumns(ctx, "stages")
+	if err != nil {
+		return err
+	}
+	if _, ok := cols["stage_brief_artifact_id"]; ok {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE stages ADD COLUMN stage_brief_artifact_id TEXT REFERENCES artifacts(id)`); err != nil {
+		return fmt.Errorf("add stage brief artifact column: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) rebuildWorkflowTablesForProjects(ctx context.Context) error {
@@ -636,6 +665,7 @@ func createWorkflowTablesTx(ctx context.Context, tx *sql.Tx) error {
   stage_type TEXT NOT NULL,
   adapter TEXT,
   status TEXT NOT NULL,
+  stage_brief_artifact_id TEXT REFERENCES artifacts(id),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY(project_id, run_id, attempt_id) REFERENCES attempts(project_id, run_id, id),
@@ -903,11 +933,11 @@ func (s *Store) GetWorkflowRun(ctx context.Context, runID string) (WorkflowRun, 
 }
 
 func (s *Store) ListStages(ctx context.Context, runID string) ([]Stage, error) {
-	return s.listStages(ctx, `SELECT id, project_id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, created_at, updated_at FROM stages WHERE run_id = ? ORDER BY created_at ASC`, runID)
+	return s.listStages(ctx, `SELECT id, project_id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, COALESCE(stage_brief_artifact_id,''), created_at, updated_at FROM stages WHERE run_id = ? ORDER BY created_at ASC`, runID)
 }
 
 func (s *Store) ListStagesForAttempt(ctx context.Context, runID, attemptID string) ([]Stage, error) {
-	return s.listStages(ctx, `SELECT id, project_id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, created_at, updated_at FROM stages WHERE run_id = ? AND attempt_id = ? ORDER BY created_at ASC`, runID, attemptID)
+	return s.listStages(ctx, `SELECT id, project_id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, COALESCE(stage_brief_artifact_id,''), created_at, updated_at FROM stages WHERE run_id = ? AND attempt_id = ? ORDER BY created_at ASC`, runID, attemptID)
 }
 
 func (s *Store) listStages(ctx context.Context, query string, args ...any) ([]Stage, error) {
@@ -919,7 +949,7 @@ func (s *Store) listStages(ctx context.Context, query string, args ...any) ([]St
 	var stages []Stage
 	for rows.Next() {
 		var stage Stage
-		if err := rows.Scan(&stage.ID, &stage.ProjectID, &stage.RunID, &stage.TaskID, &stage.AttemptID, &stage.StageType, &stage.Adapter, &stage.Status, &stage.CreatedAt, &stage.UpdatedAt); err != nil {
+		if err := rows.Scan(&stage.ID, &stage.ProjectID, &stage.RunID, &stage.TaskID, &stage.AttemptID, &stage.StageType, &stage.Adapter, &stage.Status, &stage.StageBriefArtifactID, &stage.CreatedAt, &stage.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan stage: %w", err)
 		}
 		stages = append(stages, stage)
@@ -980,6 +1010,14 @@ func (s *Store) UpdateStageAdapter(ctx context.Context, stageID, adapter string)
 	_, err := s.db.ExecContext(ctx, `UPDATE stages SET adapter = ?, updated_at = ? WHERE id = ?`, adapter, nowRFC3339(), stageID)
 	if err != nil {
 		return fmt.Errorf("update stage adapter: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) UpdateStageBriefArtifactID(ctx context.Context, stageID, artifactID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE stages SET stage_brief_artifact_id = ?, updated_at = ? WHERE id = ?`, artifactID, nowRFC3339(), stageID)
+	if err != nil {
+		return fmt.Errorf("update stage brief artifact: %w", err)
 	}
 	return nil
 }

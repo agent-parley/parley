@@ -56,6 +56,9 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	defer st.Close()
+	if _, err := st.EnsureProject(ctx, store.ProjectSpec{ID: projectID, Name: "p1", RepositoryPath: source, QueueAutoWhenReady: true, QueueMaxConcurrent: 1, QueueBacklogCap: 100}); err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
 	renderer, err := web.NewRenderer()
 	if err != nil {
 		t.Fatalf("renderer: %v", err)
@@ -90,8 +93,18 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 		if stage.Status != store.RunStatusCompleted {
 			t.Fatalf("stage not completed: %+v", stage)
 		}
+		if stage.StageBriefArtifactID == "" {
+			t.Fatalf("stage missing Stage brief reference: %+v", stage)
+		}
+		_, content, err := st.GetArtifact(ctx, stage.StageBriefArtifactID)
+		if err != nil {
+			t.Fatalf("read stage brief %s: %v", stage.StageBriefArtifactID, err)
+		}
+		if !strings.Contains(string(content), "# Stage brief") || !strings.Contains(string(content), "## Source: workflow_snapshot") {
+			t.Fatalf("stage brief missing source-labeled content:\n%s", content)
+		}
 	}
-	var reportArtifacts, diffArtifacts, contractArtifacts int
+	var reportArtifacts, diffArtifacts, contractArtifacts, stageBriefArtifacts int
 	for _, artifact := range bundle.Artifacts {
 		switch artifact.Kind {
 		case "report":
@@ -100,6 +113,8 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 			diffArtifacts++
 		case "task_contract":
 			contractArtifacts++
+		case "stage_brief":
+			stageBriefArtifacts++
 		}
 	}
 	if reportArtifacts != 5 {
@@ -110,6 +125,9 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 	}
 	if contractArtifacts != 1 {
 		t.Fatalf("expected 1 task contract artifact, got %d", contractArtifacts)
+	}
+	if stageBriefArtifacts != 5 {
+		t.Fatalf("expected 5 stage brief artifacts, got %d", stageBriefArtifacts)
 	}
 	var completedEvent bool
 	for _, ev := range bundle.Events {
