@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The Makefile exports GOTOOLCHAIN=auto for local compatibility, but CI installs
+# Go 1.26 explicitly so every fast job uses the module's declared toolchain.
+jobs:
+  build:
+    name: make build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Run build
+        run: make build
+
+  vet:
+    name: make vet
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Run vet
+        run: make vet
+
+  test:
+    name: make test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Run tests
+        run: make test
+
+  integration:
+    name: make test-integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Run integration-tagged tests
+        run: make test-integration
+
+  race:
+    name: make test-race
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Install cgo toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Run race tests
+        run: |
+          set +e
+          make test-race 2>&1 | tee "${RUNNER_TEMP}/test-race.log"
+          status="${PIPESTATUS[0]}"
+          if [ "${status}" -ne 0 ]; then
+            {
+              echo "### make test-race failure"
+              echo '```'
+              tail -n 60 "${RUNNER_TEMP}/test-race.log"
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+
+            message="$(tail -n 60 "${RUNNER_TEMP}/test-race.log")"
+            message="${message//'%'/'%25'}"
+            message="${message//$'\r'/'%0D'}"
+            message="${message//$'\n'/'%0A'}"
+            echo "::error title=make test-race failed::${message}"
+            exit "${status}"
+          fi
