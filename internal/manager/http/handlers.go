@@ -22,27 +22,32 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method", http.StatusMethodNotAllowed)
 		return
 	}
-	runs, err := s.store.ListRuns(r.Context())
+	data, err := s.indexData(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	s.writePage(w, "index.html", data)
+}
+
+func (s *Server) indexData(r *http.Request) (web.IndexData, error) {
+	runs, err := s.store.ListRuns(r.Context())
+	if err != nil {
+		return web.IndexData{}, err
 	}
 	runners, err := s.store.ListRunners(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return web.IndexData{}, err
 	}
 	runnerEventPage, err := s.store.ListSystemEventsPage(r.Context(), parseInt64Query(r, "runner_events_before"), 50)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return web.IndexData{}, err
 	}
 	queueState, err := s.engine.QueueState(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return web.IndexData{}, err
 	}
-	s.writePage(w, "index.html", web.IndexData{Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, Queue: web.NewQueueView(queueState), CSRF: csrfFromContext(r.Context()), Title: "Parley"})
+	return web.IndexData{Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, Queue: web.NewQueueView(queueState), CSRF: csrfFromContext(r.Context()), Title: "Parley"}, nil
 }
 
 func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
@@ -63,7 +68,13 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var backlogErr orchestrator.QueueBacklogFullError
 		if errors.As(err, &backlogErr) {
-			http.Error(w, err.Error(), http.StatusTooManyRequests)
+			data, pageErr := s.indexData(r)
+			if pageErr != nil {
+				http.Error(w, pageErr.Error(), http.StatusInternalServerError)
+				return
+			}
+			data.Notice = backlogFullNotice(backlogErr, data.Queue)
+			s.writePageStatus(w, "index.html", data, http.StatusTooManyRequests)
 			return
 		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -239,7 +250,27 @@ func parseInt64Query(r *http.Request, key string) int64 {
 	return n
 }
 
+func backlogFullNotice(backlogErr orchestrator.QueueBacklogFullError, queue web.QueueView) *web.Notice {
+	return &web.Notice{
+		Title: "Queue is full",
+		Message: fmt.Sprintf(
+			"%d pending runs are already waiting, which reaches backlog_cap %d. Effective policy: auto_when_ready=%t, max_concurrent=%d (effective %d), ready_slots=%d/%d.",
+			backlogErr.Pending,
+			backlogErr.Cap,
+			queue.AutoWhenReady,
+			queue.MaxConcurrent,
+			queue.EffectiveMaxConcurrent,
+			queue.ReadyRunnerSlots,
+			queue.RunnerSlots,
+		),
+	}
+}
+
 func (s *Server) writePage(w http.ResponseWriter, name string, data any) {
+	s.writePageStatus(w, name, data, http.StatusOK)
+}
+
+func (s *Server) writePageStatus(w http.ResponseWriter, name string, data any, status int) {
 	html, err := s.renderer.ExecutePage(name, data)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -247,5 +278,6 @@ func (s *Server) writePage(w http.ResponseWriter, name string, data any) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(len(html)))
+	w.WriteHeader(status)
 	_, _ = w.Write([]byte(html))
 }

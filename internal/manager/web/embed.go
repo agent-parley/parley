@@ -29,8 +29,14 @@ type IndexData struct {
 	Runners         []store.Runner
 	RunnerEventPage store.SystemEventPage
 	Queue           QueueView
+	Notice          *Notice
 	CSRF            string
 	Title           string
+}
+
+type Notice struct {
+	Title   string
+	Message string
 }
 
 type QueueView struct {

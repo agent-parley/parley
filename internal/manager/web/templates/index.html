@@ -10,6 +10,12 @@
 <body>
   <main>
     <header><h1>Parley</h1><p>Local-first manager control plane.</p></header>
+    {{with .Notice}}
+    <section class="notice" role="status" aria-live="polite">
+      <strong>{{.Title}}</strong>
+      <p>{{.Message}}</p>
+    </section>
+    {{end}}
     <section class="card">
       <h2>New run</h2>
       <form method="post" action="/runs">
