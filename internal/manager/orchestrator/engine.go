@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -139,7 +140,7 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 	}
 	projectID := opts.ProjectID
 	if projectID == "" {
-		projectID = "default"
+		projectID = store.DefaultProjectID
 	}
 	queuePolicy := defaultQueuePolicy()
 	if opts.QueuePolicy != nil {
@@ -172,18 +173,25 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 }
 
 func (e *Engine) StartRun(ctx context.Context, idea string) (string, error) {
+	return e.StartProjectRun(ctx, e.projectID, idea)
+}
+
+func (e *Engine) StartProjectRun(ctx context.Context, projectID, idea string) (string, error) {
+	if projectID == "" {
+		projectID = e.projectID
+	}
 	e.queueMu.Lock()
-	pending, err := e.store.CountRunsByStatus(ctx, store.RunStatusPending)
+	pending, err := e.store.CountRunsByProjectStatus(ctx, projectID, store.RunStatusPending)
 	if err != nil {
 		e.queueMu.Unlock()
 		return "", err
 	}
 	if pending >= e.queuePolicy.BacklogCap {
-		_ = e.emitQueueEvent(ctx, "queue.rejected_backlog_full", "queue backlog full", map[string]any{"pending": pending, "backlog_cap": e.queuePolicy.BacklogCap})
+		_ = e.emitQueueEvent(ctx, projectID, "queue.rejected_backlog_full", "queue backlog full", map[string]any{"pending": pending, "backlog_cap": e.queuePolicy.BacklogCap})
 		e.queueMu.Unlock()
 		return "", QueueBacklogFullError{Pending: pending, Cap: e.queuePolicy.BacklogCap}
 	}
-	wr, err := e.createQueuedRun(ctx, idea)
+	wr, err := e.createQueuedRun(ctx, projectID, idea)
 	if err != nil {
 		e.queueMu.Unlock()
 		return "", err
@@ -192,7 +200,7 @@ func (e *Engine) StartRun(ctx context.Context, idea string) (string, error) {
 		e.queueMu.Unlock()
 		return "", err
 	}
-	if err := e.emitQueueEvent(ctx, "queue.enqueued", "run enqueued", map[string]any{"run_id": wr.Run.ID, "pending": pending + 1, "backlog_cap": e.queuePolicy.BacklogCap}); err != nil {
+	if err := e.emitQueueEvent(ctx, projectID, "queue.enqueued", "run enqueued", map[string]any{"project_id": projectID, "run_id": wr.Run.ID, "pending": pending + 1, "backlog_cap": e.queuePolicy.BacklogCap}); err != nil {
 		e.queueMu.Unlock()
 		return "", err
 	}
@@ -207,8 +215,16 @@ func (e *Engine) StartRun(ctx context.Context, idea string) (string, error) {
 	return wr.Run.ID, nil
 }
 
-func (e *Engine) createQueuedRun(ctx context.Context, idea string) (store.WorkflowRun, error) {
-	wr, err := e.store.CreateWorkflowRun(ctx, idea)
+func (e *Engine) createQueuedRun(ctx context.Context, projectID, idea string) (store.WorkflowRun, error) {
+	if _, err := e.store.GetProject(ctx, projectID); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return store.WorkflowRun{}, err
+		}
+		if _, err := e.store.EnsureProject(ctx, store.ProjectSpec{ID: projectID, Name: projectID, QueueAutoWhenReady: e.queuePolicy.AutoWhenReady, QueueMaxConcurrent: e.queuePolicy.MaxConcurrent, QueueBacklogCap: e.queuePolicy.BacklogCap}); err != nil {
+			return store.WorkflowRun{}, err
+		}
+	}
+	wr, err := e.store.CreateWorkflowRunForProject(ctx, projectID, idea)
 	if err != nil {
 		return store.WorkflowRun{}, err
 	}
@@ -275,7 +291,7 @@ func (e *Engine) cancelQueuedRunLocked(ctx context.Context, wr store.WorkflowRun
 }
 
 func (e *Engine) QueueState(ctx context.Context) (QueueState, error) {
-	pending, err := e.store.CountRunsByStatus(ctx, store.RunStatusPending)
+	pending, err := e.store.CountRunsByProjectStatus(ctx, e.projectID, store.RunStatusPending)
 	if err != nil {
 		return QueueState{}, err
 	}
@@ -396,7 +412,8 @@ func (e *Engine) dispatchRunLocked(ctx context.Context, runID, trigger string) e
 	if available <= 0 {
 		return ErrNoRunnerSlots
 	}
-	queueEvent := newQueueEvent("queue.dispatched", "queued run dispatched", map[string]any{"run_id": run.ID, "trigger": trigger, "max_concurrent": e.queuePolicy.MaxConcurrent, "runner_slots": e.runnerSlots})
+	queueEvent := newQueueEvent("queue.dispatched", "queued run dispatched", map[string]any{"project_id": run.ProjectID, "run_id": run.ID, "trigger": trigger, "max_concurrent": e.queuePolicy.MaxConcurrent, "runner_slots": e.runnerSlots})
+	queueEvent.ProjectID = run.ProjectID
 	persisted, changed, err := e.store.UpdateRunStatusFromAndAppendSystemEvent(ctx, run.ID, store.RunStatusPending, store.RunStatusRunning, queueEvent)
 	if err != nil {
 		return err
@@ -449,8 +466,13 @@ func (e *Engine) readyRunnerSlots() int {
 	return e.runnerSlots
 }
 
-func (e *Engine) emitQueueEvent(ctx context.Context, typ, summary string, data map[string]any) error {
-	_, err := e.emit(ctx, newQueueEvent(typ, summary, data))
+func (e *Engine) emitQueueEvent(ctx context.Context, projectID, typ, summary string, data map[string]any) error {
+	ev := newQueueEvent(typ, summary, data)
+	ev.ProjectID = projectID
+	if ev.Data != nil && projectID != "" {
+		ev.Data["project_id"] = projectID
+	}
+	_, err := e.emit(ctx, ev)
 	return err
 }
 
@@ -773,13 +795,15 @@ func (e *Engine) dispatchStage(ctx context.Context, wr store.WorkflowRun, stage 
 		return report.Report{}, err
 	}
 	disp := contract.Dispatch{
-		RunID:     wr.Run.ID,
-		TaskID:    wr.Task.ID,
-		AttemptID: wr.Attempt.ID,
-		StageID:   stage.ID,
-		StageType: stageType,
-		Adapter:   adapterName,
-		Input:     input,
+		ProjectID:    wr.Run.ProjectID,
+		RepositoryID: wr.Task.RepositoryID,
+		RunID:        wr.Run.ID,
+		TaskID:       wr.Task.ID,
+		AttemptID:    wr.Attempt.ID,
+		StageID:      stage.ID,
+		StageType:    stageType,
+		Adapter:      adapterName,
+		Input:        input,
 	}
 	if stageType == contract.StageTypeImplementation {
 		if _, err := e.emit(ctx, stageEvent(wr, stage, "adapter.invocation_prepared", event.Actor{Kind: event.ActorKindAdapter, ID: adapterName}, "adapter invocation prepared", map[string]any{"adapter": adapterName})); err != nil {
@@ -866,7 +890,7 @@ func (e *Engine) runCommit(ctx context.Context, wr store.WorkflowRun, validation
 
 func (e *Engine) snapshotWorktree(ctx context.Context, wr store.WorkflowRun, implementationReport report.Report) (workerSnapshot, error) {
 	snapshot := workerSnapshot{DiffArtifactID: payloadString(implementationReport.Payload, "diff_artifact_id")}
-	worktreePath, err := worktree.Locate(e.dataRoot, e.projectID, wr.Run.ID, wr.Task.ID, wr.Attempt.ID)
+	worktreePath, err := worktree.Locate(e.dataRoot, wr.Run.ProjectID, wr.Run.ID, wr.Task.ID, wr.Attempt.ID)
 	if err != nil {
 		return snapshot, err
 	}
@@ -1053,6 +1077,9 @@ func (e *Engine) emit(ctx context.Context, ev event.Event) (event.Event, error) 
 func (e *Engine) workflowSnapshot(wr store.WorkflowRun, taskContractArtifactID string, frozen bool) map[string]any {
 	return map[string]any{
 		"schema_version":            1,
+		"project_id":                wr.Run.ProjectID,
+		"workspace_path":            wr.Project.WorkspacePath,
+		"repository_id":             wr.Task.RepositoryID,
 		"run_id":                    wr.Run.ID,
 		"task_id":                   wr.Task.ID,
 		"attempt_id":                wr.Attempt.ID,
@@ -1076,7 +1103,7 @@ func stageSnapshot(stage store.Stage) map[string]string {
 }
 
 func taskContractMarkdown(wr store.WorkflowRun) string {
-	return fmt.Sprintf("# Parley Task Contract\n\nRun ID: `%s`\nTask ID: `%s`\nAttempt ID: `%s`\n\n## User idea (verbatim)\n\n%s\n", wr.Run.ID, wr.Task.ID, wr.Attempt.ID, wr.Run.Idea)
+	return fmt.Sprintf("# Parley Task Contract\n\nProject ID: `%s`\nRun ID: `%s`\nTask ID: `%s`\nAttempt ID: `%s`\n\n## User idea (verbatim)\n\n%s\n", wr.Run.ProjectID, wr.Run.ID, wr.Task.ID, wr.Attempt.ID, wr.Run.Idea)
 }
 
 func implementationInput(wr store.WorkflowRun, ideaReport report.Report) map[string]any {
@@ -1127,7 +1154,7 @@ func commitFailureReport(wr store.WorkflowRun, stage store.Stage, err error, dif
 }
 
 func runEvent(wr store.WorkflowRun, typ string, actor event.Actor, summary string, data map[string]any) event.Event {
-	return event.Event{SchemaVersion: event.SchemaVersion, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, Type: typ, Actor: actor, Summary: summary, Data: data}
+	return event.Event{SchemaVersion: event.SchemaVersion, ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, Type: typ, Actor: actor, Summary: summary, Data: data}
 }
 
 func stageEvent(wr store.WorkflowRun, stage store.Stage, typ string, actor event.Actor, summary string, data map[string]any) event.Event {
@@ -1136,7 +1163,7 @@ func stageEvent(wr store.WorkflowRun, stage store.Stage, typ string, actor event
 	}
 	data["stage_id"] = stage.ID
 	data["stage_type"] = stage.StageType
-	return event.Event{SchemaVersion: event.SchemaVersion, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, Type: typ, Actor: actor, Summary: summary, Data: data}
+	return event.Event{SchemaVersion: event.SchemaVersion, ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, Type: typ, Actor: actor, Summary: summary, Data: data}
 }
 
 // completionEventType maps a stage report to the performer-family detail event

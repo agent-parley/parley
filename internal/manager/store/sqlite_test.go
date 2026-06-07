@@ -52,6 +52,45 @@ func TestStorePersistence(t *testing.T) {
 	}
 }
 
+func TestProjectWorkspaceAndNoOrphanWorkflowRecords(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	project, err := st.GetProject(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get default project: %v", err)
+	}
+	for _, child := range []string{"artifacts", "drafts", "memory"} {
+		if info, err := os.Stat(filepath.Join(project.WorkspacePath, child)); err != nil || !info.IsDir() {
+			t.Fatalf("workspace child %s stat=%v err=%v", child, info, err)
+		}
+	}
+	wr, err := st.CreateWorkflowRun(ctx, "project rooted")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if wr.Project.ID != DefaultProjectID || wr.Task.ProjectID != wr.Project.ID || wr.Run.ProjectID != wr.Project.ID || wr.Run.TaskID != wr.Task.ID || wr.Attempt.ProjectID != wr.Project.ID {
+		t.Fatalf("workflow not project-rooted: %+v", wr)
+	}
+	artifact, err := st.SaveArtifact(ctx, wr.Run.ID, "note", "text/plain", []byte("private"), ".txt")
+	if err != nil {
+		t.Fatalf("save artifact: %v", err)
+	}
+	if !strings.HasPrefix(artifact.Path, filepath.Join(project.WorkspacePath, "artifacts")) {
+		t.Fatalf("artifact path = %s, want under project workspace %s", artifact.Path, project.WorkspacePath)
+	}
+	if _, err := st.DB().ExecContext(ctx, `INSERT INTO tasks(id, project_id, idea, status, created_at, updated_at) VALUES ('task_orphan', 'missing_project', 'x', 'pending', 'now', 'now')`); err == nil {
+		t.Fatal("insert orphan task succeeded, want foreign-key failure")
+	}
+	if _, err := st.DB().ExecContext(ctx, `INSERT INTO runs(id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at) VALUES ('run_orphan', ?, 'missing_task', 'x', 'pending', 'artifact_orphan', 'now', 'now')`, wr.Project.ID); err == nil {
+		t.Fatal("insert orphan run succeeded, want foreign-key failure")
+	}
+}
+
 func TestRunlessRunnerEventPersistsWithNullRunIDAndScopedSequence(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(ctx, t.TempDir())
@@ -152,10 +191,18 @@ func TestMigrateLegacyEventsBackfillsRunScope(t *testing.T) {
 	}
 	legacy := `
 CREATE TABLE runs (id TEXT PRIMARY KEY, idea TEXT NOT NULL, status TEXT NOT NULL, event_log_artifact_id TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE tasks (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), idea TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE attempts (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), task_id TEXT NOT NULL REFERENCES tasks(id), status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE stages (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), task_id TEXT NOT NULL REFERENCES tasks(id), attempt_id TEXT NOT NULL REFERENCES attempts(id), stage_type TEXT NOT NULL, adapter TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE workflow_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id), snapshot_json TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE artifacts (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), kind TEXT NOT NULL, media_type TEXT NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE events (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), sequence INTEGER NOT NULL, timestamp TEXT NOT NULL, task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, type TEXT NOT NULL, actor_kind TEXT NOT NULL, actor_id TEXT NOT NULL, summary TEXT NOT NULL, data_json TEXT NOT NULL, envelope_json TEXT NOT NULL, UNIQUE(run_id, sequence));
 CREATE INDEX idx_events_run_sequence ON events(run_id, sequence);
 INSERT INTO runs(id, idea, status, event_log_artifact_id, created_at, updated_at) VALUES ('run_legacy', 'idea', 'running', 'artifact_log', '2026-06-04T00:00:00Z', '2026-06-04T00:00:00Z');
+INSERT INTO tasks(id, run_id, idea, status, created_at, updated_at) VALUES ('task_legacy', 'run_legacy', 'idea', 'running', '2026-06-04T00:00:00Z', '2026-06-04T00:00:00Z');
+INSERT INTO attempts(id, run_id, task_id, status, created_at, updated_at) VALUES ('attempt_legacy', 'run_legacy', 'task_legacy', 'running', '2026-06-04T00:00:00Z', '2026-06-04T00:00:00Z');
+INSERT INTO stages(id, run_id, task_id, attempt_id, stage_type, adapter, status, created_at, updated_at) VALUES ('stage_legacy', 'run_legacy', 'task_legacy', 'attempt_legacy', 'implementation', 'noop', 'running', '2026-06-04T00:00:00Z', '2026-06-04T00:00:00Z');
+INSERT INTO workflow_snapshots(run_id, snapshot_json, created_at) VALUES ('run_legacy', '{}', '2026-06-04T00:00:00Z');
 INSERT INTO artifacts(id, run_id, kind, media_type, path, created_at) VALUES ('artifact_log', 'run_legacy', 'event_log', 'application/x-jsonlines', '` + filepath.Join(artifactDir, "artifact_log.jsonl") + `', '2026-06-04T00:00:00Z');
 INSERT INTO events(id, run_id, sequence, timestamp, task_id, attempt_id, type, actor_kind, actor_id, summary, data_json, envelope_json) VALUES ('evt_legacy', 'run_legacy', 1, '2026-06-04T00:00:00Z', 'task_legacy', 'attempt_legacy', 'run.created', 'user', 'test', 'created', '{}', '{"schema_version":1,"id":"evt_legacy","sequence":1,"timestamp":"2026-06-04T00:00:00Z","run_id":"run_legacy","task_id":"task_legacy","attempt_id":"attempt_legacy","type":"run.created","actor":{"kind":"user","id":"test"},"summary":"created","data":{}}');
 `
@@ -208,17 +255,17 @@ func TestGetWorkflowRunSelectsLatestAttemptStages(t *testing.T) {
 	validationStageID := "stage_validation_later"
 	commitStageID := "stage_commit_later"
 	prReadyStageID := "stage_pr_ready_later"
-	if _, err := st.DB().ExecContext(ctx, `INSERT INTO attempts(id, run_id, task_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`, attemptID, wr.Run.ID, wr.Task.ID, RunStatusPending, later, later); err != nil {
+	if _, err := st.DB().ExecContext(ctx, `INSERT INTO attempts(id, project_id, run_id, task_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, attemptID, wr.Run.ProjectID, wr.Run.ID, wr.Task.ID, RunStatusPending, later, later); err != nil {
 		t.Fatalf("insert later attempt: %v", err)
 	}
 	for _, stage := range []Stage{
-		{ID: ideaStageID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypeIdeaIntake, Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
-		{ID: implStageID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypeImplementation, Adapter: "noop", Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
-		{ID: validationStageID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypeValidation, Adapter: "validation", Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
-		{ID: commitStageID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypeCommit, Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
-		{ID: prReadyStageID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypePRReady, Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
+		{ID: ideaStageID, ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypeIdeaIntake, Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
+		{ID: implStageID, ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypeImplementation, Adapter: "noop", Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
+		{ID: validationStageID, ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypeValidation, Adapter: "validation", Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
+		{ID: commitStageID, ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypeCommit, Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
+		{ID: prReadyStageID, ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: attemptID, StageType: contract.StageTypePRReady, Status: StageStatusPending, CreatedAt: later, UpdatedAt: later},
 	} {
-		if _, err := st.DB().ExecContext(ctx, `INSERT INTO stages(id, run_id, task_id, attempt_id, stage_type, adapter, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, stage.ID, stage.RunID, stage.TaskID, stage.AttemptID, stage.StageType, stage.Adapter, stage.Status, stage.CreatedAt, stage.UpdatedAt); err != nil {
+		if _, err := st.DB().ExecContext(ctx, `INSERT INTO stages(id, project_id, run_id, task_id, attempt_id, stage_type, adapter, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, stage.ID, stage.ProjectID, stage.RunID, stage.TaskID, stage.AttemptID, stage.StageType, stage.Adapter, stage.Status, stage.CreatedAt, stage.UpdatedAt); err != nil {
 			t.Fatalf("insert later stage %s: %v", stage.ID, err)
 		}
 	}

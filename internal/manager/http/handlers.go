@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
+	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
 	"github.com/agent-parley/parley/internal/shared/event"
 )
@@ -18,11 +19,59 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	s.handleProjectIndex(w, r, store.DefaultProjectID)
+}
+
+func (s *Server) handleProjectPath(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/projects/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	projectID := parts[0]
+	if len(parts) == 1 {
+		s.handleProjectIndex(w, r, projectID)
+		return
+	}
+	if parts[1] != "runs" {
+		http.NotFound(w, r)
+		return
+	}
+	if len(parts) == 2 {
+		s.handleProjectRuns(w, r, projectID)
+		return
+	}
+	runID := parts[2]
+	if runID == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if len(parts) == 4 && parts[3] == "events" {
+		s.handleRunEvents(w, r, projectID, runID)
+		return
+	}
+	if len(parts) == 4 && parts[3] == "cancel" {
+		s.handleCancelRun(w, r, projectID, runID)
+		return
+	}
+	if len(parts) == 4 && parts[3] == "start" {
+		s.handleStartQueuedRun(w, r, projectID, runID)
+		return
+	}
+	if len(parts) == 3 {
+		s.handleRunDetail(w, r, projectID, runID)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func (s *Server) handleProjectIndex(w http.ResponseWriter, r *http.Request, projectID string) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method", http.StatusMethodNotAllowed)
 		return
 	}
-	data, err := s.indexData(r)
+	data, err := s.indexData(r, projectID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -30,8 +79,12 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	s.writePage(w, "index.html", data)
 }
 
-func (s *Server) indexData(r *http.Request) (web.IndexData, error) {
-	runs, err := s.store.ListRuns(r.Context())
+func (s *Server) indexData(r *http.Request, projectID string) (web.IndexData, error) {
+	project, err := s.store.GetProject(r.Context(), projectID)
+	if err != nil {
+		return web.IndexData{}, err
+	}
+	runs, err := s.store.ListRunsForProject(r.Context(), projectID)
 	if err != nil {
 		return web.IndexData{}, err
 	}
@@ -47,7 +100,7 @@ func (s *Server) indexData(r *http.Request) (web.IndexData, error) {
 	if err != nil {
 		return web.IndexData{}, err
 	}
-	return web.IndexData{Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, Queue: web.NewQueueView(queueState), CSRF: csrfFromContext(r.Context()), Title: "Parley"}, nil
+	return web.IndexData{Project: project, Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, Queue: web.NewQueueView(queueState), CSRF: csrfFromContext(r.Context()), Title: "Parley · " + project.Name}, nil
 }
 
 func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
@@ -55,6 +108,10 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	s.handleProjectRuns(w, r, store.DefaultProjectID)
+}
+
+func (s *Server) handleProjectRuns(w http.ResponseWriter, r *http.Request, projectID string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method", http.StatusMethodNotAllowed)
 		return
@@ -64,11 +121,11 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "idea is required", http.StatusBadRequest)
 		return
 	}
-	runID, err := s.engine.StartRun(r.Context(), idea)
+	runID, err := s.engine.StartProjectRun(r.Context(), projectID, idea)
 	if err != nil {
 		var backlogErr orchestrator.QueueBacklogFullError
 		if errors.As(err, &backlogErr) {
-			data, pageErr := s.indexData(r)
+			data, pageErr := s.indexData(r, projectID)
 			if pageErr != nil {
 				http.Error(w, pageErr.Error(), http.StatusInternalServerError)
 				return
@@ -80,7 +137,7 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/runs/"+runID, http.StatusSeeOther)
+	http.Redirect(w, r, projectRunPath(projectID, runID), http.StatusSeeOther)
 }
 
 func (s *Server) handleRunPath(w http.ResponseWriter, r *http.Request) {
@@ -91,53 +148,67 @@ func (s *Server) handleRunPath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	runID := parts[0]
+	run, err := s.store.GetRun(r.Context(), runID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	projectID := run.ProjectID
 	if len(parts) == 2 && parts[1] == "events" {
-		s.handleRunEvents(w, r, runID)
+		s.handleRunEvents(w, r, projectID, runID)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "cancel" {
-		s.handleCancelRun(w, r, runID)
+		s.handleCancelRun(w, r, projectID, runID)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "start" {
-		s.handleStartQueuedRun(w, r, runID)
+		s.handleStartQueuedRun(w, r, projectID, runID)
 		return
 	}
 	if len(parts) == 1 {
-		s.handleRunDetail(w, r, runID)
+		http.Redirect(w, r, projectRunPath(projectID, runID), http.StatusSeeOther)
 		return
 	}
 	http.NotFound(w, r)
 }
 
-func (s *Server) handleRunDetail(w http.ResponseWriter, r *http.Request, runID string) {
+func (s *Server) handleRunDetail(w http.ResponseWriter, r *http.Request, projectID, runID string) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method", http.StatusMethodNotAllowed)
 		return
 	}
 	bundle, err := s.store.RunBundle(r.Context(), runID)
-	if err != nil {
+	if err != nil || bundle.Run.ProjectID != projectID {
 		http.NotFound(w, r)
 		return
 	}
 	s.writePage(w, "run.html", web.NewRunData(bundle, csrfFromContext(r.Context()), "Run "+runID))
 }
 
-func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request, runID string) {
+func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request, projectID, runID string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.runBelongsToProject(r, projectID, runID) {
+		http.NotFound(w, r)
 		return
 	}
 	if err := s.engine.CancelRun(r.Context(), runID); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/runs/"+runID, http.StatusSeeOther)
+	http.Redirect(w, r, projectRunPath(projectID, runID), http.StatusSeeOther)
 }
 
-func (s *Server) handleStartQueuedRun(w http.ResponseWriter, r *http.Request, runID string) {
+func (s *Server) handleStartQueuedRun(w http.ResponseWriter, r *http.Request, projectID, runID string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.runBelongsToProject(r, projectID, runID) {
+		http.NotFound(w, r)
 		return
 	}
 	if err := s.engine.StartQueuedRun(r.Context(), runID); err != nil {
@@ -150,10 +221,10 @@ func (s *Server) handleStartQueuedRun(w http.ResponseWriter, r *http.Request, ru
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/runs/"+runID, http.StatusSeeOther)
+	http.Redirect(w, r, projectRunPath(projectID, runID), http.StatusSeeOther)
 }
 
-func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request, runID string) {
+func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request, projectID, runID string) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method", http.StatusMethodNotAllowed)
 		return
@@ -168,7 +239,7 @@ func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request, runID s
 		return
 	}
 	bundle, err := s.store.RunBundle(r.Context(), runID)
-	if err != nil {
+	if err != nil || bundle.Run.ProjectID != projectID {
 		http.Error(w, "run not found", http.StatusNotFound)
 		return
 	}
@@ -186,7 +257,7 @@ func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request, runID s
 	if len(bundle.Events) > 0 {
 		seq = bundle.Events[len(bundle.Events)-1].Sequence
 	}
-	writer.Patch(event.Event{Sequence: seq}, fragment)
+	writer.Patch(event.Event{ProjectID: projectID, Sequence: seq}, fragment)
 
 	ch, unsubscribe := s.hub.Subscribe(runID)
 	defer unsubscribe()
@@ -231,6 +302,15 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = fmt.Fprintf(w, "<!doctype html><title>%s</title><pre>%s</pre>", template.HTMLEscapeString(artifact.ID), template.HTMLEscapeString(string(content)))
+}
+
+func (s *Server) runBelongsToProject(r *http.Request, projectID, runID string) bool {
+	run, err := s.store.GetRun(r.Context(), runID)
+	return err == nil && run.ProjectID == projectID
+}
+
+func projectRunPath(projectID, runID string) string {
+	return "/projects/" + projectID + "/runs/" + runID
 }
 
 func artifactIsHTML(mediaType string) bool {

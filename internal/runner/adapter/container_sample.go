@@ -54,7 +54,10 @@ func (a ContainerSample) Run(ctx context.Context, disp contract.Dispatch, sink r
 	if a.opts.SourceRepo == "" {
 		return report.Report{}, fmt.Errorf("container sample source repo is required")
 	}
-	projectID := a.opts.ProjectID
+	projectID := disp.ProjectID
+	if projectID == "" {
+		projectID = a.opts.ProjectID
+	}
 	if projectID == "" {
 		projectID = "default"
 	}

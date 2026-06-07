@@ -25,6 +25,7 @@ type TemplateRenderer struct {
 }
 
 type IndexData struct {
+	Project         store.Project
 	Runs            []store.Run
 	Runners         []store.Runner
 	RunnerEventPage store.SystemEventPage

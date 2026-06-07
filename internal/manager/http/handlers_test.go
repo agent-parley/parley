@@ -34,7 +34,10 @@ func TestHandleRunsBacklogRejectionRendersIndexNotice(t *testing.T) {
 			EffectiveMaxConcurrent: 1,
 		},
 	}
-	controller.startRunFunc = func(_ context.Context, idea string) (string, error) {
+	controller.startRunFunc = func(_ context.Context, projectID, idea string) (string, error) {
+		if projectID != store.DefaultProjectID {
+			t.Fatalf("StartProjectRun projectID = %q", projectID)
+		}
 		if idea != "ship feature" {
 			t.Fatalf("StartRun idea = %q", idea)
 		}
@@ -63,7 +66,10 @@ func TestHandleRunsBacklogRejectionRendersIndexNotice(t *testing.T) {
 func TestHandleRunsHappyPathRedirectsToRun(t *testing.T) {
 	st := openRouteTestStore(t)
 	controller := &fakeRunController{state: defaultRouteQueueState()}
-	controller.startRunFunc = func(_ context.Context, idea string) (string, error) {
+	controller.startRunFunc = func(_ context.Context, projectID, idea string) (string, error) {
+		if projectID != store.DefaultProjectID {
+			t.Fatalf("StartProjectRun projectID = %q", projectID)
+		}
 		if idea != "build the thing" {
 			t.Fatalf("StartRun idea = %q", idea)
 		}
@@ -76,16 +82,21 @@ func TestHandleRunsHappyPathRedirectsToRun(t *testing.T) {
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("POST /runs status = %d want %d body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
 	}
-	if got := rec.Header().Get("Location"); got != "/runs/run_happy" {
-		t.Fatalf("Location = %q want /runs/run_happy", got)
+	if got := rec.Header().Get("Location"); got != "/projects/default/runs/run_happy" {
+		t.Fatalf("Location = %q want /projects/default/runs/run_happy", got)
 	}
 }
 
 func TestHandleStartQueuedRunRedirectsOnSuccess(t *testing.T) {
+	ctx := context.Background()
 	st := openRouteTestStore(t)
+	queued, err := st.CreateWorkflowRun(ctx, "manual")
+	if err != nil {
+		t.Fatalf("create queued run: %v", err)
+	}
 	controller := &fakeRunController{state: defaultRouteQueueState()}
 	controller.startQueuedRunFunc = func(_ context.Context, runID string) error {
-		if runID != "run_manual" {
+		if runID != queued.Run.ID {
 			t.Fatalf("StartQueuedRun runID = %q", runID)
 		}
 		return nil
@@ -93,12 +104,13 @@ func TestHandleStartQueuedRunRedirectsOnSuccess(t *testing.T) {
 
 	srv := newRouteTestServer(t, st, controller)
 	cookie, csrf := getCSRFToken(t, srv)
-	rec := postForm(t, srv, "/runs/run_manual/start", cookie, url.Values{"_csrf": {csrf}})
+	rec := postForm(t, srv, "/runs/"+queued.Run.ID+"/start", cookie, url.Values{"_csrf": {csrf}})
 	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("POST /runs/run_manual/start status = %d want %d body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
+		t.Fatalf("POST start status = %d want %d body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
 	}
-	if got := rec.Header().Get("Location"); got != "/runs/run_manual" {
-		t.Fatalf("Location = %q want /runs/run_manual", got)
+	want := "/projects/default/runs/" + queued.Run.ID
+	if got := rec.Header().Get("Location"); got != want {
+		t.Fatalf("Location = %q want %s", got, want)
 	}
 }
 
@@ -112,13 +124,18 @@ func TestHandleStartQueuedRunConflictMappings(t *testing.T) {
 		{name: "held", err: orchestrator.ErrRunHeld},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
 			st := openRouteTestStore(t)
+			queued, err := st.CreateWorkflowRun(ctx, "conflict")
+			if err != nil {
+				t.Fatalf("create queued run: %v", err)
+			}
 			controller := &fakeRunController{state: defaultRouteQueueState()}
 			controller.startQueuedRunFunc = func(context.Context, string) error { return tc.err }
 
 			srv := newRouteTestServer(t, st, controller)
 			cookie, csrf := getCSRFToken(t, srv)
-			rec := postForm(t, srv, "/runs/run_conflict/start", cookie, url.Values{"_csrf": {csrf}})
+			rec := postForm(t, srv, "/runs/"+queued.Run.ID+"/start", cookie, url.Values{"_csrf": {csrf}})
 			if rec.Code != http.StatusConflict {
 				t.Fatalf("POST start status = %d want %d body=%s", rec.Code, http.StatusConflict, rec.Body.String())
 			}
@@ -163,7 +180,7 @@ func TestHandleIndexRendersQueueStateAndManualStartAffordance(t *testing.T) {
 	assertContains(t, body, "effective 1 · configured 2 · ready slots 1/1")
 	assertContains(t, body, "Auto when ready</dt><dd>false")
 	assertContains(t, body, "waiting for a free runner slot · manual start required")
-	assertContains(t, body, "/runs/"+queued.Run.ID+"/start")
+	assertContains(t, body, "/projects/default/runs/"+queued.Run.ID+"/start")
 	assertContains(t, body, "Start queued run")
 
 	controller.state.Policy.AutoWhenReady = true
@@ -176,16 +193,16 @@ func TestHandleIndexRendersQueueStateAndManualStartAffordance(t *testing.T) {
 type fakeRunController struct {
 	state              orchestrator.QueueState
 	queueStateFunc     func(context.Context) (orchestrator.QueueState, error)
-	startRunFunc       func(context.Context, string) (string, error)
+	startRunFunc       func(context.Context, string, string) (string, error)
 	startQueuedRunFunc func(context.Context, string) error
 	cancelRunFunc      func(context.Context, string) error
 }
 
-func (f *fakeRunController) StartRun(ctx context.Context, idea string) (string, error) {
+func (f *fakeRunController) StartProjectRun(ctx context.Context, projectID, idea string) (string, error) {
 	if f.startRunFunc != nil {
-		return f.startRunFunc(ctx, idea)
+		return f.startRunFunc(ctx, projectID, idea)
 	}
-	return "", errors.New("unexpected StartRun call")
+	return "", errors.New("unexpected StartProjectRun call")
 }
 
 func (f *fakeRunController) StartQueuedRun(ctx context.Context, runID string) error {
