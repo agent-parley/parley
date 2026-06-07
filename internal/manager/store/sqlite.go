@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/ids"
@@ -43,6 +45,11 @@ const (
 
 	RunnerOriginSpawned    = "spawned"
 	RunnerOriginRegistered = "registered"
+)
+
+var (
+	ErrWorkflowTemplateInUse       = errors.New("workflow template is used by an active run")
+	ErrWorkflowTemplateNotEditable = errors.New("workflow template is not editable")
 )
 
 type Store struct {
@@ -97,6 +104,7 @@ type Run struct {
 	TaskID             string
 	Idea               string
 	RefinementLevel    string
+	WorkflowTemplateID string
 	Status             string
 	EventLogArtifactID string
 	CreatedAt          string
@@ -232,6 +240,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schemaWithoutIndexes(string(schema))); err != nil {
 		return fmt.Errorf("migrate sqlite: %w", err)
 	}
+	if err := s.ensureWorkflowTemplates(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureDefaultProject(ctx); err != nil {
 		return err
 	}
@@ -242,6 +253,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureRefinementSchema(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureWorkflowTemplateRefSchema(ctx); err != nil {
 		return err
 	}
 	if err := s.ensureStageBriefSchema(ctx); err != nil {
@@ -411,6 +425,154 @@ func (s *Store) GetRepository(ctx context.Context, repositoryID string) (Reposit
 	return repo, nil
 }
 
+func (s *Store) ensureWorkflowTemplates(ctx context.Context) error {
+	for _, template := range workflow.PredefinedTemplates() {
+		if err := s.upsertPredefinedWorkflowTemplate(ctx, template); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) upsertPredefinedWorkflowTemplate(ctx context.Context, template workflow.Template) error {
+	template = workflow.NormalizeTemplate(template)
+	if err := workflow.ValidateTemplate(template); err != nil {
+		return fmt.Errorf("validate predefined workflow template %s: %w", template.ID, err)
+	}
+	content, err := json.Marshal(template)
+	if err != nil {
+		return fmt.Errorf("marshal predefined workflow template %s: %w", template.ID, err)
+	}
+	now := nowRFC3339()
+	_, err = s.db.ExecContext(ctx, `INSERT INTO workflow_templates(id, name, description, is_predefined, is_recommended, is_editable, template_json, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET name = excluded.name, description = excluded.description, is_predefined = excluded.is_predefined, is_recommended = excluded.is_recommended, is_editable = excluded.is_editable, template_json = excluded.template_json, updated_at = excluded.updated_at`,
+		template.ID, template.Name, template.Description, boolInt(template.Predefined), boolInt(template.Recommended), boolInt(template.Editable), string(content), now, now)
+	if err != nil {
+		return fmt.Errorf("upsert predefined workflow template %s: %w", template.ID, err)
+	}
+	return nil
+}
+
+func (s *Store) ListWorkflowTemplates(ctx context.Context) ([]workflow.Template, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT template_json FROM workflow_templates ORDER BY is_recommended DESC, name ASC, id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list workflow templates: %w", err)
+	}
+	defer rows.Close()
+	var templates []workflow.Template
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("scan workflow template: %w", err)
+		}
+		template, err := decodeWorkflowTemplate(raw)
+		if err != nil {
+			return nil, err
+		}
+		templates = append(templates, template)
+	}
+	return templates, rows.Err()
+}
+
+func (s *Store) GetWorkflowTemplate(ctx context.Context, templateID string) (workflow.Template, error) {
+	if strings.TrimSpace(templateID) == "" {
+		templateID = workflow.DefaultTemplateID
+	}
+	var raw string
+	if err := s.db.QueryRowContext(ctx, `SELECT template_json FROM workflow_templates WHERE id = ?`, templateID).Scan(&raw); err != nil {
+		return workflow.Template{}, fmt.Errorf("get workflow template %s: %w", templateID, err)
+	}
+	return decodeWorkflowTemplate(raw)
+}
+
+func (s *Store) CopyWorkflowTemplate(ctx context.Context, sourceID, newID, name string) (workflow.Template, error) {
+	source, err := s.GetWorkflowTemplate(ctx, sourceID)
+	if err != nil {
+		return workflow.Template{}, err
+	}
+	copied := source
+	copied.ID = strings.TrimSpace(newID)
+	copied.Name = strings.TrimSpace(name)
+	copied.Predefined = false
+	copied.Recommended = false
+	copied.Editable = true
+	if copied.Name == "" {
+		copied.Name = source.Name + " copy"
+	}
+	if err := s.CreateWorkflowTemplate(ctx, copied); err != nil {
+		return workflow.Template{}, err
+	}
+	return copied, nil
+}
+
+func (s *Store) CreateWorkflowTemplate(ctx context.Context, template workflow.Template) error {
+	template = workflow.NormalizeTemplate(template)
+	if !template.Editable {
+		return ErrWorkflowTemplateNotEditable
+	}
+	if err := workflow.ValidateTemplate(template); err != nil {
+		return err
+	}
+	content, err := json.Marshal(template)
+	if err != nil {
+		return fmt.Errorf("marshal workflow template: %w", err)
+	}
+	now := nowRFC3339()
+	_, err = s.db.ExecContext(ctx, `INSERT INTO workflow_templates(id, name, description, is_predefined, is_recommended, is_editable, template_json, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, template.ID, template.Name, template.Description, boolInt(template.Predefined), boolInt(template.Recommended), boolInt(template.Editable), string(content), now, now)
+	if err != nil {
+		return fmt.Errorf("insert workflow template: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) UpdateWorkflowTemplate(ctx context.Context, template workflow.Template) error {
+	template = workflow.NormalizeTemplate(template)
+	if !template.Editable || template.Predefined {
+		return ErrWorkflowTemplateNotEditable
+	}
+	if err := workflow.ValidateTemplate(template); err != nil {
+		return err
+	}
+	var active int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE workflow_template_id = ? AND status NOT IN (?, ?, ?, ?, ?)`, template.ID, RunStatusCompleted, RunStatusFailed, RunStatusInvalid, RunStatusNeedsInput, RunStatusCancelled).Scan(&active); err != nil {
+		return fmt.Errorf("count active runs for workflow template %s: %w", template.ID, err)
+	}
+	if active > 0 {
+		return ErrWorkflowTemplateInUse
+	}
+	content, err := json.Marshal(template)
+	if err != nil {
+		return fmt.Errorf("marshal workflow template: %w", err)
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE workflow_templates SET name = ?, description = ?, is_predefined = ?, is_recommended = ?, is_editable = ?, template_json = ?, updated_at = ? WHERE id = ?`,
+		template.Name, template.Description, boolInt(template.Predefined), boolInt(template.Recommended), boolInt(template.Editable), string(content), nowRFC3339(), template.ID)
+	if err != nil {
+		return fmt.Errorf("update workflow template: %w", err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read workflow template update rows affected: %w", err)
+	}
+	if changed == 0 {
+		return fmt.Errorf("workflow template %s not found", template.ID)
+	}
+	return nil
+}
+
+func decodeWorkflowTemplate(raw string) (workflow.Template, error) {
+	var template workflow.Template
+	if err := json.Unmarshal([]byte(raw), &template); err != nil {
+		return workflow.Template{}, fmt.Errorf("decode workflow template: %w", err)
+	}
+	template = workflow.NormalizeTemplate(template)
+	if err := workflow.ValidateTemplate(template); err != nil {
+		return workflow.Template{}, fmt.Errorf("stored workflow template %s is invalid: %w", template.ID, err)
+	}
+	return template, nil
+}
+
 func (s *Store) ensureRunnerRegistrySchema(ctx context.Context) error {
 	cols, err := s.tableColumns(ctx, "runner_registry")
 	if err != nil {
@@ -547,6 +709,23 @@ func (s *Store) ensureRefinementSchema(ctx context.Context) error {
 	return nil
 }
 
+func (s *Store) ensureWorkflowTemplateRefSchema(ctx context.Context) error {
+	cols, err := s.tableColumns(ctx, "runs")
+	if err != nil {
+		return err
+	}
+	if _, ok := cols["workflow_template_id"]; ok {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE runs ADD COLUMN workflow_template_id TEXT NOT NULL DEFAULT 'balanced_pr_delivery'`); err != nil {
+		return fmt.Errorf("add workflow template id column: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_runs_workflow_template_id ON runs(workflow_template_id)`); err != nil {
+		return fmt.Errorf("create run workflow template index: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) ensureStageBriefSchema(ctx context.Context) error {
 	cols, err := s.tableColumns(ctx, "stages")
 	if err != nil {
@@ -614,9 +793,9 @@ WHERE NOT EXISTS (SELECT 1 FROM tasks_legacy t WHERE t.run_id = r.id)
   AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = 'task_' || r.id)`, DefaultProjectID, repoValue); err != nil {
 		return fmt.Errorf("create synthetic tasks: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at)
-SELECT r.id, ?, COALESCE((SELECT t.id FROM tasks_legacy t WHERE t.run_id = r.id ORDER BY t.created_at DESC, t.id DESC LIMIT 1), 'task_' || r.id), r.idea, r.status, r.event_log_artifact_id, r.created_at, r.updated_at
-FROM runs_legacy r`, DefaultProjectID); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(id, project_id, task_id, idea, refinement_level, workflow_template_id, status, event_log_artifact_id, created_at, updated_at)
+SELECT r.id, ?, COALESCE((SELECT t.id FROM tasks_legacy t WHERE t.run_id = r.id ORDER BY t.created_at DESC, t.id DESC LIMIT 1), 'task_' || r.id), r.idea, 'standard', ?, r.status, r.event_log_artifact_id, r.created_at, r.updated_at
+FROM runs_legacy r`, DefaultProjectID, workflow.DefaultTemplateID); err != nil {
 		return fmt.Errorf("copy legacy runs: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO attempts(id, project_id, run_id, task_id, status, created_at, updated_at)
@@ -678,6 +857,7 @@ func createWorkflowTablesTx(ctx context.Context, tx *sql.Tx) error {
   task_id TEXT NOT NULL REFERENCES tasks(id),
   idea TEXT NOT NULL,
   refinement_level TEXT NOT NULL DEFAULT 'standard',
+  workflow_template_id TEXT NOT NULL DEFAULT 'balanced_pr_delivery',
   status TEXT NOT NULL,
   event_log_artifact_id TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -804,6 +984,13 @@ func (s *Store) CreateWorkflowRunForProjectInput(ctx context.Context, projectID 
 	if err := contract.ValidateRefinementLevel(input.RefinementLevel); err != nil {
 		return WorkflowRun{}, err
 	}
+	input.WorkflowTemplateID = strings.TrimSpace(input.WorkflowTemplateID)
+	if input.WorkflowTemplateID == "" {
+		input.WorkflowTemplateID = workflow.DefaultTemplateID
+	}
+	if _, err := s.GetWorkflowTemplate(ctx, input.WorkflowTemplateID); err != nil {
+		return WorkflowRun{}, err
+	}
 	repositoryID, err := s.DefaultRepositoryID(ctx, projectID)
 	if err != nil {
 		return WorkflowRun{}, err
@@ -811,7 +998,7 @@ func (s *Store) CreateWorkflowRunForProjectInput(ctx context.Context, projectID 
 	now := nowRFC3339()
 	wr := WorkflowRun{
 		Project: project,
-		Run:     Run{ID: ids.New("run"), ProjectID: project.ID, Idea: input.Idea, RefinementLevel: input.RefinementLevel, Status: RunStatusPending, EventLogArtifactID: ids.New("artifact"), CreatedAt: now, UpdatedAt: now},
+		Run:     Run{ID: ids.New("run"), ProjectID: project.ID, Idea: input.Idea, RefinementLevel: input.RefinementLevel, WorkflowTemplateID: input.WorkflowTemplateID, Status: RunStatusPending, EventLogArtifactID: ids.New("artifact"), CreatedAt: now, UpdatedAt: now},
 	}
 	wr.Task = Task{ID: ids.New("task"), ProjectID: project.ID, RepositoryID: repositoryID, Idea: input.Idea, RefinementLevel: input.RefinementLevel, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
 	wr.Run.TaskID = wr.Task.ID
@@ -844,7 +1031,7 @@ func (s *Store) CreateWorkflowRunForProjectInput(ctx context.Context, projectID 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO tasks(id, project_id, repository_id, idea, refinement_level, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, wr.Task.ID, wr.Task.ProjectID, repoValue, wr.Task.Idea, wr.Task.RefinementLevel, wr.Task.Status, now, now); err != nil {
 		return WorkflowRun{}, fmt.Errorf("insert task: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(id, project_id, task_id, idea, refinement_level, status, event_log_artifact_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, wr.Run.ID, wr.Run.ProjectID, wr.Run.TaskID, wr.Run.Idea, wr.Run.RefinementLevel, wr.Run.Status, wr.Run.EventLogArtifactID, now, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(id, project_id, task_id, idea, refinement_level, workflow_template_id, status, event_log_artifact_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, wr.Run.ID, wr.Run.ProjectID, wr.Run.TaskID, wr.Run.Idea, wr.Run.RefinementLevel, wr.Run.WorkflowTemplateID, wr.Run.Status, wr.Run.EventLogArtifactID, now, now); err != nil {
 		return WorkflowRun{}, fmt.Errorf("insert run: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO attempts(id, project_id, run_id, task_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, wr.Attempt.ID, wr.Attempt.ProjectID, wr.Attempt.RunID, wr.Attempt.TaskID, wr.Attempt.Status, now, now); err != nil {
@@ -865,7 +1052,7 @@ func (s *Store) CreateWorkflowRunForProjectInput(ctx context.Context, projectID 
 }
 
 func (s *Store) ListRuns(ctx context.Context) ([]Run, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, task_id, idea, refinement_level, status, event_log_artifact_id, created_at, updated_at FROM runs ORDER BY created_at DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, task_id, idea, refinement_level, workflow_template_id, status, event_log_artifact_id, created_at, updated_at FROM runs ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list runs: %w", err)
 	}
@@ -873,7 +1060,7 @@ func (s *Store) ListRuns(ctx context.Context) ([]Run, error) {
 }
 
 func (s *Store) ListRunsForProject(ctx context.Context, projectID string) ([]Run, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, task_id, idea, refinement_level, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE project_id = ? ORDER BY created_at DESC`, projectID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, task_id, idea, refinement_level, workflow_template_id, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE project_id = ? ORDER BY created_at DESC`, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("list project runs: %w", err)
 	}
@@ -881,7 +1068,7 @@ func (s *Store) ListRunsForProject(ctx context.Context, projectID string) ([]Run
 }
 
 func (s *Store) ListRunsByStatus(ctx context.Context, status string, limit int) ([]Run, error) {
-	query := `SELECT id, project_id, task_id, idea, refinement_level, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE status = ? ORDER BY created_at ASC`
+	query := `SELECT id, project_id, task_id, idea, refinement_level, workflow_template_id, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE status = ? ORDER BY created_at ASC`
 	args := []any{status}
 	if limit > 0 {
 		query += ` LIMIT ?`
@@ -895,7 +1082,7 @@ func (s *Store) ListRunsByStatus(ctx context.Context, status string, limit int) 
 }
 
 func (s *Store) ListRunsByProjectStatus(ctx context.Context, projectID, status string, limit int) ([]Run, error) {
-	query := `SELECT id, project_id, task_id, idea, refinement_level, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE project_id = ? AND status = ? ORDER BY created_at ASC`
+	query := `SELECT id, project_id, task_id, idea, refinement_level, workflow_template_id, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE project_id = ? AND status = ? ORDER BY created_at ASC`
 	args := []any{projectID, status}
 	if limit > 0 {
 		query += ` LIMIT ?`
@@ -929,10 +1116,13 @@ func scanRuns(rows *sql.Rows) ([]Run, error) {
 	var runs []Run
 	for rows.Next() {
 		var run Run
-		if err := rows.Scan(&run.ID, &run.ProjectID, &run.TaskID, &run.Idea, &run.RefinementLevel, &run.Status, &run.EventLogArtifactID, &run.CreatedAt, &run.UpdatedAt); err != nil {
+		if err := rows.Scan(&run.ID, &run.ProjectID, &run.TaskID, &run.Idea, &run.RefinementLevel, &run.WorkflowTemplateID, &run.Status, &run.EventLogArtifactID, &run.CreatedAt, &run.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan run: %w", err)
 		}
 		run.RefinementLevel = contract.NormalizeRefinementLevel(run.RefinementLevel)
+		if run.WorkflowTemplateID == "" {
+			run.WorkflowTemplateID = workflow.DefaultTemplateID
+		}
 		runs = append(runs, run)
 	}
 	return runs, rows.Err()
@@ -940,11 +1130,14 @@ func scanRuns(rows *sql.Rows) ([]Run, error) {
 
 func (s *Store) GetRun(ctx context.Context, runID string) (Run, error) {
 	var run Run
-	err := s.db.QueryRowContext(ctx, `SELECT id, project_id, task_id, idea, refinement_level, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE id = ?`, runID).Scan(&run.ID, &run.ProjectID, &run.TaskID, &run.Idea, &run.RefinementLevel, &run.Status, &run.EventLogArtifactID, &run.CreatedAt, &run.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT id, project_id, task_id, idea, refinement_level, workflow_template_id, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE id = ?`, runID).Scan(&run.ID, &run.ProjectID, &run.TaskID, &run.Idea, &run.RefinementLevel, &run.WorkflowTemplateID, &run.Status, &run.EventLogArtifactID, &run.CreatedAt, &run.UpdatedAt)
 	if err != nil {
 		return Run{}, fmt.Errorf("get run %s: %w", runID, err)
 	}
 	run.RefinementLevel = contract.NormalizeRefinementLevel(run.RefinementLevel)
+	if run.WorkflowTemplateID == "" {
+		run.WorkflowTemplateID = workflow.DefaultTemplateID
+	}
 	return run, nil
 }
 

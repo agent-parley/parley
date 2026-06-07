@@ -2,10 +2,12 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/agent-parley/parley/internal/manager/store"
+	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
@@ -76,6 +78,45 @@ func TestDispatchStagePersistsStageBriefAndPassesItToRunner(t *testing.T) {
 		}
 	}
 	t.Fatal("implementation stage not found")
+}
+
+func TestStartRunFreezesSelectedWorkflowTemplateSnapshot(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	copied, err := st.CopyWorkflowTemplate(ctx, workflow.BalancedPRDeliveryID, "team_template", "Team Template")
+	if err != nil {
+		t.Fatalf("copy template: %v", err)
+	}
+	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "use team template", WorkflowTemplateID: copied.ID})
+	if err != nil {
+		t.Fatalf("StartRunInput() error = %v", err)
+	}
+	var rawSnapshot string
+	if err := st.DB().QueryRowContext(ctx, `SELECT snapshot_json FROM workflow_snapshots WHERE run_id = ? ORDER BY id ASC LIMIT 1`, runID).Scan(&rawSnapshot); err != nil {
+		t.Fatalf("read start snapshot: %v", err)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal([]byte(rawSnapshot), &snapshot); err != nil {
+		t.Fatalf("decode start snapshot: %v", err)
+	}
+	if snapshot["frozen"] != true {
+		t.Fatalf("snapshot frozen = %v, want true", snapshot["frozen"])
+	}
+	if snapshot["workflow_template_id"] != copied.ID {
+		t.Fatalf("snapshot template id = %v, want %s", snapshot["workflow_template_id"], copied.ID)
+	}
+	if snapshot["workflow_template_frozen"] != true {
+		t.Fatalf("workflow_template_frozen = %v, want true", snapshot["workflow_template_frozen"])
+	}
+	templateSnapshot, ok := snapshot["workflow_template_snapshot"].(map[string]any)
+	if !ok || templateSnapshot["id"] != copied.ID {
+		t.Fatalf("workflow template snapshot = %+v", snapshot["workflow_template_snapshot"])
+	}
 }
 
 type capturingRunner struct {

@@ -3,11 +3,13 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/report"
@@ -115,6 +117,61 @@ func TestRunPersistsRefinementLevelAndStageCanReferenceTaskPlanArtifact(t *testi
 	}
 	if loaded.IdeaIntakeStage.TaskPlanArtifactID != artifact.ID {
 		t.Fatalf("task plan ref = %s, want %s", loaded.IdeaIntakeStage.TaskPlanArtifactID, artifact.ID)
+	}
+}
+
+func TestWorkflowTemplatesSeedCopyEditAndRejectMidRunEdit(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	templates, err := st.ListWorkflowTemplates(ctx)
+	if err != nil {
+		t.Fatalf("list workflow templates: %v", err)
+	}
+	if len(templates) != 4 {
+		t.Fatalf("template count = %d, want 4", len(templates))
+	}
+	if templates[0].ID != workflow.BalancedPRDeliveryID || !templates[0].Recommended {
+		t.Fatalf("first template = %+v, want recommended Balanced PR", templates[0])
+	}
+
+	copyTemplate, err := st.CopyWorkflowTemplate(ctx, workflow.BalancedPRDeliveryID, "team_balanced", "Team Balanced")
+	if err != nil {
+		t.Fatalf("copy template: %v", err)
+	}
+	copyTemplate.Description = "Team editable template"
+	copyTemplate.Settings["review_depth"] = "team"
+	if err := st.UpdateWorkflowTemplate(ctx, copyTemplate); err != nil {
+		t.Fatalf("update copied template before run: %v", err)
+	}
+	updated, err := st.GetWorkflowTemplate(ctx, "team_balanced")
+	if err != nil {
+		t.Fatalf("get copied template: %v", err)
+	}
+	if updated.Description != "Team editable template" || updated.Settings["review_depth"] != "team" {
+		t.Fatalf("updated template not persisted: %+v", updated)
+	}
+
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "build with template", WorkflowTemplateID: updated.ID})
+	if err != nil {
+		t.Fatalf("create templated run: %v", err)
+	}
+	if wr.Run.WorkflowTemplateID != updated.ID {
+		t.Fatalf("run template id = %s, want %s", wr.Run.WorkflowTemplateID, updated.ID)
+	}
+	updated.Description = "should be rejected"
+	if err := st.UpdateWorkflowTemplate(ctx, updated); !errors.Is(err, ErrWorkflowTemplateInUse) {
+		t.Fatalf("update active template error = %v, want ErrWorkflowTemplateInUse", err)
+	}
+	if err := st.UpdateRunStatus(ctx, wr.Run.ID, RunStatusCompleted); err != nil {
+		t.Fatalf("complete run: %v", err)
+	}
+	if err := st.UpdateWorkflowTemplate(ctx, updated); err != nil {
+		t.Fatalf("update template after run completes: %v", err)
 	}
 }
 

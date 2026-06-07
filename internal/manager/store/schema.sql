@@ -26,6 +26,18 @@ CREATE TABLE IF NOT EXISTS repositories (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS workflow_templates (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  is_predefined INTEGER NOT NULL DEFAULT 0,
+  is_recommended INTEGER NOT NULL DEFAULT 0,
+  is_editable INTEGER NOT NULL DEFAULT 1,
+  template_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),
@@ -44,6 +56,7 @@ CREATE TABLE IF NOT EXISTS runs (
   task_id TEXT NOT NULL REFERENCES tasks(id),
   idea TEXT NOT NULL,
   refinement_level TEXT NOT NULL DEFAULT 'standard',
+  workflow_template_id TEXT NOT NULL DEFAULT 'balanced_pr_delivery',
   status TEXT NOT NULL,
   event_log_artifact_id TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -137,8 +150,10 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_projects_created_at ON projects(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_workspaces_project_id ON workspaces(project_id);
 CREATE INDEX IF NOT EXISTS idx_repositories_project_id ON repositories(project_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_templates_recommended ON workflow_templates(is_recommended DESC, name ASC);
 CREATE INDEX IF NOT EXISTS idx_runs_project_created ON runs(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_task_id ON runs(task_id);
+CREATE INDEX IF NOT EXISTS idx_runs_workflow_template_id ON runs(workflow_template_id);
 CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_project_created ON tasks(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_attempts_run_id ON attempts(run_id);

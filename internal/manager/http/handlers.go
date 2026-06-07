@@ -122,7 +122,7 @@ func (s *Server) handleProjectRuns(w http.ResponseWriter, r *http.Request, proje
 		http.Error(w, "idea is required", http.StatusBadRequest)
 		return
 	}
-	input := contract.TaskInput{Idea: idea, RefinementLevel: r.Form.Get("refinement_level")}
+	input := contract.TaskInput{Idea: idea, RefinementLevel: r.Form.Get("refinement_level"), WorkflowTemplateID: r.Form.Get("workflow_template_id")}
 	input.RefinementLevel = contract.NormalizeRefinementLevel(input.RefinementLevel)
 	if err := contract.ValidateRefinementLevel(input.RefinementLevel); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)

@@ -2,5 +2,5 @@
   <h1>Run {{short .Run.ID}}</h1>
   <p class="idea">{{.Run.Idea}}</p>
   <p>Status: <span class="pill {{statusClass .Run.Status}}">{{statusLabel .Run.Status}}</span></p>
-  <p><small>Project ID: {{.Project.ID}} · Task ID: {{.Task.ID}} · Run ID: {{.Run.ID}}</small></p>
+  <p><small>Project ID: {{.Project.ID}} · Task ID: {{.Task.ID}} · Run ID: {{.Run.ID}} · Template ID: {{.Run.WorkflowTemplateID}}</small></p>
 </section>

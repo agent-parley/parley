@@ -12,6 +12,7 @@ import (
 
 	"github.com/agent-parley/parley/internal/manager/contextpack"
 	"github.com/agent-parley/parley/internal/manager/store"
+	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/runner/worktree"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
@@ -217,7 +218,7 @@ func (e *Engine) StartProjectRunInput(ctx context.Context, projectID string, inp
 		e.queueMu.Unlock()
 		return "", err
 	}
-	if _, err := e.emit(ctx, runEvent(wr, "run.created", event.Actor{Kind: event.ActorKindUser, ID: "local"}, "run created", map[string]any{"idea": input.Idea, "refinement_level": wr.Run.RefinementLevel})); err != nil {
+	if _, err := e.emit(ctx, runEvent(wr, "run.created", event.Actor{Kind: event.ActorKindUser, ID: "local"}, "run created", map[string]any{"idea": input.Idea, "refinement_level": wr.Run.RefinementLevel, "workflow_template_id": wr.Run.WorkflowTemplateID})); err != nil {
 		e.queueMu.Unlock()
 		return "", err
 	}
@@ -257,7 +258,11 @@ func (e *Engine) createQueuedRun(ctx context.Context, projectID string, input co
 	if err := e.store.UpdateStageAdapter(ctx, wr.ValidationStage.ID, e.validationAdapter); err != nil {
 		return store.WorkflowRun{}, err
 	}
-	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, "", "", false)); err != nil {
+	template, err := e.store.GetWorkflowTemplate(ctx, wr.Run.WorkflowTemplateID)
+	if err != nil {
+		return store.WorkflowRun{}, err
+	}
+	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, template, "", "", true)); err != nil {
 		return store.WorkflowRun{}, err
 	}
 	return wr, nil
@@ -792,7 +797,11 @@ func (e *Engine) runIdeaIntake(ctx context.Context, wr store.WorkflowRun) (repor
 		return report.Report{}, err
 	}
 	stage.TaskPlanArtifactID = planArtifact.ID
-	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, contractArtifact.ID, planArtifact.ID, true)); err != nil {
+	template, err := e.store.GetWorkflowTemplate(ctx, wr.Run.WorkflowTemplateID)
+	if err != nil {
+		return report.Report{}, err
+	}
+	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, template, contractArtifact.ID, planArtifact.ID, true)); err != nil {
 		return report.Report{}, err
 	}
 	rep := report.Report{
@@ -1208,22 +1217,25 @@ func (e *Engine) emit(ctx context.Context, ev event.Event) (event.Event, error) 
 	return persisted, nil
 }
 
-func (e *Engine) workflowSnapshot(wr store.WorkflowRun, taskContractArtifactID, taskPlanArtifactID string, frozen bool) map[string]any {
+func (e *Engine) workflowSnapshot(wr store.WorkflowRun, template workflow.Template, taskContractArtifactID, taskPlanArtifactID string, frozen bool) map[string]any {
 	return map[string]any{
-		"schema_version":            1,
-		"project_id":                wr.Run.ProjectID,
-		"workspace_path":            wr.Project.WorkspacePath,
-		"repository_id":             wr.Task.RepositoryID,
-		"run_id":                    wr.Run.ID,
-		"task_id":                   wr.Task.ID,
-		"attempt_id":                wr.Attempt.ID,
-		"idea_verbatim":             wr.Run.Idea,
-		"refinement_level":          wr.Run.RefinementLevel,
-		"frozen":                    frozen,
-		"task_contract_artifact_id": taskContractArtifactID,
-		"task_plan_artifact_id":     taskPlanArtifactID,
-		"graph":                     "idea_intake->implementation->validation->commit->pr_ready",
-		"edges":                     e.graph.Edges(),
+		"schema_version":             1,
+		"project_id":                 wr.Run.ProjectID,
+		"workspace_path":             wr.Project.WorkspacePath,
+		"repository_id":              wr.Task.RepositoryID,
+		"workflow_template_id":       wr.Run.WorkflowTemplateID,
+		"workflow_template_snapshot": template,
+		"workflow_template_frozen":   true,
+		"run_id":                     wr.Run.ID,
+		"task_id":                    wr.Task.ID,
+		"attempt_id":                 wr.Attempt.ID,
+		"idea_verbatim":              wr.Run.Idea,
+		"refinement_level":           wr.Run.RefinementLevel,
+		"frozen":                     frozen,
+		"task_contract_artifact_id":  taskContractArtifactID,
+		"task_plan_artifact_id":      taskPlanArtifactID,
+		"graph":                      "idea_intake->implementation->validation->commit->pr_ready",
+		"edges":                      e.graph.Edges(),
 		"stages": []map[string]string{
 			stageSnapshot(wr.IdeaIntakeStage),
 			stageSnapshot(wr.ImplementationStage),
