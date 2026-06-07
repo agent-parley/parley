@@ -104,12 +104,15 @@ func TestHandleRunsPassesExplicitRefinementLevel(t *testing.T) {
 		if input.RefinementLevel != contract.RefinementLevelDeep {
 			t.Fatalf("refinement level = %q, want deep", input.RefinementLevel)
 		}
+		if input.WorkflowTemplateID != "team_template" {
+			t.Fatalf("workflow template id = %q, want team_template", input.WorkflowTemplateID)
+		}
 		return "run_deep", nil
 	}
 
 	srv := newRouteTestServer(t, st, controller)
 	cookie, csrf := getCSRFToken(t, srv)
-	rec := postForm(t, srv, "/runs", cookie, url.Values{"idea": {"build the thing"}, "refinement_level": {"deep"}, "_csrf": {csrf}})
+	rec := postForm(t, srv, "/runs", cookie, url.Values{"idea": {"build the thing"}, "refinement_level": {"deep"}, "workflow_template_id": {"team_template"}, "_csrf": {csrf}})
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("POST /runs status = %d want %d body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
 	}

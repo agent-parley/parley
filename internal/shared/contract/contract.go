@@ -35,8 +35,9 @@ type Dispatch struct {
 
 // TaskInput is the minimal user-submitted task shape.
 type TaskInput struct {
-	Idea            string `json:"idea"`
-	RefinementLevel string `json:"refinement_level,omitempty"`
+	Idea               string `json:"idea"`
+	RefinementLevel    string `json:"refinement_level,omitempty"`
+	WorkflowTemplateID string `json:"workflow_template_id,omitempty"`
 }
 
 func NormalizeRefinementLevel(level string) string {

@@ -443,6 +443,7 @@ func (WorkflowSnapshotProvider) Collect(ctx context.Context, req Request, bounds
 		"run_id":         req.Run.ID,
 		"task_id":        req.Task.ID,
 		"attempt_id":     req.Attempt.ID,
+		"template_id":    req.Run.WorkflowTemplateID,
 		"current_stage":  stageSnapshot(req.CurrentStage),
 		"graph":          "idea_intake->implementation->validation->commit->pr_ready",
 		"stages":         stageSnapshots(req.Stages),

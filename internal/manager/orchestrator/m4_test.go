@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/agent-parley/parley/internal/manager/store"
+	"github.com/agent-parley/parley/internal/manager/workflow"
 	rworktree "github.com/agent-parley/parley/internal/runner/worktree"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
@@ -90,6 +91,19 @@ func TestIdeaIntakeFreezesVerbatimIdeaIntoContractAndSnapshot(t *testing.T) {
 	}
 	if snapshot["refinement_level"] != contract.RefinementLevelDeep {
 		t.Fatalf("snapshot refinement level = %v, want %s", snapshot["refinement_level"], contract.RefinementLevelDeep)
+	}
+	if snapshot["workflow_template_id"] != workflow.DefaultTemplateID {
+		t.Fatalf("snapshot workflow template id = %v, want %s", snapshot["workflow_template_id"], workflow.DefaultTemplateID)
+	}
+	if snapshot["workflow_template_frozen"] != true {
+		t.Fatalf("workflow_template_frozen = %v, want true", snapshot["workflow_template_frozen"])
+	}
+	templateSnapshot, ok := snapshot["workflow_template_snapshot"].(map[string]any)
+	if !ok {
+		t.Fatalf("snapshot workflow template missing or wrong type: %+v", snapshot["workflow_template_snapshot"])
+	}
+	if templateSnapshot["id"] != workflow.DefaultTemplateID || templateSnapshot["name"] != "Balanced PR Delivery" {
+		t.Fatalf("workflow template snapshot = %+v", templateSnapshot)
 	}
 }
 
