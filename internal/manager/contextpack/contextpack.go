@@ -25,6 +25,10 @@ const (
 	SourceRepoEvidence       = "repo_evidence"
 	SourceProjectRules       = "project_rules"
 	SourceProjectPreferences = "project_preferences"
+
+	SourceItemAuthorityAuthoritative = "authoritative"
+	SourceItemAuthorityCandidate     = "candidate"
+	SourceItemAuthorityInformational = "informational"
 )
 
 type Bounds struct {
@@ -96,11 +100,13 @@ type Source struct {
 }
 
 type SourceItem struct {
-	Label     string `json:"label"`
-	MediaType string `json:"media_type"`
-	Text      string `json:"text"`
-	Bytes     int    `json:"bytes"`
-	Truncated bool   `json:"truncated"`
+	Label         string `json:"label"`
+	MediaType     string `json:"media_type"`
+	Authority     string `json:"authority,omitempty"`
+	AuthorityNote string `json:"authority_note,omitempty"`
+	Text          string `json:"text"`
+	Bytes         int    `json:"bytes"`
+	Truncated     bool   `json:"truncated"`
 }
 
 type DeferredSource struct {
@@ -255,6 +261,7 @@ func deferredSources() []DeferredSource {
 		{Label: "task_plan", Reason: "deferred until B1 idea refinement produces an approved plan"},
 		{Label: "planning_artifacts", Reason: "deferred until B1 planning artifacts exist"},
 		{Label: "private_memory", Reason: "deferred until B6 memory-update stage and curated project memory exist"},
+		{Label: "editable_project_rules_preferences_app_state", Reason: "deferred until a future slice adds editable Parley app-state project rules/preferences; repo .parley/rules.md and .parley/preferences.md remain non-authoritative candidates until promoted"},
 		{Label: "external_forge_metadata", Reason: "deferred until forge issue/PR metadata source is built"},
 	}
 }
@@ -336,6 +343,18 @@ func Markdown(brief StageBrief) string {
 		b.WriteString("\n")
 		for _, item := range source.Items {
 			fmt.Fprintf(&b, "### %s\n\n", item.Label)
+			wroteMetadata := false
+			if item.Authority != "" {
+				fmt.Fprintf(&b, "- Authority: `%s`\n", item.Authority)
+				wroteMetadata = true
+			}
+			if item.AuthorityNote != "" {
+				fmt.Fprintf(&b, "- Authority note: %s\n", item.AuthorityNote)
+				wroteMetadata = true
+			}
+			if wroteMetadata {
+				b.WriteString("\n")
+			}
 			if item.Truncated {
 				b.WriteString("> [!warning] Item truncated by Stage brief bounds.\n\n")
 			}
@@ -655,18 +674,18 @@ type ProjectRulesProvider struct{}
 func (ProjectRulesProvider) Label() string { return SourceProjectRules }
 
 func (ProjectRulesProvider) Collect(_ context.Context, req Request, bounds Bounds) (Source, error) {
-	source := Source{Label: SourceProjectRules, Title: "Project rules", PrecedenceRank: precedenceRank(SourceProjectRules), Summary: "Explicit project rules from optional project state."}
+	source := Source{Label: SourceProjectRules, Title: "Project rules", PrecedenceRank: precedenceRank(SourceProjectRules), Summary: "Authoritative project rules from Parley app state only. Candidate repo rules in this source are non-authoritative and have no project_rules precedence until promoted."}
 	if strings.TrimSpace(req.Project.Description) != "" {
-		source.Items = append(source.Items, textItem("project_description", req.Project.Description))
+		source.Items = append(source.Items, withAuthority(textItem("project_description", req.Project.Description), SourceItemAuthorityAuthoritative, "Authoritative Parley app state; store.Project.Description is the first-slice project-rules field."))
+	} else {
+		source.Items = append(source.Items, withAuthority(textItem("project_rules_status", "No project rules configured in first-slice project state."), SourceItemAuthorityInformational, "Status only; no authoritative project_rules content is configured in Parley app state."))
 	}
 	if req.RepositoryPath != "" {
 		if content, truncated, err := readRepoFileBounded(req.RepositoryPath, ".parley/rules.md", bounds.MaxProjectFileBytes); err == nil {
-			item := SourceItem{Label: ".parley/rules.md", MediaType: "text/markdown", Text: content, Bytes: len(content), Truncated: truncated}
+			item := SourceItem{Label: "candidate_project_rules:.parley/rules.md", MediaType: "text/markdown", Authority: SourceItemAuthorityCandidate, AuthorityNote: "Non-authoritative repo suggestion; not accepted project_rules and does not receive project_rules precedence unless the user promotes it into Parley app state.", Text: content, Bytes: len(content), Truncated: truncated}
 			source.Items = append(source.Items, item)
+			source.Warnings = append(source.Warnings, ".parley/rules.md is a non-authoritative candidate source, not accepted project_rules until promoted to Parley app state")
 		}
-	}
-	if len(source.Items) == 0 {
-		source.Items = append(source.Items, textItem("project_rules_status", "No project rules configured in first-slice project state."))
 	}
 	return source, nil
 }
@@ -676,17 +695,18 @@ type ProjectPreferencesProvider struct{}
 func (ProjectPreferencesProvider) Label() string { return SourceProjectPreferences }
 
 func (ProjectPreferencesProvider) Collect(_ context.Context, req Request, bounds Bounds) (Source, error) {
-	source := Source{Label: SourceProjectPreferences, Title: "Project preferences", PrecedenceRank: precedenceRank(SourceProjectPreferences), Summary: "Lower-precedence project defaults and preferences."}
+	source := Source{Label: SourceProjectPreferences, Title: "Project preferences", PrecedenceRank: precedenceRank(SourceProjectPreferences), Summary: "Lower-precedence project defaults from Parley app state. Candidate repo preferences in this source are non-authoritative suggestions until promoted."}
 	prefs := map[string]any{
 		"queue_auto_when_ready": req.Project.QueueAutoWhenReady,
 		"queue_max_concurrent":  req.Project.QueueMaxConcurrent,
 		"queue_backlog_cap":     req.Project.QueueBacklogCap,
 	}
-	source.Items = append(source.Items, jsonItem("project_queue_defaults", prefs))
+	source.Items = append(source.Items, withAuthority(jsonItem("project_queue_defaults", prefs), SourceItemAuthorityAuthoritative, "Authoritative Parley app state project defaults."))
 	if req.RepositoryPath != "" {
 		if content, truncated, err := readRepoFileBounded(req.RepositoryPath, ".parley/preferences.md", bounds.MaxProjectFileBytes); err == nil {
-			item := SourceItem{Label: ".parley/preferences.md", MediaType: "text/markdown", Text: content, Bytes: len(content), Truncated: truncated}
+			item := SourceItem{Label: "candidate_project_preferences:.parley/preferences.md", MediaType: "text/markdown", Authority: SourceItemAuthorityCandidate, AuthorityNote: "Non-authoritative repo suggestion; not accepted project_preferences and does not receive project_preferences precedence unless the user promotes it into Parley app state.", Text: content, Bytes: len(content), Truncated: truncated}
 			source.Items = append(source.Items, item)
+			source.Warnings = append(source.Warnings, ".parley/preferences.md is a non-authoritative candidate source, not accepted project_preferences until promoted to Parley app state")
 		}
 	}
 	return source, nil
@@ -702,6 +722,12 @@ func jsonItem(label string, value any) SourceItem {
 
 func textItem(label, text string) SourceItem {
 	return SourceItem{Label: label, MediaType: "text/plain", Text: text, Bytes: len(text)}
+}
+
+func withAuthority(item SourceItem, authority, note string) SourceItem {
+	item.Authority = authority
+	item.AuthorityNote = note
+	return item
 }
 
 func mediaTypeForPath(path string) string {

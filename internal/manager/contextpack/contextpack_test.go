@@ -38,8 +38,69 @@ func TestAssemblerBuildsSourceLabeledStageFilteredBrief(t *testing.T) {
 			t.Fatalf("missing source label %s in %+v", label, brief.Sources)
 		}
 	}
+
+	rulesSource := sourceByLabel(brief, SourceProjectRules)
+	status := itemByLabel(rulesSource, "project_rules_status")
+	if status.Authority != SourceItemAuthorityInformational || !strings.Contains(status.Text, "No project rules configured") {
+		t.Fatalf("project rules status = %+v", status)
+	}
+	rulesCandidate := itemByLabel(rulesSource, "candidate_project_rules:.parley/rules.md")
+	if rulesCandidate.Authority != SourceItemAuthorityCandidate || !strings.Contains(rulesCandidate.AuthorityNote, "Non-authoritative repo suggestion") {
+		t.Fatalf("repo rules candidate = %+v", rulesCandidate)
+	}
+	for _, item := range rulesSource.Items {
+		if item.Authority == SourceItemAuthorityAuthoritative {
+			t.Fatalf("empty app-state rules should not yield authoritative project_rules item: %+v", item)
+		}
+	}
+
+	preferencesSource := sourceByLabel(brief, SourceProjectPreferences)
+	preferencesCandidate := itemByLabel(preferencesSource, "candidate_project_preferences:.parley/preferences.md")
+	if preferencesCandidate.Authority != SourceItemAuthorityCandidate || !strings.Contains(preferencesCandidate.AuthorityNote, "Non-authoritative repo suggestion") {
+		t.Fatalf("repo preferences candidate = %+v", preferencesCandidate)
+	}
+	if queueDefaults := itemByLabel(preferencesSource, "project_queue_defaults"); queueDefaults.Authority != SourceItemAuthorityAuthoritative {
+		t.Fatalf("queue defaults authority = %+v", queueDefaults)
+	}
+	if !hasDeferredSource(brief, "editable_project_rules_preferences_app_state") {
+		t.Fatalf("missing project rules/preferences app-state deferred source: %+v", brief.DeferredSources)
+	}
+
 	markdown := Markdown(brief)
-	for _, want := range []string{"## Source: workflow_snapshot", "## Source: repo_evidence", "## Source: project_rules", "## Source: project_preferences", "Conflict precedence"} {
+	for _, want := range []string{"## Source: workflow_snapshot", "## Source: repo_evidence", "## Source: project_rules", "## Source: project_preferences", "Conflict precedence", "candidate_project_rules:.parley/rules.md", "candidate_project_preferences:.parley/preferences.md", "Authority: `candidate`", "Non-authoritative repo suggestion", "No project rules configured in first-slice project state"} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("markdown missing %q:\n%s", want, markdown)
+		}
+	}
+}
+
+func TestProjectRulesAppStateIsAuthoritativeAndRepoRulesRemainCandidate(t *testing.T) {
+	ctx := context.Background()
+	repo := initBriefRepo(t, ctx, map[string]string{
+		"go.mod":           "module example.test/parley\n",
+		".parley/rules.md": "Never bypass approval gates.\n",
+	})
+	req := briefRequest(repo, contract.StageTypeImplementation)
+	req.Project.Description = "Ship only after validation passes."
+	brief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+
+	rulesSource := sourceByLabel(brief, SourceProjectRules)
+	authoritative := itemByLabel(rulesSource, "project_description")
+	if authoritative.Authority != SourceItemAuthorityAuthoritative || authoritative.Text != req.Project.Description {
+		t.Fatalf("authoritative rules item = %+v", authoritative)
+	}
+	if status := itemByLabel(rulesSource, "project_rules_status"); status.Label != "" {
+		t.Fatalf("unexpected empty-state status with app-state rules: %+v", status)
+	}
+	candidate := itemByLabel(rulesSource, "candidate_project_rules:.parley/rules.md")
+	if candidate.Authority != SourceItemAuthorityCandidate || candidate.Text != "Never bypass approval gates.\n" {
+		t.Fatalf("repo rules candidate = %+v", candidate)
+	}
+	markdown := Markdown(brief)
+	for _, want := range []string{"project_description", "Authority: `authoritative`", "candidate_project_rules:.parley/rules.md", "does not receive project_rules precedence"} {
 		if !strings.Contains(markdown, want) {
 			t.Fatalf("markdown missing %q:\n%s", want, markdown)
 		}
@@ -139,6 +200,24 @@ func sourceByLabel(brief StageBrief, label string) Source {
 		}
 	}
 	return Source{}
+}
+
+func itemByLabel(source Source, label string) SourceItem {
+	for _, item := range source.Items {
+		if item.Label == label {
+			return item
+		}
+	}
+	return SourceItem{}
+}
+
+func hasDeferredSource(brief StageBrief, label string) bool {
+	for _, source := range brief.DeferredSources {
+		if source.Label == label {
+			return true
+		}
+	}
+	return false
 }
 
 func fixedBriefNow() time.Time { return time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC) }
