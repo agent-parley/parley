@@ -1,56 +1,129 @@
 # Parley
 
-> **Open-source, local-first harness that takes a software idea to an inspectable pull request through a configurable agent workflow.**
+> **Open-source, local-first harness that takes a software idea to a sandboxed, inspectable PR-ready stop.**
 
 [![Status](https://img.shields.io/badge/status-early%20design-orange.svg)](#status)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Namespace](https://img.shields.io/badge/namespace-agent--parley-blue.svg)](#name-and-namespace)
 
-Parley turns a software idea into a branch, commit set, and PR-ready result by running it through a **configurable workflow** of focused, sandboxed agents — planning, implementing, reviewing, validating — and handing you the result to approve.
+Parley is a **control-plane harness**, not a coding agent. It owns run state, runner coordination, sandbox setup, artifacts, events, and delivery policy; agents are the workers it dispatches.
 
-You stay in control of the *shape* of the work (which stages run, how strict review is, where humans step in) without hand-running each step.
+The current repo contains a live-validated walking skeleton, not the full configurable workflow product. A manually submitted idea runs through a deterministic local path: implementation in an isolated worktree, containerized validation, a commit built from the worker snapshot, and a stop at a **PR-ready human handoff**. The end-to-end commit → PR-ready loop requires a diff-producing adapter (the **Pi** agent); the default `noop` adapter runs the path but makes no changes, so the run stops at the commit stage with *no changes to commit*. Parley does **not** push branches or open pull requests yet.
 
 > [!warning]
-> Parley is early. This README describes the intended direction; details will change as implementation stabilizes. Today the system targets **local-first, dry-run-by-default** operation, with guarded local execution still experimental.
+> Parley is early. The walking skeleton runs, but the product surface and workflow model will keep changing. This README separates what works today from intended direction.
 
-## What Parley is
+## Status
 
-Parley is a **control-plane harness**, not a coding agent. It owns the workflow, the run state, context assembly, runner coordination, artifacts and events, and delivery policy. The agents are the workers it dispatches.
+Walking skeleton status:
 
-The harness is **deterministic and configurable**: you (and your project defaults) decide the workflow; the agents supply the cognition inside each step. Parley does not let an agent improvise the control flow.
+- **Built and live-validated:** Manager spawns and dials one Runner over a persistent WebSocket.
+- **Built and live-validated:** deterministic `idea → implementation → validation → commit → pr_ready` path.
+- **Built and live-validated:** rootless Podman sandbox provider, isolated git worktrees, SQLite + filesystem artifacts, durable events, and per-run JSONL logs.
+- **Built and live-validated:** one real agent family, **Pi**, behind the runner adapter interface.
+- **Built and live-validated:** embedded hypermedia web UI using Datastar + SSE, including run events, artifacts, cancellation, and runner-health/supervision surfaces.
+- **Built:** optional TOML project/global settings and a local auto-queue — `POST /runs` enqueues runs that auto-dispatch to free runner slots (approval gates preserved), with a backlog cap and crash/startup recovery. Capacity equals the number of local runner slots (currently one).
+- **Not yet built:** push/PR creation. The workflow stops at PR-ready metadata for a human/operator.
+- **Not yet built:** auto-pickup, issue polling, agent profiles, workflow templates, project memory, semantic review verdicts, or human-stage parity.
+- **No published release yet.** Expect sharp edges.
+
+The skeleton runs a single local runner slot, so one run executes at a time; additional submitted runs are queued and auto-dispatched as the slot frees. There is no external scheduler or issue auto-pickup yet.
+
+## What works today
+
+The current deterministic path is:
 
 ```text
-Idea
-  → Plan               (draft + review the plan)
-  → Implement          (isolated, sandboxed work)
-  → Review / Validate  (fresh-context review; run tests/checks)
-  → (loop back to Implement when changes are requested)
-  → Commit → Open PR
+Idea intake         (manager creates the run and task contract)
+  → Implementation  (Pi adapter in an isolated worktree; noop adapter by default)
+  → Validation      (containerized validation command; status gate only)
+  → Commit          (commit made from the post-implementation worker snapshot)
+  → PR-ready stop   (branch/commit/diff metadata; no forge push, no PR)
 ```
 
-Every stage is a unit in an editable workflow graph. The human's default touchpoint is **approving the resulting PR** — but any stage's actor can be an agent *or* a human, and you can place an approval gate anywhere.
+The full commit → PR-ready loop requires an adapter that produces changes (the Pi agent). With the default `noop` adapter the implementation step writes nothing, so the run reaches the commit stage and stops there with *no changes to commit*.
 
-## How it works
+Routing is based on structured `status` values only. There is no resident coordinator LLM, semantic verdict engine, review stage, configurable fix loop, or human approval stage in the skeleton.
 
-- **Workflow templates & snapshots.** Start from a project-default template, adjust it for a run if you want, then it freezes into a snapshot for a reproducible run.
-- **Stages with agent-or-human actors.** Idea intake, Implementation, Review, Validation, Commit, PR creation, Memory update — each performed by an assigned **agent profile** or by a human.
-- **Harness-coordinated, not a free-for-all.** Agents are isolated and don't talk to each other directly; the harness dispatches each one a curated brief and reads back a structured result. Runs stay reproducible and each agent's context stays focused.
-- **Fresh-context review.** Review runs with its own context and judges a target (the plan, the diff, validation evidence) instead of inheriting the implementer's assumptions.
-- **Configurable delivery policy.** Branch + PR is the recommended default; direct integration and human approval gates are *configurable choices*, not mandatory ceremony.
+The web UI lets you submit a run, watch stage/event progress over SSE, inspect artifacts and diffs, cancel a run, and see runner health. Runs and artifacts are persisted under `.parley-data` by default.
+
+Submitted runs are enqueued and auto-dispatched to the local runner slot as it frees; the UI shows queue depth and the effective policy. Optional TOML settings (`.parley/config.toml`) select defaults such as the queue policy (`auto_when_ready`, `max_concurrent`, `backlog_cap`); settings change which defaults apply, never the deterministic routing.
+
+## Intended direction
+
+The long-term product direction is still a configurable workflow harness:
+
+- editable workflow templates and run snapshots
+- agent-or-human stages for planning, implementation, review, validation, commit, PR creation, and memory update
+- semantic review verdicts and fix loops
+- configurable delivery policy, including real push/PR creation
+- agent profiles, context packets, auto-pickup, and curated memory
+- additional agent families and sandbox substrates beyond Pi/rootless Podman
+
+Those are direction, not current behavior.
 
 ## Sandboxed by design
 
-Isolation is a core feature, not an afterthought. Parley treats agents as untrusted automation and runs them inside isolated containers.
+Isolation is a core feature. Parley treats agents as untrusted automation and runs live agent/validation work inside sandboxed containers.
 
-- **You provide one working runtime; Parley owns the rest.** Point Parley at a container runtime you provide — **rootless Podman** today, with **Docker** and **remote runners you operate** planned. Parley owns the isolation recipe, mounts, and lifecycle, so you never hand-configure container internals.
-- **Filesystem & credential isolation.** No host home mount; edit work runs in per-task worktrees, not your primary checkout; credentials are brokered, never handed raw to workers.
-- **Secure by default, your machine is yours.** Sandboxing is on by default; a clearly-labeled "no sandbox" option exists for users who knowingly want it — never as a silent fallback.
-- **Local-first.** Parley runs on infrastructure *you* control — your own machine, or a remote host you operate. It is not a hosted service.
+- **Today:** rootless Podman is the implemented sandbox provider.
+- **Today:** Pi is the only real agent family; validation runs as its own adapter.
+- **Today:** edit work happens in per-run worktrees, not your primary checkout.
+- **Today:** credentials are referenced through explicit local paths/volumes; they are not intended to be committed into the repo.
+- **Planned, not done:** Docker support, remote runners, and non-Pi agent families.
 
 ## Pluggable, adapter-ready
 
-- **Agent profiles.** Pi is the first supported agent family, behind a generic agent interface so other families can follow. Core models stay vendor-neutral.
-- **Context engineering at the boundary.** Parley curates what each agent is given and reads structured output back; agents manage their own working context. Focused context, more reliable agents.
+The runner has a generic adapter interface, but the only real supported agent family today is **Pi**. The generic interface is a seam for future adapters, not a claim of broad provider support.
+
+Parley curates the dispatch contract and reads structured reports back from adapters. Agents manage their own working context inside that boundary.
+
+## Build, run, and test
+
+Prerequisites:
+
+- Go 1.26 (see `go.mod`)
+- `make`
+- rootless Podman (required for submitted-run validation and the live test targets)
+
+Build both binaries:
+
+```sh
+make build
+```
+
+Run the Manager and its spawned Runner:
+
+```sh
+make run
+```
+
+`make run` builds first, starts the web UI at `http://127.0.0.1:8080` by default, and stores local state in `.parley-data`. Override with environment variables such as `PARLEY_ADDR`, `PARLEY_DATA_DIR`, and `PARLEY_RUNNER_BIN`.
+
+The default implementation adapter is `noop`, which makes no file changes — useful as a smoke test, but a run using it stops at the commit stage with *no changes to commit*. To exercise the full commit → PR-ready loop, run the real Pi adapter by providing the Pi worker image/auth configuration and opting in explicitly, for example:
+
+```sh
+PARLEY_ADAPTER=pi \
+PARLEY_PI_AUTH_JSON=/path/to/auth.json \
+PARLEY_PI_IMAGE=localhost/parley-pi-worker:0.78.0 \
+make run
+```
+
+Validation uses a rootless Podman container. Tune it with `PARLEY_VALIDATION_IMAGE`, `PARLEY_VALIDATION_CMD`, and `PARLEY_VALIDATION_NETWORK`.
+
+Useful test targets:
+
+```sh
+make test
+make vet
+make test-race
+make test-integration
+make test-live-m4
+make test-live-m5
+make test-live-m5-loop
+```
+
+The live targets are guarded and require the Podman images, Pi auth volume/path, and environment described in the `Makefile`.
 
 ## What Parley is not
 
@@ -59,17 +132,9 @@ Isolation is a core feature, not an afterthought. Parley treats agents as untrus
 - not a generic chatbot UI
 - not a black-box "fully autonomous engineer"
 - not a hosted cloud service
+- not currently a tool that pushes branches or opens pull requests for you
 
 Parley is a workflow layer that makes agentic software work **structured, inspectable, and governable**.
-
-## Status
-
-Honest current state:
-
-- **Local-first**, intended to run as a local process with a responsive web UI (not a TUI).
-- **Dry-run by default.** Guarded local execution (including an experimental local Pi mode) is opt-in and still maturing.
-- **Pi-first**, with the agent interface kept generic for future families.
-- No published release yet. Remote runners, real sync/handoff, and broad multi-runtime support are **planned, not done.**
 
 ## Name and namespace
 
@@ -79,7 +144,7 @@ The product is **Parley**; the project uses **`agent-parley`** for URLs and pack
 
 ## Contributing
 
-Parley is early and welcomes focused contributions — workflow/stage design, execution-isolation safety, event/artifact formats, agent-profile prototypes, and UI sketches. Open an issue or design note before a large PR.
+Parley is early and welcomes focused contributions to the current skeleton and its next layers: workflow depth, sandbox safety, event/artifact contracts, runner adapters, web UI, and PR-ready delivery. Open an issue or design note before a large PR.
 
 ## License
 
