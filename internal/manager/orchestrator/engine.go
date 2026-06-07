@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/agent-parley/parley/internal/manager/contextpack"
@@ -185,8 +186,20 @@ func (e *Engine) StartRun(ctx context.Context, idea string) (string, error) {
 }
 
 func (e *Engine) StartProjectRun(ctx context.Context, projectID, idea string) (string, error) {
+	return e.StartProjectRunInput(ctx, projectID, contract.TaskInput{Idea: idea})
+}
+
+func (e *Engine) StartRunInput(ctx context.Context, input contract.TaskInput) (string, error) {
+	return e.StartProjectRunInput(ctx, e.projectID, input)
+}
+
+func (e *Engine) StartProjectRunInput(ctx context.Context, projectID string, input contract.TaskInput) (string, error) {
 	if projectID == "" {
 		projectID = e.projectID
+	}
+	input.RefinementLevel = contract.NormalizeRefinementLevel(input.RefinementLevel)
+	if err := contract.ValidateRefinementLevel(input.RefinementLevel); err != nil {
+		return "", err
 	}
 	e.queueMu.Lock()
 	pending, err := e.store.CountRunsByProjectStatus(ctx, projectID, store.RunStatusPending)
@@ -199,12 +212,12 @@ func (e *Engine) StartProjectRun(ctx context.Context, projectID, idea string) (s
 		e.queueMu.Unlock()
 		return "", QueueBacklogFullError{Pending: pending, Cap: e.queuePolicy.BacklogCap}
 	}
-	wr, err := e.createQueuedRun(ctx, projectID, idea)
+	wr, err := e.createQueuedRun(ctx, projectID, input)
 	if err != nil {
 		e.queueMu.Unlock()
 		return "", err
 	}
-	if _, err := e.emit(ctx, runEvent(wr, "run.created", event.Actor{Kind: event.ActorKindUser, ID: "local"}, "run created", map[string]any{"idea": idea})); err != nil {
+	if _, err := e.emit(ctx, runEvent(wr, "run.created", event.Actor{Kind: event.ActorKindUser, ID: "local"}, "run created", map[string]any{"idea": input.Idea, "refinement_level": wr.Run.RefinementLevel})); err != nil {
 		e.queueMu.Unlock()
 		return "", err
 	}
@@ -223,7 +236,7 @@ func (e *Engine) StartProjectRun(ctx context.Context, projectID, idea string) (s
 	return wr.Run.ID, nil
 }
 
-func (e *Engine) createQueuedRun(ctx context.Context, projectID, idea string) (store.WorkflowRun, error) {
+func (e *Engine) createQueuedRun(ctx context.Context, projectID string, input contract.TaskInput) (store.WorkflowRun, error) {
 	if _, err := e.store.GetProject(ctx, projectID); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return store.WorkflowRun{}, err
@@ -232,7 +245,7 @@ func (e *Engine) createQueuedRun(ctx context.Context, projectID, idea string) (s
 			return store.WorkflowRun{}, err
 		}
 	}
-	wr, err := e.store.CreateWorkflowRunForProject(ctx, projectID, idea)
+	wr, err := e.store.CreateWorkflowRunForProjectInput(ctx, projectID, input)
 	if err != nil {
 		return store.WorkflowRun{}, err
 	}
@@ -244,7 +257,7 @@ func (e *Engine) createQueuedRun(ctx context.Context, projectID, idea string) (s
 	if err := e.store.UpdateStageAdapter(ctx, wr.ValidationStage.ID, e.validationAdapter); err != nil {
 		return store.WorkflowRun{}, err
 	}
-	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, "", false)); err != nil {
+	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, "", "", false)); err != nil {
 		return store.WorkflowRun{}, err
 	}
 	return wr, nil
@@ -770,7 +783,16 @@ func (e *Engine) runIdeaIntake(ctx context.Context, wr store.WorkflowRun) (repor
 	if err != nil {
 		return report.Report{}, err
 	}
-	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, contractArtifact.ID, true)); err != nil {
+	planMarkdown := taskPlanMarkdown(wr)
+	planArtifact, err := e.store.SaveArtifact(ctx, wr.Run.ID, "task_plan", "text/markdown", []byte(planMarkdown), ".md")
+	if err != nil {
+		return report.Report{}, err
+	}
+	if err := e.store.UpdateStageTaskPlanArtifactID(ctx, stage.ID, planArtifact.ID); err != nil {
+		return report.Report{}, err
+	}
+	stage.TaskPlanArtifactID = planArtifact.ID
+	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, contractArtifact.ID, planArtifact.ID, true)); err != nil {
 		return report.Report{}, err
 	}
 	rep := report.Report{
@@ -782,11 +804,13 @@ func (e *Engine) runIdeaIntake(ctx context.Context, wr store.WorkflowRun) (repor
 		StageType:     stage.StageType,
 		Actor:         report.Actor{Kind: report.ActorKindHarness, ID: "idea_intake"},
 		Status:        report.StatusCompleted,
-		Summary:       "idea frozen into task contract and workflow snapshot",
-		EvidenceRefs:  []string{contractArtifact.ID},
+		Summary:       "idea refined into a task plan and frozen workflow snapshot",
+		EvidenceRefs:  []string{contractArtifact.ID, planArtifact.ID},
 		Payload: map[string]any{
 			"idea_verbatim":             wr.Run.Idea,
+			"refinement_level":          wr.Run.RefinementLevel,
 			"task_contract_artifact_id": contractArtifact.ID,
+			"task_plan_artifact_id":     planArtifact.ID,
 			"workflow_snapshot_frozen":  true,
 			"implementation_stage_id":   wr.ImplementationStage.ID,
 			"validation_stage_id":       wr.ValidationStage.ID,
@@ -1045,6 +1069,9 @@ func (e *Engine) startStage(ctx context.Context, wr store.WorkflowRun, stage sto
 	if stage.StageBriefArtifactID != "" {
 		data["stage_brief_artifact_id"] = stage.StageBriefArtifactID
 	}
+	if stage.TaskPlanArtifactID != "" {
+		data["task_plan_artifact_id"] = stage.TaskPlanArtifactID
+	}
 	_, err := e.emit(ctx, stageEvent(wr, stage, "stage.started", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, summary, data))
 	return err
 }
@@ -1082,7 +1109,10 @@ func (e *Engine) completeStage(ctx context.Context, wr store.WorkflowRun, stage 
 	if stage.StageBriefArtifactID != "" {
 		data["stage_brief_artifact_id"] = stage.StageBriefArtifactID
 	}
-	copyPayloadStrings(data, rep.Payload, "branch", "commit_sha", "diff_artifact_id", "task_contract_artifact_id")
+	if stage.TaskPlanArtifactID != "" {
+		data["task_plan_artifact_id"] = stage.TaskPlanArtifactID
+	}
+	copyPayloadStrings(data, rep.Payload, "branch", "commit_sha", "diff_artifact_id", "task_contract_artifact_id", "task_plan_artifact_id")
 	if typ := completionEventType(rep); typ != "" {
 		if _, err := e.emit(ctx, stageEvent(wr, stage, typ, reportActor(rep.Actor, stage), rep.Summary, data)); err != nil {
 			return err
@@ -1178,7 +1208,7 @@ func (e *Engine) emit(ctx context.Context, ev event.Event) (event.Event, error) 
 	return persisted, nil
 }
 
-func (e *Engine) workflowSnapshot(wr store.WorkflowRun, taskContractArtifactID string, frozen bool) map[string]any {
+func (e *Engine) workflowSnapshot(wr store.WorkflowRun, taskContractArtifactID, taskPlanArtifactID string, frozen bool) map[string]any {
 	return map[string]any{
 		"schema_version":            1,
 		"project_id":                wr.Run.ProjectID,
@@ -1188,8 +1218,10 @@ func (e *Engine) workflowSnapshot(wr store.WorkflowRun, taskContractArtifactID s
 		"task_id":                   wr.Task.ID,
 		"attempt_id":                wr.Attempt.ID,
 		"idea_verbatim":             wr.Run.Idea,
+		"refinement_level":          wr.Run.RefinementLevel,
 		"frozen":                    frozen,
 		"task_contract_artifact_id": taskContractArtifactID,
+		"task_plan_artifact_id":     taskPlanArtifactID,
 		"graph":                     "idea_intake->implementation->validation->commit->pr_ready",
 		"edges":                     e.graph.Edges(),
 		"stages": []map[string]string{
@@ -1207,7 +1239,67 @@ func stageSnapshot(stage store.Stage) map[string]string {
 }
 
 func taskContractMarkdown(wr store.WorkflowRun) string {
-	return fmt.Sprintf("# Parley Task Contract\n\nProject ID: `%s`\nRun ID: `%s`\nTask ID: `%s`\nAttempt ID: `%s`\n\n## User idea (verbatim)\n\n%s\n", wr.Run.ProjectID, wr.Run.ID, wr.Task.ID, wr.Attempt.ID, wr.Run.Idea)
+	return fmt.Sprintf("# Parley Task Contract\n\nProject ID: `%s`\nRun ID: `%s`\nTask ID: `%s`\nAttempt ID: `%s`\nRefinement level: `%s`\n\n## User idea (verbatim)\n\n%s\n", wr.Run.ProjectID, wr.Run.ID, wr.Task.ID, wr.Attempt.ID, wr.Run.RefinementLevel, wr.Run.Idea)
+}
+
+func taskPlanMarkdown(wr store.WorkflowRun) string {
+	level := contract.NormalizeRefinementLevel(wr.Run.RefinementLevel)
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Task Plan\n\n")
+	fmt.Fprintf(&b, "Project ID: `%s`\n", wr.Run.ProjectID)
+	fmt.Fprintf(&b, "Run ID: `%s`\n", wr.Run.ID)
+	fmt.Fprintf(&b, "Task ID: `%s`\n", wr.Task.ID)
+	fmt.Fprintf(&b, "Attempt ID: `%s`\n", wr.Attempt.ID)
+	fmt.Fprintf(&b, "Refinement level: `%s`\n\n", level)
+	b.WriteString("## User Idea\n\n")
+	b.WriteString(wr.Run.Idea)
+	if !strings.HasSuffix(wr.Run.Idea, "\n") {
+		b.WriteString("\n")
+	}
+	b.WriteString("\n## Plan Boundary\n\n")
+	b.WriteString("This artifact is a task plan, not a workflow definition. It does not choose, add, remove, or reorder workflow stages.\n\n")
+	b.WriteString("## Objective\n\n")
+	b.WriteString("Deliver the submitted idea while preserving the repository's current behavior outside the requested change.\n\n")
+	switch level {
+	case contract.RefinementLevelDirect:
+		b.WriteString("## Direct Plan\n\n")
+		b.WriteString("- Preserve the idea as the implementation prompt.\n")
+		b.WriteString("- Make the smallest coherent code and test changes needed for the request.\n")
+		b.WriteString("- Validate the touched path with the narrowest meaningful build or test command.\n")
+	case contract.RefinementLevelDeep:
+		b.WriteString("## Deep Plan\n\n")
+		b.WriteString("### Scope\n\n")
+		b.WriteString("- Treat the submitted idea as the authoritative task statement.\n")
+		b.WriteString("- Identify affected behavior before editing, then keep changes inside that boundary.\n")
+		b.WriteString("- Preserve existing project conventions unless the task explicitly requires a change.\n\n")
+		b.WriteString("### Implementation Approach\n\n")
+		b.WriteString("- Inspect the current code path and tests that own the requested behavior.\n")
+		b.WriteString("- Make a narrow vertical change that produces observable behavior, not only internal scaffolding.\n")
+		b.WriteString("- Add or update focused tests for the new behavior and any regression-prone edge cases.\n")
+		b.WriteString("- Keep generated artifacts in the project workspace; do not write planning material into the repository unless requested.\n\n")
+		b.WriteString("### Risks And Checks\n\n")
+		b.WriteString("- Watch for hidden coupling with persistence, event payloads, and stage routing.\n")
+		b.WriteString("- Prefer additive schema changes with migration defaults when persisted state is touched.\n")
+		b.WriteString("- Run build, vet, and targeted tests before handoff.\n\n")
+		b.WriteString("### Open Questions\n\n")
+		b.WriteString("- None are blocking for execution; unresolved details should be documented in the handoff or issue tracker.\n")
+	default:
+		b.WriteString("## Standard Plan\n\n")
+		b.WriteString("### Scope\n\n")
+		b.WriteString("- Implement the submitted idea without changing unrelated workflow policy.\n")
+		b.WriteString("- Keep output artifacts private to the project workspace unless the user explicitly promotes them.\n\n")
+		b.WriteString("### Implementation Approach\n\n")
+		b.WriteString("- Read the code and tests for the affected path.\n")
+		b.WriteString("- Make the smallest end-to-end change that satisfies the task.\n")
+		b.WriteString("- Persist any new run output as an artifact rather than repository content.\n\n")
+		b.WriteString("### Validation\n\n")
+		b.WriteString("- Run focused tests for changed packages.\n")
+		b.WriteString("- Run build and vet before the work is handed off.\n\n")
+		b.WriteString("### Open Questions\n\n")
+		b.WriteString("- No clarification is required before starting; any material limitation should be recorded in the handoff.\n")
+	}
+	b.WriteString("\n")
+	return b.String()
 }
 
 func implementationInput(wr store.WorkflowRun, ideaReport report.Report) map[string]any {

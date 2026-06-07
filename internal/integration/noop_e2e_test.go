@@ -104,7 +104,7 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 			t.Fatalf("stage brief missing source-labeled content:\n%s", content)
 		}
 	}
-	var reportArtifacts, diffArtifacts, contractArtifacts, stageBriefArtifacts int
+	var reportArtifacts, diffArtifacts, contractArtifacts, planArtifacts, stageBriefArtifacts int
 	for _, artifact := range bundle.Artifacts {
 		switch artifact.Kind {
 		case "report":
@@ -113,6 +113,8 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 			diffArtifacts++
 		case "task_contract":
 			contractArtifacts++
+		case "task_plan":
+			planArtifacts++
 		case "stage_brief":
 			stageBriefArtifacts++
 		}
@@ -125,6 +127,9 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 	}
 	if contractArtifacts != 1 {
 		t.Fatalf("expected 1 task contract artifact, got %d", contractArtifacts)
+	}
+	if planArtifacts != 1 {
+		t.Fatalf("expected 1 task plan artifact, got %d", planArtifacts)
 	}
 	if stageBriefArtifacts != 5 {
 		t.Fatalf("expected 5 stage brief artifacts, got %d", stageBriefArtifacts)

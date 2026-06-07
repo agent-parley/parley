@@ -96,6 +96,7 @@ type Run struct {
 	ProjectID          string
 	TaskID             string
 	Idea               string
+	RefinementLevel    string
 	Status             string
 	EventLogArtifactID string
 	CreatedAt          string
@@ -103,13 +104,14 @@ type Run struct {
 }
 
 type Task struct {
-	ID           string
-	ProjectID    string
-	RepositoryID string
-	Idea         string
-	Status       string
-	CreatedAt    string
-	UpdatedAt    string
+	ID              string
+	ProjectID       string
+	RepositoryID    string
+	Idea            string
+	RefinementLevel string
+	Status          string
+	CreatedAt       string
+	UpdatedAt       string
 }
 
 type Attempt struct {
@@ -132,6 +134,7 @@ type Stage struct {
 	Adapter              string
 	Status               string
 	StageBriefArtifactID string
+	TaskPlanArtifactID   string
 	CreatedAt            string
 	UpdatedAt            string
 }
@@ -238,7 +241,13 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureProjectWorkflowSchema(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureRefinementSchema(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureStageBriefSchema(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureTaskPlanSchema(ctx); err != nil {
 		return err
 	}
 	if err := s.ensureRunnerRegistrySchema(ctx); err != nil {
@@ -522,6 +531,22 @@ func (s *Store) ensureProjectWorkflowSchema(ctx context.Context) error {
 	return s.rebuildWorkflowTablesForProjects(ctx)
 }
 
+func (s *Store) ensureRefinementSchema(ctx context.Context) error {
+	for _, table := range []string{"tasks", "runs"} {
+		cols, err := s.tableColumns(ctx, table)
+		if err != nil {
+			return err
+		}
+		if _, ok := cols["refinement_level"]; ok {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN refinement_level TEXT NOT NULL DEFAULT '%s'`, table, contract.RefinementLevelStandard)); err != nil {
+			return fmt.Errorf("add %s refinement_level column: %w", table, err)
+		}
+	}
+	return nil
+}
+
 func (s *Store) ensureStageBriefSchema(ctx context.Context) error {
 	cols, err := s.tableColumns(ctx, "stages")
 	if err != nil {
@@ -532,6 +557,20 @@ func (s *Store) ensureStageBriefSchema(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE stages ADD COLUMN stage_brief_artifact_id TEXT REFERENCES artifacts(id)`); err != nil {
 		return fmt.Errorf("add stage brief artifact column: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ensureTaskPlanSchema(ctx context.Context) error {
+	cols, err := s.tableColumns(ctx, "stages")
+	if err != nil {
+		return err
+	}
+	if _, ok := cols["task_plan_artifact_id"]; ok {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE stages ADD COLUMN task_plan_artifact_id TEXT REFERENCES artifacts(id)`); err != nil {
+		return fmt.Errorf("add task plan artifact column: %w", err)
 	}
 	return nil
 }
@@ -627,6 +666,7 @@ func createWorkflowTablesTx(ctx context.Context, tx *sql.Tx) error {
   project_id TEXT NOT NULL REFERENCES projects(id),
   repository_id TEXT REFERENCES repositories(id),
   idea TEXT NOT NULL,
+  refinement_level TEXT NOT NULL DEFAULT 'standard',
   status TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -637,6 +677,7 @@ func createWorkflowTablesTx(ctx context.Context, tx *sql.Tx) error {
   project_id TEXT NOT NULL REFERENCES projects(id),
   task_id TEXT NOT NULL REFERENCES tasks(id),
   idea TEXT NOT NULL,
+  refinement_level TEXT NOT NULL DEFAULT 'standard',
   status TEXT NOT NULL,
   event_log_artifact_id TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -666,6 +707,7 @@ func createWorkflowTablesTx(ctx context.Context, tx *sql.Tx) error {
   adapter TEXT,
   status TEXT NOT NULL,
   stage_brief_artifact_id TEXT REFERENCES artifacts(id),
+  task_plan_artifact_id TEXT REFERENCES artifacts(id),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY(project_id, run_id, attempt_id) REFERENCES attempts(project_id, run_id, id),
@@ -743,8 +785,23 @@ func (s *Store) CreateWorkflowRun(ctx context.Context, idea string) (WorkflowRun
 }
 
 func (s *Store) CreateWorkflowRunForProject(ctx context.Context, projectID, idea string) (WorkflowRun, error) {
+	return s.CreateWorkflowRunForProjectInput(ctx, projectID, contract.TaskInput{Idea: idea})
+}
+
+func (s *Store) CreateWorkflowRunInput(ctx context.Context, input contract.TaskInput) (WorkflowRun, error) {
+	return s.CreateWorkflowRunForProjectInput(ctx, DefaultProjectID, input)
+}
+
+func (s *Store) CreateWorkflowRunForProjectInput(ctx context.Context, projectID string, input contract.TaskInput) (WorkflowRun, error) {
 	project, err := s.GetProject(ctx, projectID)
 	if err != nil {
+		return WorkflowRun{}, err
+	}
+	input.RefinementLevel = contract.NormalizeRefinementLevel(input.RefinementLevel)
+	if strings.TrimSpace(input.Idea) == "" {
+		return WorkflowRun{}, fmt.Errorf("idea is required")
+	}
+	if err := contract.ValidateRefinementLevel(input.RefinementLevel); err != nil {
 		return WorkflowRun{}, err
 	}
 	repositoryID, err := s.DefaultRepositoryID(ctx, projectID)
@@ -754,9 +811,9 @@ func (s *Store) CreateWorkflowRunForProject(ctx context.Context, projectID, idea
 	now := nowRFC3339()
 	wr := WorkflowRun{
 		Project: project,
-		Run:     Run{ID: ids.New("run"), ProjectID: project.ID, Idea: idea, Status: RunStatusPending, EventLogArtifactID: ids.New("artifact"), CreatedAt: now, UpdatedAt: now},
+		Run:     Run{ID: ids.New("run"), ProjectID: project.ID, Idea: input.Idea, RefinementLevel: input.RefinementLevel, Status: RunStatusPending, EventLogArtifactID: ids.New("artifact"), CreatedAt: now, UpdatedAt: now},
 	}
-	wr.Task = Task{ID: ids.New("task"), ProjectID: project.ID, RepositoryID: repositoryID, Idea: idea, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
+	wr.Task = Task{ID: ids.New("task"), ProjectID: project.ID, RepositoryID: repositoryID, Idea: input.Idea, RefinementLevel: input.RefinementLevel, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
 	wr.Run.TaskID = wr.Task.ID
 	wr.Attempt = Attempt{ID: ids.New("attempt"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
 	wr.IdeaIntakeStage = Stage{ID: ids.New("stage"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeIdeaIntake, Adapter: "", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
@@ -784,10 +841,10 @@ func (s *Store) CreateWorkflowRunForProject(ctx context.Context, projectID, idea
 	if wr.Task.RepositoryID != "" {
 		repoValue = wr.Task.RepositoryID
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO tasks(id, project_id, repository_id, idea, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, wr.Task.ID, wr.Task.ProjectID, repoValue, wr.Task.Idea, wr.Task.Status, now, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO tasks(id, project_id, repository_id, idea, refinement_level, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, wr.Task.ID, wr.Task.ProjectID, repoValue, wr.Task.Idea, wr.Task.RefinementLevel, wr.Task.Status, now, now); err != nil {
 		return WorkflowRun{}, fmt.Errorf("insert task: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, wr.Run.ID, wr.Run.ProjectID, wr.Run.TaskID, wr.Run.Idea, wr.Run.Status, wr.Run.EventLogArtifactID, now, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(id, project_id, task_id, idea, refinement_level, status, event_log_artifact_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, wr.Run.ID, wr.Run.ProjectID, wr.Run.TaskID, wr.Run.Idea, wr.Run.RefinementLevel, wr.Run.Status, wr.Run.EventLogArtifactID, now, now); err != nil {
 		return WorkflowRun{}, fmt.Errorf("insert run: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO attempts(id, project_id, run_id, task_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, wr.Attempt.ID, wr.Attempt.ProjectID, wr.Attempt.RunID, wr.Attempt.TaskID, wr.Attempt.Status, now, now); err != nil {
@@ -808,7 +865,7 @@ func (s *Store) CreateWorkflowRunForProject(ctx context.Context, projectID, idea
 }
 
 func (s *Store) ListRuns(ctx context.Context) ([]Run, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at FROM runs ORDER BY created_at DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, task_id, idea, refinement_level, status, event_log_artifact_id, created_at, updated_at FROM runs ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list runs: %w", err)
 	}
@@ -816,7 +873,7 @@ func (s *Store) ListRuns(ctx context.Context) ([]Run, error) {
 }
 
 func (s *Store) ListRunsForProject(ctx context.Context, projectID string) ([]Run, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE project_id = ? ORDER BY created_at DESC`, projectID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, task_id, idea, refinement_level, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE project_id = ? ORDER BY created_at DESC`, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("list project runs: %w", err)
 	}
@@ -824,7 +881,7 @@ func (s *Store) ListRunsForProject(ctx context.Context, projectID string) ([]Run
 }
 
 func (s *Store) ListRunsByStatus(ctx context.Context, status string, limit int) ([]Run, error) {
-	query := `SELECT id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE status = ? ORDER BY created_at ASC`
+	query := `SELECT id, project_id, task_id, idea, refinement_level, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE status = ? ORDER BY created_at ASC`
 	args := []any{status}
 	if limit > 0 {
 		query += ` LIMIT ?`
@@ -838,7 +895,7 @@ func (s *Store) ListRunsByStatus(ctx context.Context, status string, limit int) 
 }
 
 func (s *Store) ListRunsByProjectStatus(ctx context.Context, projectID, status string, limit int) ([]Run, error) {
-	query := `SELECT id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE project_id = ? AND status = ? ORDER BY created_at ASC`
+	query := `SELECT id, project_id, task_id, idea, refinement_level, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE project_id = ? AND status = ? ORDER BY created_at ASC`
 	args := []any{projectID, status}
 	if limit > 0 {
 		query += ` LIMIT ?`
@@ -872,9 +929,10 @@ func scanRuns(rows *sql.Rows) ([]Run, error) {
 	var runs []Run
 	for rows.Next() {
 		var run Run
-		if err := rows.Scan(&run.ID, &run.ProjectID, &run.TaskID, &run.Idea, &run.Status, &run.EventLogArtifactID, &run.CreatedAt, &run.UpdatedAt); err != nil {
+		if err := rows.Scan(&run.ID, &run.ProjectID, &run.TaskID, &run.Idea, &run.RefinementLevel, &run.Status, &run.EventLogArtifactID, &run.CreatedAt, &run.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan run: %w", err)
 		}
+		run.RefinementLevel = contract.NormalizeRefinementLevel(run.RefinementLevel)
 		runs = append(runs, run)
 	}
 	return runs, rows.Err()
@@ -882,10 +940,11 @@ func scanRuns(rows *sql.Rows) ([]Run, error) {
 
 func (s *Store) GetRun(ctx context.Context, runID string) (Run, error) {
 	var run Run
-	err := s.db.QueryRowContext(ctx, `SELECT id, project_id, task_id, idea, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE id = ?`, runID).Scan(&run.ID, &run.ProjectID, &run.TaskID, &run.Idea, &run.Status, &run.EventLogArtifactID, &run.CreatedAt, &run.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT id, project_id, task_id, idea, refinement_level, status, event_log_artifact_id, created_at, updated_at FROM runs WHERE id = ?`, runID).Scan(&run.ID, &run.ProjectID, &run.TaskID, &run.Idea, &run.RefinementLevel, &run.Status, &run.EventLogArtifactID, &run.CreatedAt, &run.UpdatedAt)
 	if err != nil {
 		return Run{}, fmt.Errorf("get run %s: %w", runID, err)
 	}
+	run.RefinementLevel = contract.NormalizeRefinementLevel(run.RefinementLevel)
 	return run, nil
 }
 
@@ -900,9 +959,10 @@ func (s *Store) GetWorkflowRun(ctx context.Context, runID string) (WorkflowRun, 
 	}
 	var task Task
 	var repo sql.NullString
-	if err := s.db.QueryRowContext(ctx, `SELECT id, project_id, repository_id, idea, status, created_at, updated_at FROM tasks WHERE id = ? AND project_id = ?`, run.TaskID, run.ProjectID).Scan(&task.ID, &task.ProjectID, &repo, &task.Idea, &task.Status, &task.CreatedAt, &task.UpdatedAt); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT id, project_id, repository_id, idea, refinement_level, status, created_at, updated_at FROM tasks WHERE id = ? AND project_id = ?`, run.TaskID, run.ProjectID).Scan(&task.ID, &task.ProjectID, &repo, &task.Idea, &task.RefinementLevel, &task.Status, &task.CreatedAt, &task.UpdatedAt); err != nil {
 		return WorkflowRun{}, fmt.Errorf("get task for run %s: %w", runID, err)
 	}
+	task.RefinementLevel = contract.NormalizeRefinementLevel(task.RefinementLevel)
 	if repo.Valid {
 		task.RepositoryID = repo.String
 	}
@@ -933,11 +993,11 @@ func (s *Store) GetWorkflowRun(ctx context.Context, runID string) (WorkflowRun, 
 }
 
 func (s *Store) ListStages(ctx context.Context, runID string) ([]Stage, error) {
-	return s.listStages(ctx, `SELECT id, project_id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, COALESCE(stage_brief_artifact_id,''), created_at, updated_at FROM stages WHERE run_id = ? ORDER BY created_at ASC`, runID)
+	return s.listStages(ctx, `SELECT id, project_id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, COALESCE(stage_brief_artifact_id,''), COALESCE(task_plan_artifact_id,''), created_at, updated_at FROM stages WHERE run_id = ? ORDER BY created_at ASC`, runID)
 }
 
 func (s *Store) ListStagesForAttempt(ctx context.Context, runID, attemptID string) ([]Stage, error) {
-	return s.listStages(ctx, `SELECT id, project_id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, COALESCE(stage_brief_artifact_id,''), created_at, updated_at FROM stages WHERE run_id = ? AND attempt_id = ? ORDER BY created_at ASC`, runID, attemptID)
+	return s.listStages(ctx, `SELECT id, project_id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, COALESCE(stage_brief_artifact_id,''), COALESCE(task_plan_artifact_id,''), created_at, updated_at FROM stages WHERE run_id = ? AND attempt_id = ? ORDER BY created_at ASC`, runID, attemptID)
 }
 
 func (s *Store) listStages(ctx context.Context, query string, args ...any) ([]Stage, error) {
@@ -949,7 +1009,7 @@ func (s *Store) listStages(ctx context.Context, query string, args ...any) ([]St
 	var stages []Stage
 	for rows.Next() {
 		var stage Stage
-		if err := rows.Scan(&stage.ID, &stage.ProjectID, &stage.RunID, &stage.TaskID, &stage.AttemptID, &stage.StageType, &stage.Adapter, &stage.Status, &stage.StageBriefArtifactID, &stage.CreatedAt, &stage.UpdatedAt); err != nil {
+		if err := rows.Scan(&stage.ID, &stage.ProjectID, &stage.RunID, &stage.TaskID, &stage.AttemptID, &stage.StageType, &stage.Adapter, &stage.Status, &stage.StageBriefArtifactID, &stage.TaskPlanArtifactID, &stage.CreatedAt, &stage.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan stage: %w", err)
 		}
 		stages = append(stages, stage)
@@ -1018,6 +1078,14 @@ func (s *Store) UpdateStageBriefArtifactID(ctx context.Context, stageID, artifac
 	_, err := s.db.ExecContext(ctx, `UPDATE stages SET stage_brief_artifact_id = ?, updated_at = ? WHERE id = ?`, artifactID, nowRFC3339(), stageID)
 	if err != nil {
 		return fmt.Errorf("update stage brief artifact: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) UpdateStageTaskPlanArtifactID(ctx context.Context, stageID, artifactID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE stages SET task_plan_artifact_id = ?, updated_at = ? WHERE id = ?`, artifactID, nowRFC3339(), stageID)
+	if err != nil {
+		return fmt.Errorf("update stage task plan artifact: %w", err)
 	}
 	return nil
 }

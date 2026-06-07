@@ -13,6 +13,7 @@ import (
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
+	"github.com/agent-parley/parley/internal/shared/contract"
 )
 
 func TestHandleRunsBacklogRejectionRendersIndexNotice(t *testing.T) {
@@ -66,12 +67,15 @@ func TestHandleRunsBacklogRejectionRendersIndexNotice(t *testing.T) {
 func TestHandleRunsHappyPathRedirectsToRun(t *testing.T) {
 	st := openRouteTestStore(t)
 	controller := &fakeRunController{state: defaultRouteQueueState()}
-	controller.startRunFunc = func(_ context.Context, projectID, idea string) (string, error) {
+	controller.startRunInputFunc = func(_ context.Context, projectID string, input contract.TaskInput) (string, error) {
 		if projectID != store.DefaultProjectID {
 			t.Fatalf("StartProjectRun projectID = %q", projectID)
 		}
-		if idea != "build the thing" {
-			t.Fatalf("StartRun idea = %q", idea)
+		if input.Idea != "build the thing" {
+			t.Fatalf("StartRun idea = %q", input.Idea)
+		}
+		if input.RefinementLevel != contract.RefinementLevelStandard {
+			t.Fatalf("refinement level = %q, want standard", input.RefinementLevel)
 		}
 		return "run_happy", nil
 	}
@@ -85,6 +89,42 @@ func TestHandleRunsHappyPathRedirectsToRun(t *testing.T) {
 	if got := rec.Header().Get("Location"); got != "/projects/default/runs/run_happy" {
 		t.Fatalf("Location = %q want /projects/default/runs/run_happy", got)
 	}
+}
+
+func TestHandleRunsPassesExplicitRefinementLevel(t *testing.T) {
+	st := openRouteTestStore(t)
+	controller := &fakeRunController{state: defaultRouteQueueState()}
+	controller.startRunInputFunc = func(_ context.Context, projectID string, input contract.TaskInput) (string, error) {
+		if projectID != store.DefaultProjectID {
+			t.Fatalf("StartProjectRun projectID = %q", projectID)
+		}
+		if input.Idea != "build the thing" {
+			t.Fatalf("StartRun idea = %q", input.Idea)
+		}
+		if input.RefinementLevel != contract.RefinementLevelDeep {
+			t.Fatalf("refinement level = %q, want deep", input.RefinementLevel)
+		}
+		return "run_deep", nil
+	}
+
+	srv := newRouteTestServer(t, st, controller)
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/runs", cookie, url.Values{"idea": {"build the thing"}, "refinement_level": {"deep"}, "_csrf": {csrf}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST /runs status = %d want %d body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
+	}
+}
+
+func TestHandleRunsRejectsInvalidRefinementLevel(t *testing.T) {
+	st := openRouteTestStore(t)
+	controller := &fakeRunController{state: defaultRouteQueueState()}
+	srv := newRouteTestServer(t, st, controller)
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/runs", cookie, url.Values{"idea": {"build the thing"}, "refinement_level": {"max"}, "_csrf": {csrf}})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /runs status = %d want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	assertContains(t, rec.Body.String(), "refinement_level must be one of")
 }
 
 func TestHandleStartQueuedRunRedirectsOnSuccess(t *testing.T) {
@@ -194,6 +234,7 @@ type fakeRunController struct {
 	state              orchestrator.QueueState
 	queueStateFunc     func(context.Context) (orchestrator.QueueState, error)
 	startRunFunc       func(context.Context, string, string) (string, error)
+	startRunInputFunc  func(context.Context, string, contract.TaskInput) (string, error)
 	startQueuedRunFunc func(context.Context, string) error
 	cancelRunFunc      func(context.Context, string) error
 }
@@ -203,6 +244,16 @@ func (f *fakeRunController) StartProjectRun(ctx context.Context, projectID, idea
 		return f.startRunFunc(ctx, projectID, idea)
 	}
 	return "", errors.New("unexpected StartProjectRun call")
+}
+
+func (f *fakeRunController) StartProjectRunInput(ctx context.Context, projectID string, input contract.TaskInput) (string, error) {
+	if f.startRunInputFunc != nil {
+		return f.startRunInputFunc(ctx, projectID, input)
+	}
+	if f.startRunFunc != nil {
+		return f.startRunFunc(ctx, projectID, input.Idea)
+	}
+	return "", errors.New("unexpected StartProjectRunInput call")
 }
 
 func (f *fakeRunController) StartQueuedRun(ctx context.Context, runID string) error {

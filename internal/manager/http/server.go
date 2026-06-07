@@ -9,10 +9,12 @@ import (
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
+	"github.com/agent-parley/parley/internal/shared/contract"
 )
 
 type RunController interface {
 	StartProjectRun(context.Context, string, string) (string, error)
+	StartProjectRunInput(context.Context, string, contract.TaskInput) (string, error)
 	StartQueuedRun(context.Context, string) error
 	CancelRun(context.Context, string) error
 	QueueState(context.Context) (orchestrator.QueueState, error)
