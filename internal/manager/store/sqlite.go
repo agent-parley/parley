@@ -45,11 +45,26 @@ const (
 
 	RunnerOriginSpawned    = "spawned"
 	RunnerOriginRegistered = "registered"
+
+	ProjectMemoryKindLesson                 = "lesson"
+	ProjectMemoryKindRepoFact               = "repo_fact"
+	ProjectMemoryKindGotcha                 = "gotcha"
+	ProjectMemoryKindImplementationLandmark = "implementation_landmark"
+	ProjectMemoryKindPriorResult            = "prior_result"
+	ProjectMemoryKindDecision               = "decision"
+	ProjectMemoryKindFreshnessNote          = "freshness_note"
+
+	ProjectMemoryMaxEntriesPerUpdate = 20
+	ProjectMemoryMaxKindRunes        = 64
+	ProjectMemoryMaxTitleRunes       = 160
+	ProjectMemoryMaxBodyRunes        = 2000
+	ProjectMemoryMaxSourceRunes      = 500
 )
 
 var (
 	ErrWorkflowTemplateInUse       = errors.New("workflow template is used by an active run")
 	ErrWorkflowTemplateNotEditable = errors.New("workflow template is not editable")
+	ErrProjectMemoryCuratorStage   = errors.New("project memory writes require a memory_update curator stage")
 )
 
 type Store struct {
@@ -159,6 +174,51 @@ type Artifact struct {
 	CreatedAt string
 }
 
+type ProjectMemoryEntry struct {
+	ID               string
+	ProjectID        string
+	Kind             string
+	Title            string
+	Body             string
+	SourceRunID      string
+	SourceTaskID     string
+	SourceStageID    string
+	SourceArtifactID string
+	CuratorStageID   string
+	SourceSummary    string
+	CreatedAt        string
+	UpdatedAt        string
+}
+
+type ProjectMemoryInput struct {
+	Kind             string
+	Title            string
+	Body             string
+	SourceStageID    string
+	SourceArtifactID string
+	SourceSummary    string
+}
+
+type ProjectMemoryUpdate struct {
+	ProjectID      string
+	RunID          string
+	TaskID         string
+	CuratorStageID string
+	Entries        []ProjectMemoryInput
+}
+
+type ProjectMemoryRejection struct {
+	Title            string `json:"title"`
+	Reason           string `json:"reason"`
+	SourceStageID    string `json:"source_stage_id,omitempty"`
+	SourceArtifactID string `json:"source_artifact_id,omitempty"`
+}
+
+type ProjectMemoryUpdateResult struct {
+	Entries    []ProjectMemoryEntry
+	Rejections []ProjectMemoryRejection
+}
+
 type Runner struct {
 	ID               string
 	Status           string
@@ -191,6 +251,7 @@ type WorkflowRun struct {
 	ValidationStage     Stage
 	CommitStage         Stage
 	PRReadyStage        Stage
+	MemoryUpdateStage   Stage
 }
 
 type RunBundle struct {
@@ -1004,6 +1065,8 @@ func defaultStageAdapter(stage workflow.StageTemplate) string {
 	switch {
 	case stage.Type == workflow.StageTypeValidation:
 		return "validation"
+	case stage.Type == workflow.StageTypeMemoryUpdate:
+		return ""
 	case stage.Actor == workflow.ActorAgent:
 		return "noop"
 	default:
@@ -1033,6 +1096,10 @@ func assignWorkflowRunStages(wr *WorkflowRun, stages []Stage) {
 		case contract.StageTypePRReady, contract.StageTypePRCreation:
 			if wr.PRReadyStage.ID == "" {
 				wr.PRReadyStage = stage
+			}
+		case contract.StageTypeMemoryUpdate:
+			if wr.MemoryUpdateStage.ID == "" {
+				wr.MemoryUpdateStage = stage
 			}
 		}
 	}

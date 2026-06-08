@@ -214,6 +214,70 @@ func TestProjectWorkspaceAndNoOrphanWorkflowRecords(t *testing.T) {
 	}
 }
 
+func TestProjectMemoryIsSQLiteOnlyAndCuratorGated(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "learn from a run", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if wr.MemoryUpdateStage.ID == "" {
+		t.Fatal("autonomous workflow did not persist a memory update stage")
+	}
+	sourceReport := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		StageID:       wr.ImplementationStage.ID,
+		StageType:     wr.ImplementationStage.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: "noop"},
+		Status:        report.StatusCompleted,
+		Summary:       "implementation found a reusable gotcha",
+		Payload:       map[string]any{},
+		Errors:        []string{},
+	}
+	sourceArtifact, err := st.SaveReportArtifact(ctx, sourceReport)
+	if err != nil {
+		t.Fatalf("save source report: %v", err)
+	}
+	valid := ProjectMemoryInput{Kind: ProjectMemoryKindGotcha, Title: "Validation image needs git", Body: "Validation containers need git available before worktree snapshots can be inspected.", SourceStageID: wr.ImplementationStage.ID, SourceArtifactID: sourceArtifact.ID, SourceSummary: "implementation report"}
+	if _, err := st.ApplyProjectMemoryUpdate(ctx, ProjectMemoryUpdate{ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, CuratorStageID: wr.ImplementationStage.ID, Entries: []ProjectMemoryInput{valid}}); !errors.Is(err, ErrProjectMemoryCuratorStage) {
+		t.Fatalf("non-curator memory update error = %v, want ErrProjectMemoryCuratorStage", err)
+	}
+	result, err := st.ApplyProjectMemoryUpdate(ctx, ProjectMemoryUpdate{ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, CuratorStageID: wr.MemoryUpdateStage.ID, Entries: []ProjectMemoryInput{
+		valid,
+		{Kind: ProjectMemoryKindLesson, Title: "Token leak", Body: "password=super-secret", SourceStageID: wr.ImplementationStage.ID, SourceArtifactID: sourceArtifact.ID, SourceSummary: "bad candidate"},
+		{Kind: "standing_instruction", Title: "Always run broad checks", Body: "Always run every validation command", SourceStageID: wr.ImplementationStage.ID, SourceArtifactID: sourceArtifact.ID, SourceSummary: "bad candidate"},
+		{Kind: "current_code_truth", Title: "Current code truth", Body: "current code truth belongs in repo evidence, not memory", SourceStageID: wr.ImplementationStage.ID, SourceArtifactID: sourceArtifact.ID, SourceSummary: "bad candidate"},
+	}})
+	if err != nil {
+		t.Fatalf("apply memory update: %v", err)
+	}
+	if len(result.Entries) != 1 || len(result.Rejections) != 3 {
+		t.Fatalf("memory update result entries=%d rejections=%d: %#v", len(result.Entries), len(result.Rejections), result)
+	}
+	entry := result.Entries[0]
+	if entry.ProjectID != wr.Run.ProjectID || entry.SourceArtifactID != sourceArtifact.ID || entry.SourceStageID != wr.ImplementationStage.ID || entry.CuratorStageID != wr.MemoryUpdateStage.ID {
+		t.Fatalf("memory entry is not source-linked/curator-linked: %+v", entry)
+	}
+	entries, err := st.ListProjectMemoryEntries(ctx, wr.Run.ProjectID)
+	if err != nil {
+		t.Fatalf("list memory entries: %v", err)
+	}
+	if len(entries) != 1 || entries[0].ID != entry.ID {
+		t.Fatalf("persisted memory entries = %#v, want %s", entries, entry.ID)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "projects", DefaultProjectID, "workspace", "memory.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("project memory file stat err = %v, want not exist", err)
+	}
+}
+
 func TestRunlessRunnerEventPersistsWithNullRunIDAndScopedSequence(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(ctx, t.TempDir())
