@@ -717,7 +717,7 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 		return err
 	}
 	currentID := runtime.Graph.Start()
-	maxTransitions := maxInt(16, len(runtime.Stages)*8)
+	maxTransitions := maxInt(16, len(runtime.Stages)*(maxFixLoops(runtime.Template, workflow.StageTemplate{})+2)*4)
 	var lastReport report.Report
 	var lastValidationReport report.Report
 	var lastDeliveryReport report.Report
@@ -751,6 +751,27 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 		nextID, ok := runtime.Graph.Next(runtimeStage.Template.ID, rep.Status)
 		if !ok {
 			return e.stopRun(context.Background(), wr, rep.Status, "workflow stopped after "+runtimeStage.Template.ID)
+		}
+		if isFixLoopTransition(runtime, runtimeStage.Template, rep, nextID) {
+			if fixLoopExhausted, err := e.fixLoopExhausted(context.Background(), wr, runtime.Template, runtimeStage.Template); err != nil {
+				return err
+			} else if fixLoopExhausted {
+				rep = withFixLoopExhaustion(rep, maxFixLoops(runtime.Template, runtimeStage.Template))
+				nextID = runtime.Graph.StopID()
+			} else {
+				newWR, newRuntime, err := e.startFixLoopAttempt(context.Background(), wr, runtime, runtimeStage, rep, nextID)
+				if err != nil {
+					return err
+				}
+				wr = newWR
+				runtime = newRuntime
+				lastReport = rep
+				lastValidationReport = report.Report{}
+				snapshot = workerSnapshot{}
+				snapshotErr = nil
+				currentID = nextID
+				continue
+			}
 		}
 		if nextID == runtime.Graph.StopID() && !reportCarriesDeliveryPayload(rep) && lastDeliveryReport.StageID != "" {
 			rep = withDeliveryPayload(rep, lastDeliveryReport)
@@ -786,7 +807,12 @@ func (e *Engine) runWorkflowStage(ctx context.Context, wr store.WorkflowRun, run
 		return e.dispatchStage(ctx, wr, stage, stage.Adapter, templateStage.Type, e.stageDispatchInput(runtime, templateStage, implementationInput(wr, lastReport)))
 	case workflow.StageTypeValidation:
 		return e.dispatchStage(ctx, wr, stage, stage.Adapter, templateStage.Type, e.stageDispatchInput(runtime, templateStage, map[string]any{"idea": wr.Run.Idea}))
-	case workflow.StageTypeReview, workflow.StageTypeMemoryUpdate:
+	case workflow.StageTypeReview:
+		if templateStage.Actor == workflow.ActorHuman {
+			return e.runHumanStage(ctx, wr, stage, templateStage)
+		}
+		return e.runReviewStage(ctx, wr, runtime, runtimeStage, lastReport, lastValidationReport, snapshot, snapshotErr)
+	case workflow.StageTypeMemoryUpdate:
 		if templateStage.Actor == workflow.ActorHuman {
 			return e.runHumanStage(ctx, wr, stage, templateStage)
 		}
@@ -1145,6 +1171,7 @@ func (e *Engine) runStopReport(ctx context.Context, wr store.WorkflowRun, stage 
 			"previous_stage_id":   previous.StageID,
 			"previous_stage_type": previous.StageType,
 			"previous_status":     previous.Status,
+			"previous_verdict":    verdictString(previous.Verdict),
 		},
 		Errors: errors,
 	}
@@ -1271,6 +1298,9 @@ func (e *Engine) completeStage(ctx context.Context, wr store.WorkflowRun, stage 
 		"stage_type":         stage.StageType,
 		"status":             rep.Status,
 		"report_artifact_id": artifact.ID,
+	}
+	if rep.Verdict != nil {
+		data["verdict"] = string(*rep.Verdict)
 	}
 	if stage.WorkflowStageID != "" {
 		data["workflow_stage_id"] = stage.WorkflowStageID
@@ -1511,13 +1541,37 @@ func taskPlanMarkdown(wr store.WorkflowRun) string {
 	return b.String()
 }
 
-func implementationInput(wr store.WorkflowRun, ideaReport report.Report) map[string]any {
-	return map[string]any{
+func implementationInput(wr store.WorkflowRun, previous report.Report) map[string]any {
+	input := map[string]any{
 		"idea":                      wr.Run.Idea,
 		"contract_markdown":         taskContractMarkdown(wr),
-		"task_contract_artifact_id": payloadString(ideaReport.Payload, "task_contract_artifact_id"),
+		"task_contract_artifact_id": payloadString(previous.Payload, "task_contract_artifact_id"),
 		"workflow_snapshot_frozen":  true,
 	}
+	if previous.StageID != "" {
+		input["previous_stage_report"] = reportInput(previous)
+	}
+	if previous.StageType == contract.StageTypeReview && previous.Status == report.StatusChangesRequested {
+		accepted := acceptedFindings(previous.Payload)
+		input["accepted_findings"] = accepted
+		input["fix_loop_context"] = map[string]any{
+			"source":            "review_arbitration",
+			"trigger_stage_id":  previous.StageID,
+			"trigger_status":    previous.Status,
+			"review_verdict":    verdictString(previous.Verdict),
+			"accepted_findings": accepted,
+		}
+	}
+	if previous.StageType == contract.StageTypeValidation && previous.Status == report.StatusFailed {
+		input["fix_loop_context"] = map[string]any{
+			"source":           "validation_failure",
+			"trigger_stage_id": previous.StageID,
+			"trigger_status":   previous.Status,
+			"summary":          previous.Summary,
+			"errors":           append([]string{}, previous.Errors...),
+		}
+	}
+	return input
 }
 
 func dispatchFailedReport(wr store.WorkflowRun, stage store.Stage, adapterName string, err error) report.Report {

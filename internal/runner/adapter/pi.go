@@ -126,7 +126,7 @@ func (a Pi) Run(ctx context.Context, disp contract.Dispatch, sink runnerio.Sink)
 			return report.Report{}, err
 		}
 		repairInvocation := prepared.Invocation
-		repairInvocation.Command = a.piCommand(repairPrompt(validationErr))
+		repairInvocation.Command = a.piCommand(repairPrompt(disp, validationErr))
 		repairResult, repairRunErr := a.runInvocation(ctx, disp, repairInvocation, sink)
 		if ctx.Err() != nil {
 			return report.Report{}, fmt.Errorf("pi adapter canceled: %w", ctx.Err())
@@ -186,12 +186,21 @@ func (a Pi) Prepare(ctx context.Context, disp contract.Dispatch) (PiPreparedRun,
 		return PiPreparedRun{}, fmt.Errorf("create pi agent-state root: %w", err)
 	}
 
+	effectiveAttemptID := disp.AttemptID
+	if executionID := sanitizePathSegment(inputString(disp.Input, "adapter_execution_id")); executionID != "" {
+		effectiveAttemptID = disp.AttemptID + "-" + executionID
+	}
+
+	worktreeAttemptID := effectiveAttemptID
+	if disp.StageType == contract.StageTypeReview {
+		worktreeAttemptID = disp.AttemptID
+	}
 	wt, err := worktree.Create(ctx, worktree.CreateOptions{
 		DataRoot:   a.opts.DataRoot,
 		ProjectID:  projectID,
 		RunID:      disp.RunID,
 		TaskID:     disp.TaskID,
-		AttemptID:  disp.AttemptID,
+		AttemptID:  worktreeAttemptID,
 		SourceRepo: a.opts.SourceRepo,
 	})
 	if err != nil {
@@ -200,13 +209,15 @@ func (a Pi) Prepare(ctx context.Context, disp contract.Dispatch) (PiPreparedRun,
 
 	artifactDir := a.opts.ArtifactDir
 	if artifactDir == "" {
-		artifactDir = filepath.Join(a.opts.DataRoot, "projects", projectID, "artifacts", disp.RunID, disp.TaskID, disp.AttemptID)
+		artifactDir = filepath.Join(a.opts.DataRoot, "projects", projectID, "artifacts", disp.RunID, disp.TaskID, effectiveAttemptID)
+	} else if effectiveAttemptID != disp.AttemptID {
+		artifactDir = filepath.Join(artifactDir, effectiveAttemptID)
 	}
 	if err := os.MkdirAll(artifactDir, 0o700); err != nil {
 		return PiPreparedRun{}, fmt.Errorf("create pi artifact dir: %w", err)
 	}
 
-	runStateDir := filepath.Join(a.opts.AgentStateRoot, "runs", disp.RunID, disp.TaskID, disp.AttemptID)
+	runStateDir := filepath.Join(a.opts.AgentStateRoot, "runs", disp.RunID, disp.TaskID, effectiveAttemptID)
 	agentDir := filepath.Join(runStateDir, "agent")
 	if err := os.MkdirAll(agentDir, 0o700); err != nil {
 		return PiPreparedRun{}, fmt.Errorf("create pi agent dir: %w", err)
@@ -243,8 +254,12 @@ func (a Pi) invocation(disp contract.Dispatch, worktreePath, artifactDir, agentD
 	if image == "" {
 		image = defaultPiImage
 	}
+	repoMode := "rw"
+	if disp.StageType == contract.StageTypeReview {
+		repoMode = "ro"
+	}
 	mounts := []provider.Mount{
-		{Host: worktreePath, Container: containerRepoPath, Mode: "rw", Relabel: "Z"},
+		{Host: worktreePath, Container: containerRepoPath, Mode: repoMode, Relabel: "Z"},
 		{Host: artifactDir, Container: containerWorkspacePath, Mode: "rw", Relabel: "Z"},
 	}
 	if a.opts.ReferenceRoot != "" {
@@ -301,6 +316,19 @@ func (a Pi) readStampedReport(disp contract.Dispatch, prepared PiPreparedRun, re
 	if err != nil {
 		return report.Report{}, err
 	}
+	payload := map[string]any{
+		"adapter":     piName,
+		"provider":    optionDefault(a.opts.PiProvider, defaultPiProvider),
+		"model":       optionDefault(a.opts.Model, defaultPiModel),
+		"thinking":    optionDefault(a.opts.Thinking, defaultPiThinking),
+		"exit_code":   result.ExitCode,
+		"started_at":  result.StartedAt,
+		"ended_at":    result.EndedAt,
+		"report_path": "/project/workspace/report.json",
+	}
+	for key, value := range workerReport.Payload {
+		payload[key] = value
+	}
 	rep := report.Report{
 		SchemaVersion: report.SchemaVersion,
 		RunID:         disp.RunID,
@@ -310,20 +338,11 @@ func (a Pi) readStampedReport(disp contract.Dispatch, prepared PiPreparedRun, re
 		StageType:     disp.StageType,
 		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: piName},
 		Status:        workerReport.Status,
-		Verdict:       nil,
+		Verdict:       workerReport.Verdict,
 		Summary:       workerReport.Summary,
-		EvidenceRefs:  []string{},
-		Payload: map[string]any{
-			"adapter":     piName,
-			"provider":    optionDefault(a.opts.PiProvider, defaultPiProvider),
-			"model":       optionDefault(a.opts.Model, defaultPiModel),
-			"thinking":    optionDefault(a.opts.Thinking, defaultPiThinking),
-			"exit_code":   result.ExitCode,
-			"started_at":  result.StartedAt,
-			"ended_at":    result.EndedAt,
-			"report_path": "/project/workspace/report.json",
-		},
-		Errors: workerReport.Errors,
+		EvidenceRefs:  append([]string{}, workerReport.EvidenceRefs...),
+		Payload:       payload,
+		Errors:        workerReport.Errors,
 	}
 	if runErr != nil {
 		rep.Payload["provider_run_error"] = runErr.Error()
@@ -354,19 +373,25 @@ func readPiWorkerReport(path string) (piWorkerReport, error) {
 	if err != nil {
 		return piWorkerReport{}, fmt.Errorf("parse report.json errors: %w", err)
 	}
-	return piWorkerReport{Status: raw.Status, Summary: raw.Summary, Errors: errs}, nil
+	return piWorkerReport{Status: raw.Status, Verdict: raw.Verdict, Summary: raw.Summary, EvidenceRefs: raw.EvidenceRefs, Payload: raw.Payload, Errors: errs}, nil
 }
 
 type piWorkerReport struct {
-	Status  string
-	Summary string
-	Errors  []string
+	Status       string
+	Verdict      *report.Verdict
+	Summary      string
+	EvidenceRefs []string
+	Payload      map[string]any
+	Errors       []string
 }
 
 type piWorkerReportJSON struct {
-	Status  string          `json:"status"`
-	Summary string          `json:"summary"`
-	Errors  json.RawMessage `json:"errors"`
+	Status       string          `json:"status"`
+	Verdict      *report.Verdict `json:"verdict"`
+	Summary      string          `json:"summary"`
+	EvidenceRefs []string        `json:"evidence_refs"`
+	Payload      map[string]any  `json:"payload"`
+	Errors       json.RawMessage `json:"errors"`
 }
 
 func parsePiReportErrors(raw json.RawMessage) ([]string, error) {
@@ -442,8 +467,12 @@ func initialPrompt() string {
 	return "Read /project/workspace/worker-input.md, execute that worker contract exactly, and write /project/workspace/report.json when finished."
 }
 
-func repairPrompt(validationErr error) string {
-	return "The previous worker run did not produce a valid /project/workspace/report.json. Do not modify /project/repo during this repair. Read the existing work if needed, then replace /project/workspace/report.json with the required JSON subset {status, summary, errors}. Validation error: " + validationErr.Error()
+func repairPrompt(disp contract.Dispatch, validationErr error) string {
+	shape := "required JSON subset {status, summary, errors}"
+	if disp.StageType == contract.StageTypeReview {
+		shape = "review JSON contract from /project/workspace/worker-input.md, including payload and verdict when the role is arbiter"
+	}
+	return "The previous worker run did not produce a valid /project/workspace/report.json. Do not modify /project/repo during this repair. Read /project/workspace/worker-input.md and the existing work if needed, then replace /project/workspace/report.json with the " + shape + ". Validation error: " + validationErr.Error()
 }
 
 func workerInputMarkdown(disp contract.Dispatch) string {
@@ -475,18 +504,91 @@ func workerInputMarkdown(disp contract.Dispatch) string {
 		b.WriteString(contextText)
 		b.WriteString("\n\n")
 	}
+	if disp.StageType == contract.StageTypeReview {
+		appendReviewWorkerContract(&b, disp)
+	}
 	b.WriteString("## Filesystem Contract\n\n")
-	b.WriteString("- Edit repository files only under `/project/repo`.\n")
+	if disp.StageType == contract.StageTypeReview {
+		b.WriteString("- Do not modify repository files during review; inspect `/project/repo` only.\n")
+	} else {
+		b.WriteString("- Edit repository files only under `/project/repo`.\n")
+	}
 	b.WriteString("- Write worker artifacts only under `/project/workspace`.\n")
 	b.WriteString("- Treat `/project/reference` as read-only reference material.\n")
 	b.WriteString("- Do not read or write host paths outside the mounted `/project` layout.\n\n")
 	b.WriteString("## Required Report\n\n")
+	if disp.StageType == contract.StageTypeReview {
+		appendReviewRequiredReport(&b, disp)
+	} else {
+		appendDefaultRequiredReport(&b)
+	}
+	return b.String()
+}
+
+func appendReviewWorkerContract(b *strings.Builder, disp contract.Dispatch) {
+	role := inputString(disp.Input, "review_role")
+	profile := inputString(disp.Input, "review_profile")
+	intensity := inputString(disp.Input, "review_intensity")
+	instructions := inputString(disp.Input, "review_instructions")
+	b.WriteString("## Review Contract\n\n")
+	b.WriteString("This Review stage is user-facing as one reviewer. Internally it always runs exactly one critic and one hidden arbiter; never create a panel and never add a `custom` profile.\n\n")
+	fmt.Fprintf(b, "- Review role for this dispatch: `%s`\n", role)
+	fmt.Fprintf(b, "- Reviewer profile: `%s`\n", profile)
+	fmt.Fprintf(b, "- Review intensity: `%s`\n", intensity)
+	if instructions != "" {
+		fmt.Fprintf(b, "- Additional review instructions: %s\n", instructions)
+	}
+	b.WriteString("- Intensity tunes the single critic's strictness/persona only; it never changes critic count.\n")
+	b.WriteString("- Classifications are `accepted`, `rejected`, `deferred`, or `escalated`; only `accepted` findings may become implementation work.\n\n")
+	if role == contract.ReviewRoleArbiter {
+		b.WriteString("### Arbiter input\n\n")
+		b.WriteString("Classify the critic's raw findings independently. Use the Stage Brief and repository evidence; do not assume the critic is correct. Preserve raw findings for audit.\n\n")
+		b.WriteString("```json\n")
+		b.WriteString(inputJSON(disp.Input, "raw_findings", []any{}))
+		b.WriteString("\n```\n\n")
+	} else {
+		b.WriteString("### Critic task\n\n")
+		b.WriteString("Review the target semantically against the task contract, stage brief, implementation diff, validation evidence, repository evidence, and profile. Produce raw findings only; do not arbitrate and do not emit a verdict.\n\n")
+	}
+}
+
+func appendDefaultRequiredReport(b *strings.Builder) {
 	b.WriteString("Write exactly one report file at `/project/workspace/report.json`. Do not create `summary.md` or `changed-files.txt` for M3. The report must be valid JSON with this semantic subset only:\n\n")
 	b.WriteString("```json\n")
 	b.WriteString("{\n  \"status\": \"completed\",\n  \"summary\": \"short implementation summary\",\n  \"errors\": []\n}\n")
 	b.WriteString("```\n\n")
 	b.WriteString("Allowed status values: `completed`, `failed`, `needs_input`, `invalid`. If status is `failed` or `invalid`, `errors` must be non-empty.\n")
-	return b.String()
+}
+
+func appendReviewRequiredReport(b *strings.Builder, disp contract.Dispatch) {
+	role := inputString(disp.Input, "review_role")
+	b.WriteString("Write exactly one report file at `/project/workspace/report.json`. The adapter preserves `payload` and `verdict` for the manager.\n\n")
+	if role == contract.ReviewRoleArbiter {
+		b.WriteString("The arbiter report must be valid JSON shaped like:\n\n")
+		b.WriteString("```json\n")
+		b.WriteString("{\n  \"status\": \"completed\",\n  \"verdict\": \"pass\",\n  \"summary\": \"short arbitrated review summary\",\n  \"evidence_refs\": [],\n  \"payload\": {\n    \"raw_findings\": [],\n    \"arbitration_decisions\": [\n      {\n        \"finding_id\": \"finding-1\",\n        \"classification\": \"accepted\",\n        \"rationale\": \"why this classification is correct\",\n        \"severity\": \"medium\",\n        \"priority\": \"p2\",\n        \"evidence_refs\": []\n      }\n    ],\n    \"residual_risk\": \"remaining risk notes\",\n    \"confidence\": \"high\"\n  },\n  \"errors\": []\n}\n")
+		b.WriteString("```\n\n")
+		b.WriteString("Allowed verdict values: `pass`, `changes_requested`, `blocked`, `escalate`. Use `changes_requested` only when at least one accepted finding should enter the fix loop. Use `blocked` or `escalate` for terminal human-needed outcomes.\n")
+	} else {
+		b.WriteString("The critic report must be valid JSON shaped like:\n\n")
+		b.WriteString("```json\n")
+		b.WriteString("{\n  \"status\": \"completed\",\n  \"summary\": \"short critic summary\",\n  \"payload\": {\n    \"raw_findings\": [\n      {\n        \"id\": \"finding-1\",\n        \"title\": \"concise finding title\",\n        \"detail\": \"specific issue and why it matters\",\n        \"severity\": \"medium\",\n        \"evidence_refs\": []\n      }\n    ]\n  },\n  \"errors\": []\n}\n")
+		b.WriteString("```\n\n")
+		b.WriteString("Do not include `verdict` in the critic report. The hidden arbiter emits the verdict.\n")
+	}
+	b.WriteString("Allowed status values: `completed`, `failed`, `needs_input`, `invalid`. If status is `failed` or `invalid`, `errors` must be non-empty.\n")
+}
+
+func inputJSON(input map[string]any, key string, fallback any) string {
+	value := fallback
+	if raw, ok := input[key]; ok {
+		value = raw
+	}
+	content, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return "null"
+	}
+	return string(content)
 }
 
 func appendSystemMarkdown(extra string) string {
@@ -500,7 +602,7 @@ You are running as a non-interactive Parley implementation worker.
 - Keep /project/reference read-only.
 - Do not use or request secret environment variables. Provider credentials are already available through the mounted auth.json.
 - Never wait for interactive user input.
-- Always finish by writing /project/workspace/report.json using the required {status, summary, errors} subset.
+- Always finish by writing /project/workspace/report.json using the stage-specific Required Report contract in worker-input.md.
 `
 	if strings.TrimSpace(extra) == "" {
 		return base
@@ -517,6 +619,23 @@ func inputString(input map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func sanitizePathSegment(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return strings.Trim(b.String(), "_")
 }
 
 func optionDefault(value, fallback string) string {

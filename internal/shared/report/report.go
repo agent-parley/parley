@@ -24,8 +24,21 @@ const (
 	StatusInvalid          = "invalid"
 )
 
-// Verdict is reserved for judgment stages outside M0/M1.
 type Verdict string
+
+const (
+	ReviewVerdictPass             Verdict = "pass"
+	ReviewVerdictChangesRequested Verdict = "changes_requested"
+	ReviewVerdictBlocked          Verdict = "blocked"
+	ReviewVerdictEscalate         Verdict = "escalate"
+)
+
+const (
+	ReviewFindingAccepted  = "accepted"
+	ReviewFindingRejected  = "rejected"
+	ReviewFindingDeferred  = "deferred"
+	ReviewFindingEscalated = "escalated"
+)
 
 // Actor identifies the producer of a report.
 type Actor struct {
@@ -77,6 +90,9 @@ func (r Report) Validate() error {
 	if !validStatus(r.Status) {
 		errs = append(errs, fmt.Errorf("status %q is invalid", r.Status))
 	}
+	if r.Verdict != nil && !validVerdictForStage(r.StageType, *r.Verdict) {
+		errs = append(errs, fmt.Errorf("verdict %q is invalid for stage_type %q", *r.Verdict, r.StageType))
+	}
 	if (r.Status == StatusFailed || r.Status == StatusInvalid) && len(r.Errors) == 0 {
 		errs = append(errs, fmt.Errorf("errors must be populated when status=%s", r.Status))
 	}
@@ -114,6 +130,20 @@ func validStatus(v string) bool {
 	switch v {
 	case StatusCompleted, StatusApproved, StatusChangesRequested, StatusFailed, StatusNeedsInput, StatusInvalid:
 		return true
+	default:
+		return false
+	}
+}
+
+func validVerdictForStage(stageType string, verdict Verdict) bool {
+	switch stageType {
+	case contract.StageTypeReview:
+		switch verdict {
+		case ReviewVerdictPass, ReviewVerdictChangesRequested, ReviewVerdictBlocked, ReviewVerdictEscalate:
+			return true
+		default:
+			return false
+		}
 	default:
 		return false
 	}

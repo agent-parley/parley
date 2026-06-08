@@ -49,6 +49,7 @@ func (g Graph) Edges() map[string]string {
 
 func (g Graph) addStage(stageType, completedNext string) {
 	g.add(stageType, report.StatusCompleted, completedNext)
+	g.add(stageType, report.StatusApproved, completedNext)
 	g.add(stageType, report.StatusFailed, NodeStopReport)
 	g.add(stageType, report.StatusInvalid, NodeStopReport)
 	g.add(stageType, report.StatusNeedsInput, NodeStopReport)

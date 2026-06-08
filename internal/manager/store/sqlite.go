@@ -1127,6 +1127,60 @@ func (s *Store) CreateWorkflowRunForProjectInput(ctx context.Context, projectID 
 	return wr, nil
 }
 
+func (s *Store) CreateAttemptForRun(ctx context.Context, runID string, template workflow.Template) (Attempt, []Stage, error) {
+	run, err := s.GetRun(ctx, runID)
+	if err != nil {
+		return Attempt{}, nil, err
+	}
+	var taskID string
+	if err := s.db.QueryRowContext(ctx, `SELECT id FROM tasks WHERE id = ? AND project_id = ?`, run.TaskID, run.ProjectID).Scan(&taskID); err != nil {
+		return Attempt{}, nil, fmt.Errorf("get task for run %s: %w", runID, err)
+	}
+	template = workflow.NormalizeTemplate(template)
+	if err := workflow.ValidateTemplate(template); err != nil {
+		return Attempt{}, nil, err
+	}
+	now := nowRFC3339()
+	attempt := Attempt{ID: ids.New("attempt"), ProjectID: run.ProjectID, RunID: run.ID, TaskID: taskID, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
+	stages := stagesFromTemplate(run.ProjectID, run.ID, taskID, attempt.ID, template, now)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Attempt{}, nil, fmt.Errorf("begin create attempt: %w", err)
+	}
+	defer rollback(tx)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO attempts(id, project_id, run_id, task_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, attempt.ID, attempt.ProjectID, attempt.RunID, attempt.TaskID, attempt.Status, now, now); err != nil {
+		return Attempt{}, nil, fmt.Errorf("insert attempt: %w", err)
+	}
+	for _, stage := range stages {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO stages(id, project_id, run_id, task_id, attempt_id, workflow_stage_id, stage_type, adapter, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, stage.ID, stage.ProjectID, stage.RunID, stage.TaskID, stage.AttemptID, stage.WorkflowStageID, stage.StageType, stage.Adapter, stage.Status, now, now); err != nil {
+			return Attempt{}, nil, fmt.Errorf("insert stage: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Attempt{}, nil, fmt.Errorf("commit create attempt: %w", err)
+	}
+	return attempt, stages, nil
+}
+
+func (s *Store) CountAttemptsForRun(ctx context.Context, runID string) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempts WHERE run_id = ?`, runID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count attempts for run %s: %w", runID, err)
+	}
+	return count, nil
+}
+
+func (s *Store) UpdateAttemptStatus(ctx context.Context, attemptID, status string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE attempts SET status = ?, updated_at = ? WHERE id = ?`, status, nowRFC3339(), attemptID)
+	if err != nil {
+		return fmt.Errorf("update attempt status: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) ListRuns(ctx context.Context) ([]Run, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, task_id, idea, refinement_level, workflow_template_id, status, event_log_artifact_id, created_at, updated_at FROM runs ORDER BY created_at DESC`)
 	if err != nil {
@@ -1236,7 +1290,7 @@ func (s *Store) GetWorkflowRun(ctx context.Context, runID string) (WorkflowRun, 
 		task.RepositoryID = repo.String
 	}
 	var attempt Attempt
-	if err := s.db.QueryRowContext(ctx, `SELECT id, project_id, run_id, task_id, status, created_at, updated_at FROM attempts WHERE project_id = ? AND run_id = ? AND task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`, run.ProjectID, run.ID, task.ID).Scan(&attempt.ID, &attempt.ProjectID, &attempt.RunID, &attempt.TaskID, &attempt.Status, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT id, project_id, run_id, task_id, status, created_at, updated_at FROM attempts WHERE project_id = ? AND run_id = ? AND task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`, run.ProjectID, run.ID, task.ID).Scan(&attempt.ID, &attempt.ProjectID, &attempt.RunID, &attempt.TaskID, &attempt.Status, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
 		return WorkflowRun{}, fmt.Errorf("get attempt for run %s: %w", runID, err)
 	}
 	stages, err := s.ListStagesForAttempt(ctx, run.ID, attempt.ID)

@@ -31,6 +31,17 @@ func TestReportValidate(t *testing.T) {
 		{name: "failed requires errors", mutate: func(r *Report) { r.Status = StatusFailed }, wantErr: true},
 		{name: "invalid requires errors", mutate: func(r *Report) { r.Status = StatusInvalid }, wantErr: true},
 		{name: "invalid with errors accepted", mutate: func(r *Report) { r.Status = StatusInvalid; r.Errors = []string{"bad"} }},
+		{name: "valid review verdict", mutate: func(r *Report) {
+			r.StageType = contract.StageTypeReview
+			verdict := ReviewVerdictChangesRequested
+			r.Verdict = &verdict
+		}},
+		{name: "invalid review verdict rejected", mutate: func(r *Report) {
+			r.StageType = contract.StageTypeReview
+			verdict := Verdict("request_fix")
+			r.Verdict = &verdict
+		}, wantErr: true},
+		{name: "non-review verdict rejected", mutate: func(r *Report) { verdict := ReviewVerdictPass; r.Verdict = &verdict }, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
