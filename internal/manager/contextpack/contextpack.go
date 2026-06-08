@@ -237,10 +237,15 @@ func defaultProviders() []SourceProvider {
 func defaultAllowlist() map[string][]string {
 	return map[string][]string{
 		contract.StageTypeIdeaIntake:     {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectPreferences},
+		contract.StageTypeIdeaRefinement: {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectPreferences},
+		contract.StageTypeReview:         {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectRules, SourceProjectPreferences},
 		contract.StageTypeImplementation: {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectRules, SourceProjectPreferences},
 		contract.StageTypeValidation:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectRules},
 		contract.StageTypeCommit:         {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectRules},
+		contract.StageTypePRCreation:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
 		contract.StageTypePRReady:        {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
+		contract.StageTypeMemoryUpdate:   {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectPreferences},
+		contract.StageTypeStopReport:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
 	}
 }
 
@@ -445,7 +450,7 @@ func (WorkflowSnapshotProvider) Collect(ctx context.Context, req Request, bounds
 		"attempt_id":     req.Attempt.ID,
 		"template_id":    req.Run.WorkflowTemplateID,
 		"current_stage":  stageSnapshot(req.CurrentStage),
-		"graph":          "idea_intake->implementation->validation->commit->pr_ready",
+		"graph":          "from frozen workflow_template_snapshot",
 		"stages":         stageSnapshots(req.Stages),
 		"attempt_status": req.Attempt.Status,
 	}
@@ -480,6 +485,9 @@ func stageSnapshot(stage store.Stage) map[string]any {
 		"status":     stage.Status,
 		"created_at": stage.CreatedAt,
 		"updated_at": stage.UpdatedAt,
+	}
+	if stage.WorkflowStageID != "" {
+		out["workflow_stage_id"] = stage.WorkflowStageID
 	}
 	if stage.StageBriefArtifactID != "" {
 		out["stage_brief_artifact_id"] = stage.StageBriefArtifactID

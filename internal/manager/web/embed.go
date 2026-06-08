@@ -179,7 +179,7 @@ func prReadyFromEvents(bundle store.RunBundle) PRReadyView {
 	var out PRReadyView
 	for _, ev := range bundle.Events {
 		stageType, _ := ev.Data["stage_type"].(string)
-		if stageType != "pr_ready" && ev.Type != "run.completed" {
+		if stageType != "pr_ready" && stageType != "pr_creation" && ev.Type != "run.completed" {
 			continue
 		}
 		if branch, ok := ev.Data["branch"].(string); ok && branch != "" {
@@ -205,7 +205,7 @@ func short(s string) string {
 
 func statusClass(status string) string {
 	switch status {
-	case "completed", "connected":
+	case "completed", "connected", "approved", "changes_requested":
 		return "status-completed"
 	case "failed", "invalid", "down", "cancelled":
 		return "status-failed"

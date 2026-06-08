@@ -7,11 +7,18 @@ import (
 
 // Stage type names are protocol-visible and must remain stable.
 const (
+	// StageTypeIdeaIntake is the skeleton-era name. New workflow templates use
+	// StageTypeIdeaRefinement, but legacy runs and snapshots may still contain it.
 	StageTypeIdeaIntake     = "idea_intake"
+	StageTypeIdeaRefinement = "idea_refinement"
+	StageTypeReview         = "review"
 	StageTypeImplementation = "implementation"
 	StageTypeValidation     = "validation"
 	StageTypeCommit         = "commit"
+	StageTypePRCreation     = "pr_creation"
 	StageTypePRReady        = "pr_ready"
+	StageTypeMemoryUpdate   = "memory_update"
+	StageTypeStopReport     = "stop_report"
 )
 
 const (

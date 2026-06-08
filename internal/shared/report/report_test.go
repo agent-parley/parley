@@ -26,6 +26,7 @@ func TestReportValidate(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "valid completed"},
+		{name: "valid changes requested", mutate: func(r *Report) { r.Status = StatusChangesRequested }},
 		{name: "invalid status rejected", mutate: func(r *Report) { r.Status = "surprised" }, wantErr: true},
 		{name: "failed requires errors", mutate: func(r *Report) { r.Status = StatusFailed }, wantErr: true},
 		{name: "invalid requires errors", mutate: func(r *Report) { r.Status = StatusInvalid }, wantErr: true},

@@ -43,6 +43,9 @@ const (
 	OnCompleted        = "completed"
 	OnApproved         = "approved"
 	OnChangesRequested = "changes_requested"
+	OnFailed           = "failed"
+	OnNeedsInput       = "needs_input"
+	OnInvalid          = "invalid"
 )
 
 type Template struct {
@@ -151,6 +154,9 @@ func ValidateTemplate(template Template) error {
 		if !stageIDs[edge.To] {
 			errs = append(errs, fmt.Errorf("edge to %q does not reference a stage", edge.To))
 		}
+		if !validEdgeOn(edge.On) {
+			errs = append(errs, fmt.Errorf("edge %q -> %q on %q is invalid", edge.From, edge.To, edge.On))
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -180,18 +186,27 @@ func validActor(actor string) bool {
 	}
 }
 
+func validEdgeOn(on string) bool {
+	switch on {
+	case OnCompleted, OnApproved, OnChangesRequested, OnFailed, OnNeedsInput, OnInvalid:
+		return true
+	default:
+		return false
+	}
+}
+
 func balancedPRDelivery() Template {
 	stages := []StageTemplate{
 		stage("idea_refinement", StageTypeIdeaRefinement, "Idea refinement", ActorHarness, ""),
-		stage("plan_review_human", StageTypeReview, "Plan review", ActorHuman, TargetPlan),
+		reviewStage("plan_review_human", "Plan review", ActorHuman, TargetPlan),
 		stage("implementation", StageTypeImplementation, "Implementation", ActorAgent, ""),
 		stage("validation", StageTypeValidation, "Validation", ActorHarness, ""),
-		stage("change_review_agent", StageTypeReview, "Code review", ActorAgent, TargetCodeChanges),
+		reviewStage("change_review_agent", "Code review", ActorAgent, TargetCodeChanges),
 		stage("commit_feature_branch", StageTypeCommit, "Commit to feature branch", ActorHarness, ""),
 		stage("pr_creation", StageTypePRCreation, "PR creation", ActorHarness, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	return predefined(BalancedPRDeliveryID, "Balanced PR Delivery", "Recommended branch-and-PR workflow with human plan review and agent code review.", true, stages, linearEdges(stages), map[string]any{
+	return predefined(BalancedPRDeliveryID, "Balanced PR Delivery", "Recommended branch-and-PR workflow with human plan review and agent code review.", true, stages, defaultEdges(stages), map[string]any{
 		"branch_policy": "feature_branch",
 		"pr_behavior":   "create_pr",
 		"merge_policy":  "human_stop",
@@ -203,18 +218,19 @@ func autonomousPRDelivery() Template {
 		stage("idea_refinement", StageTypeIdeaRefinement, "Idea refinement", ActorHarness, ""),
 		stage("implementation", StageTypeImplementation, "Implementation", ActorAgent, ""),
 		stage("validation", StageTypeValidation, "Validation", ActorHarness, ""),
-		stage("change_review_agent", StageTypeReview, "Code review", ActorAgent, TargetCodeChanges),
+		reviewStage("change_review_agent", "Code review", ActorAgent, TargetCodeChanges),
 		stage("commit_feature_branch", StageTypeCommit, "Commit to feature branch", ActorHarness, ""),
 		stage("pr_creation", StageTypePRCreation, "PR creation", ActorHarness, ""),
 		stage("memory_update", StageTypeMemoryUpdate, "Memory update", ActorAgent, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	edges := linearEdges(stages)
+	edges := defaultEdges(stages)
 	edges = append(edges, Edge{From: "change_review_agent", To: "implementation", On: OnChangesRequested})
 	return predefined(AutonomousPRDeliveryID, "Autonomous PR Delivery", "Unattended PR workflow with agent review, fix loop, and memory update.", false, stages, edges, map[string]any{
 		"branch_policy": "feature_branch",
 		"pr_behavior":   "create_pr",
 		"fix_loop":      true,
+		"max_fix_loops": 3,
 		"memory_update": true,
 	})
 }
@@ -222,16 +238,16 @@ func autonomousPRDelivery() Template {
 func carefulReviewDelivery() Template {
 	stages := []StageTemplate{
 		stage("idea_refinement", StageTypeIdeaRefinement, "Idea refinement", ActorHarness, ""),
-		stage("plan_review_human", StageTypeReview, "Plan review", ActorHuman, TargetPlan),
+		reviewStage("plan_review_human", "Plan review", ActorHuman, TargetPlan),
 		stage("implementation", StageTypeImplementation, "Implementation", ActorAgent, ""),
 		stage("validation", StageTypeValidation, "Validation", ActorHarness, ""),
-		stage("change_review_agent", StageTypeReview, "Agent code review", ActorAgent, TargetCodeChanges),
-		stage("change_review_human", StageTypeReview, "Human code review", ActorHuman, TargetCodeChanges),
+		reviewStage("change_review_agent", "Agent code review", ActorAgent, TargetCodeChanges),
+		reviewStage("change_review_human", "Human code review", ActorHuman, TargetCodeChanges),
 		stage("commit_feature_branch", StageTypeCommit, "Commit", ActorHarness, ""),
 		stage("pr_creation", StageTypePRCreation, "PR creation", ActorHarness, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	return predefined(CarefulReviewID, "Careful Review Delivery", "Branch-and-PR workflow with human review before implementation and before PR handoff.", false, stages, linearEdges(stages), map[string]any{
+	return predefined(CarefulReviewID, "Careful Review Delivery", "Branch-and-PR workflow with human review before implementation and before PR handoff.", false, stages, defaultEdges(stages), map[string]any{
 		"branch_policy": "feature_branch",
 		"pr_behavior":   "create_pr",
 		"review_depth":  "careful",
@@ -243,12 +259,12 @@ func directCommitDelivery() Template {
 		stage("idea_refinement", StageTypeIdeaRefinement, "Idea refinement", ActorHarness, ""),
 		stage("implementation", StageTypeImplementation, "Implementation", ActorAgent, ""),
 		stage("validation", StageTypeValidation, "Validation", ActorHarness, ""),
-		stage("change_review_agent", StageTypeReview, "Code review", ActorAgent, TargetCodeChanges),
+		reviewStage("change_review_agent", "Code review", ActorAgent, TargetCodeChanges),
 		stage("commit_target_branch", StageTypeCommit, "Commit to target branch", ActorHarness, ""),
 		stage("memory_update", StageTypeMemoryUpdate, "Memory update", ActorAgent, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	return predefined(DirectCommitID, "Direct Commit Delivery", "Advanced opt-in workflow that commits to a target branch instead of creating a PR.", false, stages, linearEdges(stages), map[string]any{
+	return predefined(DirectCommitID, "Direct Commit Delivery", "Advanced opt-in workflow that commits to a target branch instead of creating a PR.", false, stages, defaultEdges(stages), map[string]any{
 		"advanced":      true,
 		"branch_policy": "target_branch",
 		"pr_behavior":   "none",
@@ -275,10 +291,30 @@ func stage(id, stageType, label, actor, target string) StageTemplate {
 	return StageTemplate{ID: id, Type: stageType, Label: label, Actor: actor, Target: target}
 }
 
-func linearEdges(stages []StageTemplate) []Edge {
+func reviewStage(id, label, actor, target string) StageTemplate {
+	stage := stage(id, StageTypeReview, label, actor, target)
+	stage.Settings = map[string]any{"profile": "generalist", "intensity": "normal"}
+	return stage
+}
+
+func defaultEdges(stages []StageTemplate) []Edge {
 	var edges []Edge
+	stopID := ""
+	for _, stage := range stages {
+		if stage.Type == StageTypeStopReport {
+			stopID = stage.ID
+			break
+		}
+	}
 	for i := 0; i < len(stages)-1; i++ {
 		edges = append(edges, Edge{From: stages[i].ID, To: stages[i+1].ID, On: OnCompleted})
+		if stopID != "" && stages[i].ID != stopID {
+			edges = append(edges,
+				Edge{From: stages[i].ID, To: stopID, On: OnFailed},
+				Edge{From: stages[i].ID, To: stopID, On: OnInvalid},
+				Edge{From: stages[i].ID, To: stopID, On: OnNeedsInput},
+			)
+		}
 	}
 	return edges
 }

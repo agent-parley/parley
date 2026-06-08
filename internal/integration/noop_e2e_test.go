@@ -14,6 +14,7 @@ import (
 	"github.com/agent-parley/parley/internal/manager/runnerclient"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
+	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/runner/adapter"
 	"github.com/agent-parley/parley/internal/runner/provider"
 	"github.com/agent-parley/parley/internal/runner/runnerio"
@@ -86,8 +87,9 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 			t.Fatalf("run did not complete; last status=%s", bundle.Run.Status)
 		}
 	}
-	if len(bundle.Stages) != 5 {
-		t.Fatalf("expected 5 stages, got %d", len(bundle.Stages))
+	wantStages := len(workflow.DefaultTemplate().Stages)
+	if len(bundle.Stages) != wantStages {
+		t.Fatalf("expected %d stages, got %d", wantStages, len(bundle.Stages))
 	}
 	for _, stage := range bundle.Stages {
 		if stage.Status != store.RunStatusCompleted {
@@ -119,8 +121,8 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 			stageBriefArtifacts++
 		}
 	}
-	if reportArtifacts != 5 {
-		t.Fatalf("expected 5 report artifacts, got %d", reportArtifacts)
+	if reportArtifacts != wantStages {
+		t.Fatalf("expected %d report artifacts, got %d", wantStages, reportArtifacts)
 	}
 	if diffArtifacts != 1 {
 		t.Fatalf("expected 1 validation diff.patch artifact, got %d", diffArtifacts)
@@ -131,8 +133,8 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 	if planArtifacts != 1 {
 		t.Fatalf("expected 1 task plan artifact, got %d", planArtifacts)
 	}
-	if stageBriefArtifacts != 5 {
-		t.Fatalf("expected 5 stage brief artifacts, got %d", stageBriefArtifacts)
+	if stageBriefArtifacts != wantStages {
+		t.Fatalf("expected %d stage brief artifacts, got %d", wantStages, stageBriefArtifacts)
 	}
 	var completedEvent bool
 	for _, ev := range bundle.Events {

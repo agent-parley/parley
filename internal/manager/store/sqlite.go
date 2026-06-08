@@ -138,6 +138,7 @@ type Stage struct {
 	RunID                string
 	TaskID               string
 	AttemptID            string
+	WorkflowStageID      string
 	StageType            string
 	Adapter              string
 	Status               string
@@ -256,6 +257,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureWorkflowTemplateRefSchema(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureWorkflowStageSchema(ctx); err != nil {
 		return err
 	}
 	if err := s.ensureStageBriefSchema(ctx); err != nil {
@@ -726,6 +730,20 @@ func (s *Store) ensureWorkflowTemplateRefSchema(ctx context.Context) error {
 	return nil
 }
 
+func (s *Store) ensureWorkflowStageSchema(ctx context.Context) error {
+	cols, err := s.tableColumns(ctx, "stages")
+	if err != nil {
+		return err
+	}
+	if _, ok := cols["workflow_stage_id"]; ok {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE stages ADD COLUMN workflow_stage_id TEXT`); err != nil {
+		return fmt.Errorf("add workflow stage id column: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) ensureStageBriefSchema(ctx context.Context) error {
 	cols, err := s.tableColumns(ctx, "stages")
 	if err != nil {
@@ -805,10 +823,10 @@ SELECT a.id, ?, a.run_id,
 FROM attempts_legacy a`, DefaultProjectID); err != nil {
 		return fmt.Errorf("copy legacy attempts: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO stages(id, project_id, run_id, task_id, attempt_id, stage_type, adapter, status, created_at, updated_at)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO stages(id, project_id, run_id, task_id, attempt_id, workflow_stage_id, stage_type, adapter, status, created_at, updated_at)
 SELECT s.id, ?, s.run_id,
   CASE WHEN EXISTS (SELECT 1 FROM tasks t WHERE t.id = s.task_id) THEN s.task_id ELSE (SELECT r.task_id FROM runs r WHERE r.id = s.run_id) END,
-  s.attempt_id, s.stage_type, s.adapter, s.status, s.created_at, s.updated_at
+  s.attempt_id, NULL, s.stage_type, s.adapter, s.status, s.created_at, s.updated_at
 FROM stages_legacy s`, DefaultProjectID); err != nil {
 		return fmt.Errorf("copy legacy stages: %w", err)
 	}
@@ -883,6 +901,7 @@ func createWorkflowTablesTx(ctx context.Context, tx *sql.Tx) error {
   run_id TEXT NOT NULL REFERENCES runs(id),
   task_id TEXT NOT NULL REFERENCES tasks(id),
   attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  workflow_stage_id TEXT,
   stage_type TEXT NOT NULL,
   adapter TEXT,
   status TEXT NOT NULL,
@@ -960,6 +979,65 @@ func (s *Store) checkForeignKeys(ctx context.Context) error {
 	return rows.Err()
 }
 
+func stagesFromTemplate(projectID, runID, taskID, attemptID string, template workflow.Template, now string) []Stage {
+	stages := make([]Stage, 0, len(template.Stages))
+	for _, templateStage := range template.Stages {
+		stage := Stage{
+			ID:              ids.New("stage"),
+			ProjectID:       projectID,
+			RunID:           runID,
+			TaskID:          taskID,
+			AttemptID:       attemptID,
+			WorkflowStageID: templateStage.ID,
+			StageType:       templateStage.Type,
+			Adapter:         defaultStageAdapter(templateStage),
+			Status:          StageStatusPending,
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		}
+		stages = append(stages, stage)
+	}
+	return stages
+}
+
+func defaultStageAdapter(stage workflow.StageTemplate) string {
+	switch {
+	case stage.Type == workflow.StageTypeValidation:
+		return "validation"
+	case stage.Actor == workflow.ActorAgent:
+		return "noop"
+	default:
+		return ""
+	}
+}
+
+func assignWorkflowRunStages(wr *WorkflowRun, stages []Stage) {
+	for _, stage := range stages {
+		switch stage.StageType {
+		case contract.StageTypeIdeaIntake, contract.StageTypeIdeaRefinement:
+			if wr.IdeaIntakeStage.ID == "" {
+				wr.IdeaIntakeStage = stage
+			}
+		case contract.StageTypeImplementation:
+			if wr.ImplementationStage.ID == "" {
+				wr.ImplementationStage = stage
+			}
+		case contract.StageTypeValidation:
+			if wr.ValidationStage.ID == "" {
+				wr.ValidationStage = stage
+			}
+		case contract.StageTypeCommit:
+			if wr.CommitStage.ID == "" {
+				wr.CommitStage = stage
+			}
+		case contract.StageTypePRReady, contract.StageTypePRCreation:
+			if wr.PRReadyStage.ID == "" {
+				wr.PRReadyStage = stage
+			}
+		}
+	}
+}
+
 func (s *Store) CreateWorkflowRun(ctx context.Context, idea string) (WorkflowRun, error) {
 	return s.CreateWorkflowRunForProject(ctx, DefaultProjectID, idea)
 }
@@ -988,7 +1066,8 @@ func (s *Store) CreateWorkflowRunForProjectInput(ctx context.Context, projectID 
 	if input.WorkflowTemplateID == "" {
 		input.WorkflowTemplateID = workflow.DefaultTemplateID
 	}
-	if _, err := s.GetWorkflowTemplate(ctx, input.WorkflowTemplateID); err != nil {
+	template, err := s.GetWorkflowTemplate(ctx, input.WorkflowTemplateID)
+	if err != nil {
 		return WorkflowRun{}, err
 	}
 	repositoryID, err := s.DefaultRepositoryID(ctx, projectID)
@@ -1003,11 +1082,8 @@ func (s *Store) CreateWorkflowRunForProjectInput(ctx context.Context, projectID 
 	wr.Task = Task{ID: ids.New("task"), ProjectID: project.ID, RepositoryID: repositoryID, Idea: input.Idea, RefinementLevel: input.RefinementLevel, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
 	wr.Run.TaskID = wr.Task.ID
 	wr.Attempt = Attempt{ID: ids.New("attempt"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
-	wr.IdeaIntakeStage = Stage{ID: ids.New("stage"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeIdeaIntake, Adapter: "", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
-	wr.ImplementationStage = Stage{ID: ids.New("stage"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeImplementation, Adapter: "noop", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
-	wr.ValidationStage = Stage{ID: ids.New("stage"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeValidation, Adapter: "validation", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
-	wr.CommitStage = Stage{ID: ids.New("stage"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypeCommit, Adapter: "", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
-	wr.PRReadyStage = Stage{ID: ids.New("stage"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, StageType: contract.StageTypePRReady, Adapter: "", Status: StageStatusPending, CreatedAt: now, UpdatedAt: now}
+	stages := stagesFromTemplate(project.ID, wr.Run.ID, wr.Task.ID, wr.Attempt.ID, template, now)
+	assignWorkflowRunStages(&wr, stages)
 
 	eventLogPath := artifactPathForWorkspace(project.WorkspacePath, wr.Run.EventLogArtifactID, ".jsonl")
 	if err := os.MkdirAll(filepath.Dir(eventLogPath), 0o700); err != nil {
@@ -1037,8 +1113,8 @@ func (s *Store) CreateWorkflowRunForProjectInput(ctx context.Context, projectID 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO attempts(id, project_id, run_id, task_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, wr.Attempt.ID, wr.Attempt.ProjectID, wr.Attempt.RunID, wr.Attempt.TaskID, wr.Attempt.Status, now, now); err != nil {
 		return WorkflowRun{}, fmt.Errorf("insert attempt: %w", err)
 	}
-	for _, stage := range []Stage{wr.IdeaIntakeStage, wr.ImplementationStage, wr.ValidationStage, wr.CommitStage, wr.PRReadyStage} {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO stages(id, project_id, run_id, task_id, attempt_id, stage_type, adapter, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, stage.ID, stage.ProjectID, stage.RunID, stage.TaskID, stage.AttemptID, stage.StageType, stage.Adapter, stage.Status, now, now); err != nil {
+	for _, stage := range stages {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO stages(id, project_id, run_id, task_id, attempt_id, workflow_stage_id, stage_type, adapter, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, stage.ID, stage.ProjectID, stage.RunID, stage.TaskID, stage.AttemptID, stage.WorkflowStageID, stage.StageType, stage.Adapter, stage.Status, now, now); err != nil {
 			return WorkflowRun{}, fmt.Errorf("insert stage: %w", err)
 		}
 	}
@@ -1168,29 +1244,16 @@ func (s *Store) GetWorkflowRun(ctx context.Context, runID string) (WorkflowRun, 
 		return WorkflowRun{}, err
 	}
 	wr := WorkflowRun{Project: project, Run: run, Task: task, Attempt: attempt}
-	for _, stage := range stages {
-		switch stage.StageType {
-		case contract.StageTypeIdeaIntake:
-			wr.IdeaIntakeStage = stage
-		case contract.StageTypeImplementation:
-			wr.ImplementationStage = stage
-		case contract.StageTypeValidation:
-			wr.ValidationStage = stage
-		case contract.StageTypeCommit:
-			wr.CommitStage = stage
-		case contract.StageTypePRReady:
-			wr.PRReadyStage = stage
-		}
-	}
+	assignWorkflowRunStages(&wr, stages)
 	return wr, nil
 }
 
 func (s *Store) ListStages(ctx context.Context, runID string) ([]Stage, error) {
-	return s.listStages(ctx, `SELECT id, project_id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, COALESCE(stage_brief_artifact_id,''), COALESCE(task_plan_artifact_id,''), created_at, updated_at FROM stages WHERE run_id = ? ORDER BY created_at ASC`, runID)
+	return s.listStages(ctx, `SELECT id, project_id, run_id, task_id, attempt_id, COALESCE(workflow_stage_id,''), stage_type, COALESCE(adapter,''), status, COALESCE(stage_brief_artifact_id,''), COALESCE(task_plan_artifact_id,''), created_at, updated_at FROM stages WHERE run_id = ? ORDER BY created_at ASC`, runID)
 }
 
 func (s *Store) ListStagesForAttempt(ctx context.Context, runID, attemptID string) ([]Stage, error) {
-	return s.listStages(ctx, `SELECT id, project_id, run_id, task_id, attempt_id, stage_type, COALESCE(adapter,''), status, COALESCE(stage_brief_artifact_id,''), COALESCE(task_plan_artifact_id,''), created_at, updated_at FROM stages WHERE run_id = ? AND attempt_id = ? ORDER BY created_at ASC`, runID, attemptID)
+	return s.listStages(ctx, `SELECT id, project_id, run_id, task_id, attempt_id, COALESCE(workflow_stage_id,''), stage_type, COALESCE(adapter,''), status, COALESCE(stage_brief_artifact_id,''), COALESCE(task_plan_artifact_id,''), created_at, updated_at FROM stages WHERE run_id = ? AND attempt_id = ? ORDER BY created_at ASC`, runID, attemptID)
 }
 
 func (s *Store) listStages(ctx context.Context, query string, args ...any) ([]Stage, error) {
@@ -1202,7 +1265,7 @@ func (s *Store) listStages(ctx context.Context, query string, args ...any) ([]St
 	var stages []Stage
 	for rows.Next() {
 		var stage Stage
-		if err := rows.Scan(&stage.ID, &stage.ProjectID, &stage.RunID, &stage.TaskID, &stage.AttemptID, &stage.StageType, &stage.Adapter, &stage.Status, &stage.StageBriefArtifactID, &stage.TaskPlanArtifactID, &stage.CreatedAt, &stage.UpdatedAt); err != nil {
+		if err := rows.Scan(&stage.ID, &stage.ProjectID, &stage.RunID, &stage.TaskID, &stage.AttemptID, &stage.WorkflowStageID, &stage.StageType, &stage.Adapter, &stage.Status, &stage.StageBriefArtifactID, &stage.TaskPlanArtifactID, &stage.CreatedAt, &stage.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan stage: %w", err)
 		}
 		stages = append(stages, stage)
@@ -1603,6 +1666,42 @@ func (s *Store) SaveWorkflowSnapshot(ctx context.Context, runID string, snapshot
 		return fmt.Errorf("insert workflow snapshot: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) LatestWorkflowSnapshot(ctx context.Context, runID string) (map[string]any, error) {
+	var raw string
+	if err := s.db.QueryRowContext(ctx, `SELECT snapshot_json FROM workflow_snapshots WHERE run_id = ? ORDER BY id DESC LIMIT 1`, runID).Scan(&raw); err != nil {
+		return nil, fmt.Errorf("get latest workflow snapshot: %w", err)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal([]byte(raw), &snapshot); err != nil {
+		return nil, fmt.Errorf("decode latest workflow snapshot: %w", err)
+	}
+	return snapshot, nil
+}
+
+func (s *Store) LatestWorkflowTemplateSnapshot(ctx context.Context, runID string) (workflow.Template, error) {
+	snapshot, err := s.LatestWorkflowSnapshot(ctx, runID)
+	if err != nil {
+		return workflow.Template{}, err
+	}
+	raw, ok := snapshot["workflow_template_snapshot"]
+	if !ok {
+		return workflow.Template{}, fmt.Errorf("workflow snapshot missing workflow_template_snapshot")
+	}
+	content, err := json.Marshal(raw)
+	if err != nil {
+		return workflow.Template{}, fmt.Errorf("marshal workflow template snapshot: %w", err)
+	}
+	var template workflow.Template
+	if err := json.Unmarshal(content, &template); err != nil {
+		return workflow.Template{}, fmt.Errorf("decode workflow template snapshot: %w", err)
+	}
+	template = workflow.NormalizeTemplate(template)
+	if err := workflow.ValidateTemplate(template); err != nil {
+		return workflow.Template{}, fmt.Errorf("workflow template snapshot is invalid: %w", err)
+	}
+	return template, nil
 }
 
 func (s *Store) UpsertRunner(ctx context.Context, runnerID, status string, capabilities any) error {
