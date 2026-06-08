@@ -16,10 +16,12 @@ const (
 )
 
 const (
-	StatusCompleted  = "completed"
-	StatusFailed     = "failed"
-	StatusNeedsInput = "needs_input"
-	StatusInvalid    = "invalid"
+	StatusCompleted        = "completed"
+	StatusApproved         = "approved"
+	StatusChangesRequested = "changes_requested"
+	StatusFailed           = "failed"
+	StatusNeedsInput       = "needs_input"
+	StatusInvalid          = "invalid"
 )
 
 // Verdict is reserved for judgment stages outside M0/M1.
@@ -84,10 +86,15 @@ func (r Report) Validate() error {
 func validStageType(v string) bool {
 	switch v {
 	case contract.StageTypeIdeaIntake,
+		contract.StageTypeIdeaRefinement,
+		contract.StageTypeReview,
 		contract.StageTypeImplementation,
 		contract.StageTypeValidation,
 		contract.StageTypeCommit,
-		contract.StageTypePRReady:
+		contract.StageTypePRCreation,
+		contract.StageTypePRReady,
+		contract.StageTypeMemoryUpdate,
+		contract.StageTypeStopReport:
 		return true
 	default:
 		return false
@@ -105,7 +112,7 @@ func validActorKind(v string) bool {
 
 func validStatus(v string) bool {
 	switch v {
-	case StatusCompleted, StatusFailed, StatusNeedsInput, StatusInvalid:
+	case StatusCompleted, StatusApproved, StatusChangesRequested, StatusFailed, StatusNeedsInput, StatusInvalid:
 		return true
 	default:
 		return false

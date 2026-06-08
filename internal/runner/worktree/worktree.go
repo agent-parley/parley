@@ -90,6 +90,9 @@ func Create(ctx context.Context, opts CreateOptions) (Worktree, error) {
 	if _, err := runGit(ctx, git, opts.SourceRepo, "rev-parse", "--show-toplevel"); err != nil {
 		return Worktree{}, fmt.Errorf("verify source repo: %w", err)
 	}
+	if isGitWorktree(path) {
+		return Worktree{Path: path, SourceRepo: opts.SourceRepo, ProjectID: opts.ProjectID, RunID: opts.RunID, TaskID: opts.TaskID}, nil
+	}
 	if _, err := runGit(ctx, git, opts.SourceRepo, "worktree", "add", "--detach", path, baseRef); err != nil {
 		return Worktree{}, fmt.Errorf("create git worktree: %w", err)
 	}

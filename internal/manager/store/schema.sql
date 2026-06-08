@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS stages (
   run_id TEXT NOT NULL REFERENCES runs(id),
   task_id TEXT NOT NULL REFERENCES tasks(id),
   attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  workflow_stage_id TEXT,
   stage_type TEXT NOT NULL,
   adapter TEXT,
   status TEXT NOT NULL,

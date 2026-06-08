@@ -250,15 +250,11 @@ func (e *Engine) createQueuedRun(ctx context.Context, projectID string, input co
 	if err != nil {
 		return store.WorkflowRun{}, err
 	}
-	wr.ImplementationStage.Adapter = e.implementationAdapter
-	wr.ValidationStage.Adapter = e.validationAdapter
-	if err := e.store.UpdateStageAdapter(ctx, wr.ImplementationStage.ID, e.implementationAdapter); err != nil {
-		return store.WorkflowRun{}, err
-	}
-	if err := e.store.UpdateStageAdapter(ctx, wr.ValidationStage.ID, e.validationAdapter); err != nil {
-		return store.WorkflowRun{}, err
-	}
 	template, err := e.store.GetWorkflowTemplate(ctx, wr.Run.WorkflowTemplateID)
+	if err != nil {
+		return store.WorkflowRun{}, err
+	}
+	wr, err = e.configureRuntimeStageAdapters(ctx, wr, template)
 	if err != nil {
 		return store.WorkflowRun{}, err
 	}
@@ -266,6 +262,41 @@ func (e *Engine) createQueuedRun(ctx context.Context, projectID string, input co
 		return store.WorkflowRun{}, err
 	}
 	return wr, nil
+}
+
+func (e *Engine) configureRuntimeStageAdapters(ctx context.Context, wr store.WorkflowRun, template workflow.Template) (store.WorkflowRun, error) {
+	stages, err := e.store.ListStagesForAttempt(ctx, wr.Run.ID, wr.Attempt.ID)
+	if err != nil {
+		return store.WorkflowRun{}, err
+	}
+	byWorkflowStageID := map[string]store.Stage{}
+	for _, stage := range stages {
+		byWorkflowStageID[stage.WorkflowStageID] = stage
+	}
+	for _, templateStage := range template.Stages {
+		stage, ok := byWorkflowStageID[templateStage.ID]
+		if !ok {
+			continue
+		}
+		desired := e.adapterForTemplateStage(templateStage)
+		if stage.Adapter == desired {
+			continue
+		}
+		if err := e.store.UpdateStageAdapter(ctx, stage.ID, desired); err != nil {
+			return store.WorkflowRun{}, err
+		}
+	}
+	return e.store.GetWorkflowRun(ctx, wr.Run.ID)
+}
+
+func (e *Engine) adapterForTemplateStage(stage workflow.StageTemplate) string {
+	if stage.Type == workflow.StageTypeValidation {
+		return e.validationAdapter
+	}
+	if stage.Actor == workflow.ActorAgent {
+		return e.implementationAdapter
+	}
+	return ""
 }
 
 func (e *Engine) StartQueuedRun(ctx context.Context, runID string) error {
@@ -681,106 +712,135 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 		return err
 	}
 
-	ideaReport, err := e.runIdeaIntake(ctx, wr)
+	runtime, err := e.loadRuntimeWorkflow(context.Background(), wr)
 	if err != nil {
 		return err
 	}
-	next, err := e.graph.Next(contract.StageTypeIdeaIntake, ideaReport.Status)
-	if err != nil {
-		return err
-	}
-	if next == NodeStopReport {
-		return e.stopRun(context.Background(), wr, ideaReport.Status, "workflow stopped after idea intake")
-	}
-	if e.isCancelling(wr.Run.ID) {
-		return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after idea intake")
-	}
+	currentID := runtime.Graph.Start()
+	maxTransitions := maxInt(16, len(runtime.Stages)*8)
+	var lastReport report.Report
+	var lastValidationReport report.Report
+	var lastDeliveryReport report.Report
+	var snapshot workerSnapshot
+	var snapshotErr error
 
-	implementationReport, err := e.dispatchStage(ctx, wr, wr.ImplementationStage, e.implementationAdapter, contract.StageTypeImplementation, implementationInput(wr, ideaReport))
-	if err != nil {
-		return err
+	for step := 0; step < maxTransitions; step++ {
+		runtimeStage, ok := runtime.ByID[currentID]
+		if !ok {
+			return fmt.Errorf("workflow stage %q not found in frozen snapshot", currentID)
+		}
+		rep, err := e.runWorkflowStage(ctx, wr, runtime, runtimeStage, lastReport, lastValidationReport, snapshot, snapshotErr)
+		if err != nil {
+			return err
+		}
+		if runtimeStage.Template.Type == workflow.StageTypeImplementation && rep.Status == report.StatusCompleted {
+			snapshot, snapshotErr = e.snapshotWorktree(ctx, wr, rep)
+		}
+		if runtimeStage.Template.Type == workflow.StageTypeValidation {
+			lastValidationReport = rep
+		}
+		if reportCarriesDeliveryPayload(rep) {
+			lastDeliveryReport = rep
+		}
+		if runtimeStage.Template.Type == workflow.StageTypeStopReport {
+			return e.finishRunFromStopReport(context.Background(), wr, rep)
+		}
+		if e.isCancelling(wr.Run.ID) {
+			return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after "+runtimeStage.Template.ID)
+		}
+		nextID, ok := runtime.Graph.Next(runtimeStage.Template.ID, rep.Status)
+		if !ok {
+			return e.stopRun(context.Background(), wr, rep.Status, "workflow stopped after "+runtimeStage.Template.ID)
+		}
+		if nextID == runtime.Graph.StopID() && !reportCarriesDeliveryPayload(rep) && lastDeliveryReport.StageID != "" {
+			rep = withDeliveryPayload(rep, lastDeliveryReport)
+		}
+		lastReport = rep
+		currentID = nextID
 	}
-	next, err = e.graph.Next(contract.StageTypeImplementation, implementationReport.Status)
-	if err != nil {
-		return err
-	}
-	if next == NodeStopReport {
-		return e.stopRun(context.Background(), wr, implementationReport.Status, "workflow stopped after implementation")
-	}
-	if e.isCancelling(wr.Run.ID) {
-		return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after implementation")
-	}
+	return fmt.Errorf("workflow exceeded %d transitions; possible unbounded loop in frozen template %s", maxTransitions, runtime.Template.ID)
+}
 
-	workerSnapshot, snapshotErr := e.snapshotWorktree(ctx, wr, implementationReport)
+func (e *Engine) loadRuntimeWorkflow(ctx context.Context, wr store.WorkflowRun) (runtimeWorkflow, error) {
+	template, err := e.store.LatestWorkflowTemplateSnapshot(ctx, wr.Run.ID)
+	if err != nil {
+		template, err = e.store.GetWorkflowTemplate(ctx, wr.Run.WorkflowTemplateID)
+		if err != nil {
+			return runtimeWorkflow{}, err
+		}
+	}
+	stages, err := e.store.ListStagesForAttempt(ctx, wr.Run.ID, wr.Attempt.ID)
+	if err != nil {
+		return runtimeWorkflow{}, err
+	}
+	return newRuntimeWorkflow(template, stages)
+}
 
-	validationReport, err := e.dispatchStage(ctx, wr, wr.ValidationStage, e.validationAdapter, contract.StageTypeValidation, map[string]any{"idea": wr.Run.Idea})
-	if err != nil {
-		return err
+func (e *Engine) runWorkflowStage(ctx context.Context, wr store.WorkflowRun, runtime runtimeWorkflow, runtimeStage runtimeStage, lastReport, lastValidationReport report.Report, snapshot workerSnapshot, snapshotErr error) (report.Report, error) {
+	stage := runtimeStage.Stage
+	templateStage := runtimeStage.Template
+	switch templateStage.Type {
+	case workflow.StageTypeIdeaRefinement, contract.StageTypeIdeaIntake:
+		return e.runIdeaIntakeStage(ctx, wr, stage, runtime.Template)
+	case workflow.StageTypeImplementation:
+		return e.dispatchStage(ctx, wr, stage, stage.Adapter, templateStage.Type, e.stageDispatchInput(runtime, templateStage, implementationInput(wr, lastReport)))
+	case workflow.StageTypeValidation:
+		return e.dispatchStage(ctx, wr, stage, stage.Adapter, templateStage.Type, e.stageDispatchInput(runtime, templateStage, map[string]any{"idea": wr.Run.Idea}))
+	case workflow.StageTypeReview, workflow.StageTypeMemoryUpdate:
+		if templateStage.Actor == workflow.ActorHuman {
+			return e.runHumanStage(ctx, wr, stage, templateStage)
+		}
+		return e.dispatchStage(ctx, wr, stage, stage.Adapter, templateStage.Type, e.stageDispatchInput(runtime, templateStage, map[string]any{"idea": wr.Run.Idea}))
+	case workflow.StageTypeCommit:
+		reportForCommit := lastValidationReport
+		if reportForCommit.StageID == "" {
+			reportForCommit = lastReport
+		}
+		return e.runCommitStage(ctx, wr, stage, runtime.Template, templateStage, reportForCommit, snapshot, snapshotErr)
+	case workflow.StageTypePRCreation, contract.StageTypePRReady:
+		return e.runPRReadyStage(ctx, wr, stage, lastReport, runtime.Template, templateStage)
+	case workflow.StageTypeStopReport:
+		return e.runStopReport(ctx, wr, stage, lastReport)
+	default:
+		return report.Report{}, fmt.Errorf("unsupported workflow stage type %q", templateStage.Type)
 	}
-	next, err = e.graph.Next(contract.StageTypeValidation, validationReport.Status)
-	if err != nil {
-		return err
-	}
-	if next == NodeStopReport {
-		return e.stopRun(context.Background(), wr, validationReport.Status, "workflow stopped after validation")
-	}
-	if e.isCancelling(wr.Run.ID) {
-		return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after validation")
-	}
+}
 
-	commitReport, err := e.runCommit(ctx, wr, validationReport, workerSnapshot, snapshotErr)
-	if err != nil {
-		return err
+func (e *Engine) stageDispatchInput(runtime runtimeWorkflow, stage workflow.StageTemplate, input map[string]any) map[string]any {
+	out := map[string]any{}
+	for key, value := range input {
+		out[key] = value
 	}
-	next, err = e.graph.Next(contract.StageTypeCommit, commitReport.Status)
-	if err != nil {
-		return err
-	}
-	if next == NodeStopReport {
-		return e.stopRun(context.Background(), wr, commitReport.Status, "workflow stopped after commit")
-	}
-	if e.isCancelling(wr.Run.ID) {
-		return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after commit")
-	}
-
-	prReadyReport, err := e.runPRReady(ctx, wr, commitReport)
-	if err != nil {
-		return err
-	}
-	next, err = e.graph.Next(contract.StageTypePRReady, prReadyReport.Status)
-	if err != nil {
-		return err
-	}
-	if next != NodeDone {
-		return e.stopRun(context.Background(), wr, prReadyReport.Status, "workflow stopped after pr_ready")
-	}
-	if e.isCancelling(wr.Run.ID) {
-		return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after pr_ready")
-	}
-	changed, err := e.store.UpdateRunStatusIfOpen(context.Background(), wr.Run.ID, store.RunStatusCompleted)
-	if err != nil {
-		return err
-	}
-	if !changed {
-		return nil
-	}
-	_, err = e.emit(context.Background(), runEvent(wr, "run.completed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "run reached PR-ready human stop", map[string]any{
-		"terminal_status":  store.RunStatusCompleted,
-		"branch":           payloadString(prReadyReport.Payload, "branch"),
-		"commit_sha":       payloadString(prReadyReport.Payload, "commit_sha"),
-		"diff_artifact_id": payloadString(prReadyReport.Payload, "diff_artifact_id"),
-	}))
-	return err
+	out["workflow_template_id"] = runtime.Template.ID
+	out["workflow_template_settings"] = runtime.Template.Settings
+	out["workflow_stage_id"] = stage.ID
+	out["workflow_stage_type"] = stage.Type
+	out["workflow_stage_label"] = stage.Label
+	out["workflow_stage_actor"] = stage.Actor
+	out["workflow_stage_target"] = stage.Target
+	out["workflow_stage_settings"] = stage.Settings
+	return out
 }
 
 func (e *Engine) runIdeaIntake(ctx context.Context, wr store.WorkflowRun) (report.Report, error) {
 	stage := wr.IdeaIntakeStage
+	template, err := e.store.LatestWorkflowTemplateSnapshot(ctx, wr.Run.ID)
+	if err != nil {
+		template, err = e.store.GetWorkflowTemplate(ctx, wr.Run.WorkflowTemplateID)
+		if err != nil {
+			return report.Report{}, err
+		}
+	}
+	return e.runIdeaIntakeStage(ctx, wr, stage, template)
+}
+
+func (e *Engine) runIdeaIntakeStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, template workflow.Template) (report.Report, error) {
 	_, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
 	if err != nil {
 		return report.Report{}, err
 	}
 	stage.StageBriefArtifactID = briefArtifact.ID
-	if err := e.startStage(ctx, wr, stage, "idea_intake stage started"); err != nil {
+	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
 		return report.Report{}, err
 	}
 	contractMarkdown := taskContractMarkdown(wr)
@@ -797,10 +857,6 @@ func (e *Engine) runIdeaIntake(ctx context.Context, wr store.WorkflowRun) (repor
 		return report.Report{}, err
 	}
 	stage.TaskPlanArtifactID = planArtifact.ID
-	template, err := e.store.GetWorkflowTemplate(ctx, wr.Run.WorkflowTemplateID)
-	if err != nil {
-		return report.Report{}, err
-	}
 	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, template, contractArtifact.ID, planArtifact.ID, true)); err != nil {
 		return report.Report{}, err
 	}
@@ -857,7 +913,7 @@ func (e *Engine) dispatchStage(ctx context.Context, wr store.WorkflowRun, stage 
 		Adapter:      adapterName,
 		Input:        input,
 	}
-	if stageType == contract.StageTypeImplementation {
+	if adapterName != "" && stageType != contract.StageTypeValidation {
 		if _, err := e.emit(ctx, stageEvent(wr, stage, "adapter.invocation_prepared", event.Actor{Kind: event.ActorKindAdapter, ID: adapterName}, "adapter invocation prepared", map[string]any{"adapter": adapterName})); err != nil {
 			return report.Report{}, err
 		}
@@ -886,7 +942,10 @@ func (e *Engine) dispatchStage(ctx context.Context, wr store.WorkflowRun, stage 
 }
 
 func (e *Engine) runCommit(ctx context.Context, wr store.WorkflowRun, validationReport report.Report, snapshot workerSnapshot, snapshotErr error) (report.Report, error) {
-	stage := wr.CommitStage
+	return e.runCommitStage(ctx, wr, wr.CommitStage, workflow.Template{}, workflow.StageTemplate{}, validationReport, snapshot, snapshotErr)
+}
+
+func (e *Engine) runCommitStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, template workflow.Template, templateStage workflow.StageTemplate, validationReport report.Report, snapshot workerSnapshot, snapshotErr error) (report.Report, error) {
 	_, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
 	if err != nil {
 		return report.Report{}, err
@@ -898,6 +957,14 @@ func (e *Engine) runCommit(ctx context.Context, wr store.WorkflowRun, validation
 	if snapshotErr != nil {
 		rep := commitFailureReport(wr, stage, snapshotErr, snapshot.DiffArtifactID)
 		return rep, e.completeStage(context.Background(), wr, stage, rep)
+	}
+	branchPolicy := settingString(templateStage.Settings, "branch_policy")
+	if branchPolicy == "" {
+		branchPolicy = settingString(template.Settings, "branch_policy")
+	}
+	targetBranch := settingString(templateStage.Settings, "target_branch")
+	if targetBranch == "" {
+		targetBranch = settingString(template.Settings, "target_branch")
 	}
 	result, err := commitWorktree(ctx, commitOptions{
 		WorktreePath:   snapshot.WorktreePath,
@@ -912,6 +979,8 @@ func (e *Engine) runCommit(ctx context.Context, wr store.WorkflowRun, validation
 		Git:            e.gitExecutable,
 		AuthorName:     e.gitAuthorName,
 		AuthorEmail:    e.gitAuthorEmail,
+		BranchPolicy:   branchPolicy,
+		TargetBranch:   targetBranch,
 	})
 	if err != nil {
 		rep := commitFailureReport(wr, stage, err, snapshot.DiffArtifactID)
@@ -930,6 +999,7 @@ func (e *Engine) runCommit(ctx context.Context, wr store.WorkflowRun, validation
 		EvidenceRefs:  []string{snapshot.DiffArtifactID},
 		Payload: map[string]any{
 			"branch":           result.Branch,
+			"branch_policy":    result.BranchPolicy,
 			"commit_sha":       result.CommitSHA,
 			"diff_artifact_id": snapshot.DiffArtifactID,
 			"no_verify":        true,
@@ -963,13 +1033,16 @@ func (e *Engine) snapshotWorktree(ctx context.Context, wr store.WorkflowRun, imp
 }
 
 func (e *Engine) runPRReady(ctx context.Context, wr store.WorkflowRun, commitReport report.Report) (report.Report, error) {
-	stage := wr.PRReadyStage
+	return e.runPRReadyStage(ctx, wr, wr.PRReadyStage, commitReport, workflow.Template{}, workflow.StageTemplate{})
+}
+
+func (e *Engine) runPRReadyStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, commitReport report.Report, template workflow.Template, templateStage workflow.StageTemplate) (report.Report, error) {
 	_, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
 	if err != nil {
 		return report.Report{}, err
 	}
 	stage.StageBriefArtifactID = briefArtifact.ID
-	if err := e.startStage(ctx, wr, stage, "pr_ready stage started"); err != nil {
+	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
 		return report.Report{}, err
 	}
 	branch := payloadString(commitReport.Payload, "branch")
@@ -984,7 +1057,7 @@ func (e *Engine) runPRReady(ctx context.Context, wr store.WorkflowRun, commitRep
 		StageType:     stage.StageType,
 		Actor:         report.Actor{Kind: report.ActorKindHarness, ID: "pr_ready"},
 		Status:        report.StatusCompleted,
-		Summary:       "PR-ready human stop reached",
+		Summary:       "PR-ready handoff reached",
 		EvidenceRefs:  []string{diffID},
 		Payload: map[string]any{
 			"branch":           branch,
@@ -992,9 +1065,90 @@ func (e *Engine) runPRReady(ctx context.Context, wr store.WorkflowRun, commitRep
 			"diff_artifact_id": diffID,
 			"push_performed":   false,
 			"pr_created":       false,
+			"pr_behavior":      settingString(template.Settings, "pr_behavior"),
 		},
 		Errors: []string{},
 	}
+	if err := e.completeStage(context.Background(), wr, stage, rep); err != nil {
+		return report.Report{}, err
+	}
+	return rep, nil
+}
+
+func (e *Engine) runHumanStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, templateStage workflow.StageTemplate) (report.Report, error) {
+	_, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
+	if err != nil {
+		return report.Report{}, err
+	}
+	stage.StageBriefArtifactID = briefArtifact.ID
+	if err := e.startStage(ctx, wr, stage, stage.StageType+" human stage started"); err != nil {
+		return report.Report{}, err
+	}
+	rep := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		StageID:       stage.ID,
+		StageType:     stage.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindHuman, ID: templateStage.ID},
+		Status:        report.StatusCompleted,
+		Summary:       "human stage recorded by workflow placeholder",
+		Payload: map[string]any{
+			"workflow_stage_id":       templateStage.ID,
+			"workflow_stage_label":    templateStage.Label,
+			"workflow_stage_actor":    templateStage.Actor,
+			"workflow_stage_target":   templateStage.Target,
+			"workflow_stage_settings": templateStage.Settings,
+			"human_input_supported":   false,
+		},
+		Errors: []string{},
+	}
+	if err := e.completeStage(context.Background(), wr, stage, rep); err != nil {
+		return report.Report{}, err
+	}
+	return rep, nil
+}
+
+func (e *Engine) runStopReport(ctx context.Context, wr store.WorkflowRun, stage store.Stage, previous report.Report) (report.Report, error) {
+	_, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
+	if err != nil {
+		return report.Report{}, err
+	}
+	stage.StageBriefArtifactID = briefArtifact.ID
+	if err := e.startStage(ctx, wr, stage, "stop/report stage started"); err != nil {
+		return report.Report{}, err
+	}
+	status := report.StatusCompleted
+	if previous.Status != "" {
+		status = previous.Status
+	}
+	summary := "workflow completed"
+	if status != report.StatusCompleted && previous.Summary != "" {
+		summary = "workflow stopped: " + previous.Summary
+	}
+	errors := append([]string{}, previous.Errors...)
+	if (status == report.StatusFailed || status == report.StatusInvalid) && len(errors) == 0 {
+		errors = []string{summary}
+	}
+	rep := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		StageID:       stage.ID,
+		StageType:     stage.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindHarness, ID: "stop_report"},
+		Status:        status,
+		Summary:       summary,
+		Payload: map[string]any{
+			"previous_stage_id":   previous.StageID,
+			"previous_stage_type": previous.StageType,
+			"previous_status":     previous.Status,
+		},
+		Errors: errors,
+	}
+	copyPayloadStrings(rep.Payload, previous.Payload, "branch", "commit_sha", "diff_artifact_id")
 	if err := e.completeStage(context.Background(), wr, stage, rep); err != nil {
 		return report.Report{}, err
 	}
@@ -1075,6 +1229,9 @@ func (e *Engine) startStage(ctx context.Context, wr store.WorkflowRun, stage sto
 		return err
 	}
 	data := map[string]any{}
+	if stage.WorkflowStageID != "" {
+		data["workflow_stage_id"] = stage.WorkflowStageID
+	}
 	if stage.StageBriefArtifactID != "" {
 		data["stage_brief_artifact_id"] = stage.StageBriefArtifactID
 	}
@@ -1115,13 +1272,16 @@ func (e *Engine) completeStage(ctx context.Context, wr store.WorkflowRun, stage 
 		"status":             rep.Status,
 		"report_artifact_id": artifact.ID,
 	}
+	if stage.WorkflowStageID != "" {
+		data["workflow_stage_id"] = stage.WorkflowStageID
+	}
 	if stage.StageBriefArtifactID != "" {
 		data["stage_brief_artifact_id"] = stage.StageBriefArtifactID
 	}
 	if stage.TaskPlanArtifactID != "" {
 		data["task_plan_artifact_id"] = stage.TaskPlanArtifactID
 	}
-	copyPayloadStrings(data, rep.Payload, "branch", "commit_sha", "diff_artifact_id", "task_contract_artifact_id", "task_plan_artifact_id")
+	copyPayloadStrings(data, rep.Payload, "branch", "branch_policy", "commit_sha", "diff_artifact_id", "task_contract_artifact_id", "task_plan_artifact_id")
 	if typ := completionEventType(rep); typ != "" {
 		if _, err := e.emit(ctx, stageEvent(wr, stage, typ, reportActor(rep.Actor, stage), rep.Summary, data)); err != nil {
 			return err
@@ -1148,6 +1308,26 @@ func (e *Engine) HandleRunnerArtifact(ctx context.Context, art protocol.Artifact
 		ext = ".txt"
 	}
 	_, err := e.store.SaveArtifactWithID(ctx, art.ArtifactID, art.RunID, kind, mediaType, art.Content, ext)
+	return err
+}
+
+func (e *Engine) finishRunFromStopReport(ctx context.Context, wr store.WorkflowRun, rep report.Report) error {
+	if rep.Status != report.StatusCompleted {
+		return e.stopRun(ctx, wr, rep.Status, rep.Summary)
+	}
+	changed, err := e.store.UpdateRunStatusIfOpen(ctx, wr.Run.ID, store.RunStatusCompleted)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	_, err = e.emit(ctx, runEvent(wr, "run.completed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "workflow reached stop/report", map[string]any{
+		"terminal_status":  store.RunStatusCompleted,
+		"branch":           payloadString(rep.Payload, "branch"),
+		"commit_sha":       payloadString(rep.Payload, "commit_sha"),
+		"diff_artifact_id": payloadString(rep.Payload, "diff_artifact_id"),
+	}))
 	return err
 }
 
@@ -1218,6 +1398,10 @@ func (e *Engine) emit(ctx context.Context, ev event.Event) (event.Event, error) 
 }
 
 func (e *Engine) workflowSnapshot(wr store.WorkflowRun, template workflow.Template, taskContractArtifactID, taskPlanArtifactID string, frozen bool) map[string]any {
+	stages, err := e.store.ListStagesForAttempt(context.Background(), wr.Run.ID, wr.Attempt.ID)
+	if err != nil || len(stages) == 0 {
+		stages = []store.Stage{wr.IdeaIntakeStage, wr.ImplementationStage, wr.ValidationStage, wr.CommitStage, wr.PRReadyStage}
+	}
 	return map[string]any{
 		"schema_version":             1,
 		"project_id":                 wr.Run.ProjectID,
@@ -1234,20 +1418,33 @@ func (e *Engine) workflowSnapshot(wr store.WorkflowRun, template workflow.Templa
 		"frozen":                     frozen,
 		"task_contract_artifact_id":  taskContractArtifactID,
 		"task_plan_artifact_id":      taskPlanArtifactID,
-		"graph":                      "idea_intake->implementation->validation->commit->pr_ready",
-		"edges":                      e.graph.Edges(),
-		"stages": []map[string]string{
-			stageSnapshot(wr.IdeaIntakeStage),
-			stageSnapshot(wr.ImplementationStage),
-			stageSnapshot(wr.ValidationStage),
-			stageSnapshot(wr.CommitStage),
-			stageSnapshot(wr.PRReadyStage),
-		},
+		"graph":                      "from frozen workflow_template_snapshot",
+		"edges":                      template.Edges,
+		"stages":                     stageSnapshotsForWorkflow(stages, template),
 	}
 }
 
-func stageSnapshot(stage store.Stage) map[string]string {
-	return map[string]string{"id": stage.ID, "type": stage.StageType, "adapter": stage.Adapter}
+func stageSnapshotsForWorkflow(stages []store.Stage, template workflow.Template) []map[string]any {
+	byWorkflowID := map[string]workflow.StageTemplate{}
+	for _, stage := range template.Stages {
+		byWorkflowID[stage.ID] = stage
+	}
+	out := make([]map[string]any, 0, len(stages))
+	for _, stage := range stages {
+		out = append(out, stageSnapshot(stage, byWorkflowID[stage.WorkflowStageID]))
+	}
+	return out
+}
+
+func stageSnapshot(stage store.Stage, templateStage workflow.StageTemplate) map[string]any {
+	out := map[string]any{"id": stage.ID, "type": stage.StageType, "adapter": stage.Adapter}
+	if stage.WorkflowStageID != "" {
+		out["workflow_stage_id"] = stage.WorkflowStageID
+	}
+	if templateStage.ID != "" {
+		out["template_stage"] = templateStage
+	}
+	return out
 }
 
 func taskContractMarkdown(wr store.WorkflowRun) string {
@@ -1378,7 +1575,7 @@ func stageEvent(wr store.WorkflowRun, stage store.Stage, typ string, actor event
 // from event.schema.md. Unknown/human actors do not emit task.* in the skeleton;
 // the stage terminal event records their lifecycle outcome.
 func completionEventType(rep report.Report) string {
-	failed := rep.Status != report.StatusCompleted
+	failed := rep.Status == report.StatusFailed || rep.Status == report.StatusInvalid
 	switch rep.Actor.Kind {
 	case report.ActorKindAgent:
 		if failed {
@@ -1397,7 +1594,7 @@ func completionEventType(rep report.Report) string {
 
 func stageTerminalEventType(status string) string {
 	switch status {
-	case report.StatusCompleted:
+	case report.StatusCompleted, report.StatusApproved, report.StatusChangesRequested:
 		return "stage.completed"
 	case report.StatusInvalid:
 		return "stage.invalid"
@@ -1408,7 +1605,7 @@ func stageTerminalEventType(status string) string {
 
 func stageTerminalSummary(stage store.Stage, rep report.Report) string {
 	switch rep.Status {
-	case report.StatusCompleted:
+	case report.StatusCompleted, report.StatusApproved, report.StatusChangesRequested:
 		return stage.StageType + " stage completed"
 	case report.StatusInvalid:
 		return stage.StageType + " stage returned invalid report"
@@ -1430,6 +1627,22 @@ func reportActor(actor report.Actor, stage store.Stage) event.Actor {
 	}
 }
 
+func reportCarriesDeliveryPayload(rep report.Report) bool {
+	return payloadString(rep.Payload, "branch") != "" || payloadString(rep.Payload, "commit_sha") != "" || payloadString(rep.Payload, "diff_artifact_id") != ""
+}
+
+func withDeliveryPayload(rep report.Report, delivery report.Report) report.Report {
+	if rep.Payload == nil {
+		rep.Payload = map[string]any{}
+	}
+	copyPayloadStrings(rep.Payload, delivery.Payload, "branch", "branch_policy", "commit_sha", "diff_artifact_id")
+	return rep
+}
+
+func settingString(settings map[string]any, key string) string {
+	return payloadString(settings, key)
+}
+
 func payloadString(payload map[string]any, key string) string {
 	if payload == nil {
 		return ""
@@ -1439,6 +1652,13 @@ func payloadString(payload map[string]any, key string) string {
 		return ""
 	}
 	return fmt.Sprint(value)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func copyPayloadStrings(dest map[string]any, payload map[string]any, keys ...string) {

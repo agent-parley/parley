@@ -28,13 +28,16 @@ type commitOptions struct {
 	Git            string
 	AuthorName     string
 	AuthorEmail    string
+	BranchPolicy   string
+	TargetBranch   string
 }
 
 type commitResult struct {
-	Branch      string
-	CommitSHA   string
-	AuthorName  string
-	AuthorEmail string
+	Branch       string
+	BranchPolicy string
+	CommitSHA    string
+	AuthorName   string
+	AuthorEmail  string
 }
 
 type gitIdentity struct {
@@ -56,7 +59,20 @@ func commitWorktree(ctx context.Context, opts commitOptions) (commitResult, erro
 	if git == "" {
 		git = "git"
 	}
+	branchPolicy := opts.BranchPolicy
+	if branchPolicy == "" {
+		branchPolicy = "feature_branch"
+	}
 	branch := "agent/" + opts.RunID + "/" + opts.TaskID
+	if branchPolicy == "target_branch" {
+		branch = strings.TrimSpace(opts.TargetBranch)
+		if branch == "" {
+			branch = inferTargetBranch(ctx, git, opts.WorktreePath, opts.BaseSHA)
+		}
+		if branch == "" {
+			branch = "main"
+		}
+	}
 	identity := configuredGitIdentity(opts.AuthorName, opts.AuthorEmail)
 
 	if opts.WorkerTreeSHA == opts.BaseTreeSHA {
@@ -82,7 +98,28 @@ func commitWorktree(ctx context.Context, opts commitOptions) (commitResult, erro
 	if _, err := runGitCommand(ctx, git, opts.WorktreePath, "update-ref", "refs/heads/"+branch, commitSHA); err != nil {
 		return commitResult{}, fmt.Errorf("update commit branch: %w", err)
 	}
-	return commitResult{Branch: branch, CommitSHA: commitSHA, AuthorName: identity.Name, AuthorEmail: identity.Email}, nil
+	return commitResult{Branch: branch, BranchPolicy: branchPolicy, CommitSHA: commitSHA, AuthorName: identity.Name, AuthorEmail: identity.Email}, nil
+}
+
+func inferTargetBranch(ctx context.Context, git, worktreePath, baseSHA string) string {
+	out, err := runGitCommand(ctx, git, worktreePath, "for-each-ref", "--format=%(refname:short)", "--points-at", baseSHA, "refs/heads")
+	if err != nil {
+		return ""
+	}
+	var first string
+	for _, branch := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		branch = strings.TrimSpace(branch)
+		if branch == "" {
+			continue
+		}
+		if first == "" {
+			first = branch
+		}
+		if branch == "main" || branch == "master" {
+			return branch
+		}
+	}
+	return first
 }
 
 func snapshotGitWorktree(ctx context.Context, git, worktreePath string) (string, string, string, error) {

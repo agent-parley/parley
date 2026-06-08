@@ -101,7 +101,7 @@ func (r *Runner) handleDispatch(ctx context.Context, msg protocol.Message) error
 			rep = invalidReport(disp, err)
 		}
 		terminal := "completed"
-		if rep.Status != report.StatusCompleted {
+		if rep.Status == report.StatusFailed || rep.Status == report.StatusInvalid {
 			terminal = "failed"
 		}
 		_ = r.send(context.Background(), protocol.TypeReport, rep)

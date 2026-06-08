@@ -179,6 +179,32 @@ func TestCommitWorktreeUsesWorkerSnapshotAndExcludesValidatorTrackedEdits(t *tes
 	}
 }
 
+func TestCommitWorktreeHonorsTargetBranchPolicy(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	source := initCommitSourceRepo(t, ctx, map[string]string{
+		"main.go": "package main\n\nfunc main() {}\n",
+	})
+	worktreePath := addDetachedWorktree(t, ctx, source)
+	if err := os.WriteFile(filepath.Join(worktreePath, "main.go"), []byte("package main\n\nfunc main() { println(\"direct\") }\n"), 0o600); err != nil {
+		t.Fatalf("write worker main.go: %v", err)
+	}
+	opts := snapshotCommitOptions(t, ctx, worktreePath, "run_direct", "task_test", "artifact_direct")
+	opts.BranchPolicy = "target_branch"
+	opts.TargetBranch = "direct-target"
+	result, err := commitWorktree(ctx, opts)
+	if err != nil {
+		t.Fatalf("commitWorktree() error = %v", err)
+	}
+	if result.Branch != "direct-target" || result.BranchPolicy != "target_branch" {
+		t.Fatalf("commit result branch=%s policy=%s, want direct-target target_branch", result.Branch, result.BranchPolicy)
+	}
+	branchSHA := strings.TrimSpace(string(runCommitGitOutput(t, ctx, worktreePath, "rev-parse", "refs/heads/direct-target")))
+	if branchSHA != result.CommitSHA {
+		t.Fatalf("direct target branch ref = %s, want %s", branchSHA, result.CommitSHA)
+	}
+}
+
 func TestCommitWorktreeNoChangesUsesSnapshotNotValidationDirtyWorktree(t *testing.T) {
 	requireGit(t)
 	ctx := context.Background()

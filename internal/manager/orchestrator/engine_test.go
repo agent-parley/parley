@@ -80,6 +80,92 @@ func TestDispatchStagePersistsStageBriefAndPassesItToRunner(t *testing.T) {
 	t.Fatal("implementation stage not found")
 }
 
+func TestRuntimeGraphUsesFrozenTemplateEdges(t *testing.T) {
+	template := workflow.DefaultTemplate()
+	for _, candidate := range workflow.PredefinedTemplates() {
+		if candidate.ID == workflow.AutonomousPRDeliveryID {
+			template = candidate
+			break
+		}
+	}
+	graph, err := newRuntimeGraph(template)
+	if err != nil {
+		t.Fatalf("newRuntimeGraph() error = %v", err)
+	}
+	if next, ok := graph.Next("change_review_agent", report.StatusChangesRequested); !ok || next != "implementation" {
+		t.Fatalf("changes_requested next = %q ok=%v, want implementation", next, ok)
+	}
+	if next, ok := graph.Next("validation", report.StatusFailed); !ok || next != "stop_report" {
+		t.Fatalf("validation failed next = %q ok=%v, want stop_report", next, ok)
+	}
+}
+
+func TestSelectedTemplateCreatesRuntimeStages(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "ship direct", WorkflowTemplateID: workflow.DirectCommitID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stages, err := st.ListStages(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	if len(stages) != len(workflow.DefaultTemplate().Stages)-1 {
+		t.Fatalf("direct stage count = %d, want no PR creation stage", len(stages))
+	}
+	for _, stage := range stages {
+		if stage.StageType == workflow.StageTypePRCreation {
+			t.Fatalf("direct template persisted PR creation stage: %+v", stage)
+		}
+		if stage.StageType == workflow.StageTypeCommit && stage.WorkflowStageID != "commit_target_branch" {
+			t.Fatalf("direct commit workflow stage id = %s, want commit_target_branch", stage.WorkflowStageID)
+		}
+	}
+}
+
+func TestAgentStageDispatchReceivesTemplateActorTargetSettings(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	runner := &capturingRunner{}
+	policy := QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &policy})
+	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "review my changes", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("StartRunInput() error = %v", err)
+	}
+	wr, err := st.GetWorkflowRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	runtime, err := engine.loadRuntimeWorkflow(ctx, wr)
+	if err != nil {
+		t.Fatalf("load runtime workflow: %v", err)
+	}
+	review := runtime.ByID["change_review_agent"]
+	if _, err := engine.runWorkflowStage(ctx, wr, runtime, review, report.Report{}, report.Report{}, workerSnapshot{}, nil); err != nil {
+		t.Fatalf("run review stage: %v", err)
+	}
+	if runner.disp.StageType != workflow.StageTypeReview {
+		t.Fatalf("dispatch stage type = %s, want review", runner.disp.StageType)
+	}
+	if runner.disp.Input["workflow_stage_actor"] != workflow.ActorAgent || runner.disp.Input["workflow_stage_target"] != workflow.TargetCodeChanges {
+		t.Fatalf("dispatch input missing actor/target: %+v", runner.disp.Input)
+	}
+	settings, ok := runner.disp.Input["workflow_stage_settings"].(map[string]any)
+	if !ok || settings["profile"] != "generalist" || settings["intensity"] != "normal" {
+		t.Fatalf("dispatch input settings = %#v", runner.disp.Input["workflow_stage_settings"])
+	}
+}
+
 func TestStartRunFreezesSelectedWorkflowTemplateSnapshot(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())

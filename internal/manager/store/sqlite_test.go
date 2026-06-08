@@ -49,7 +49,7 @@ func TestStorePersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run bundle: %v", err)
 	}
-	if len(bundle.Stages) != 5 || len(bundle.Events) != 1 || len(bundle.Artifacts) != 2 {
+	if len(bundle.Stages) != len(workflow.DefaultTemplate().Stages) || len(bundle.Events) != 1 || len(bundle.Artifacts) != 2 {
 		t.Fatalf("unexpected bundle counts: stages=%d events=%d artifacts=%d", len(bundle.Stages), len(bundle.Events), len(bundle.Artifacts))
 	}
 }
