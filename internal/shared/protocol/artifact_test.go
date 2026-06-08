@@ -3,6 +3,9 @@ package protocol_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -34,6 +37,117 @@ func TestSendArtifactSmallArtifactSingleFrame(t *testing.T) {
 	}
 	if !bytes.Equal(chunks[0].Content, content) {
 		t.Fatalf("content mismatch")
+	}
+}
+
+func TestSendArtifactWritesBinaryFrameContent(t *testing.T) {
+	content := []byte{0x00, 0x01, 'l', 'o', 'g', 0xff}
+	serverDone := make(chan error, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		typ, data, err := conn.Read(ctx)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if typ != websocket.MessageText {
+			serverDone <- fmt.Errorf("first frame type = %v, want %v", typ, websocket.MessageText)
+			return
+		}
+		if bytes.Contains(data, []byte(base64.StdEncoding.EncodeToString(content))) {
+			serverDone <- fmt.Errorf("artifact content was base64-encoded in JSON header")
+			return
+		}
+		var msg protocol.Message
+		if err := json.Unmarshal(data, &msg); err != nil {
+			serverDone <- err
+			return
+		}
+		if msg.Type != protocol.TypeArtifact {
+			serverDone <- fmt.Errorf("message type = %q, want %q", msg.Type, protocol.TypeArtifact)
+			return
+		}
+		header, err := protocol.DecodePayload[protocol.ArtifactPayload](msg)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if header.Seq != 0 || !header.Last || len(header.Content) != 0 {
+			serverDone <- fmt.Errorf("unexpected header: seq=%d last=%v content=%d", header.Seq, header.Last, len(header.Content))
+			return
+		}
+		typ, data, err = conn.Read(ctx)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if typ != websocket.MessageBinary {
+			serverDone <- fmt.Errorf("second frame type = %v, want %v", typ, websocket.MessageBinary)
+			return
+		}
+		if !bytes.Equal(data, content) {
+			serverDone <- fmt.Errorf("binary content mismatch")
+			return
+		}
+		serverDone <- nil
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	client := protocol.NewSession(conn)
+	client.Start(context.Background())
+	if err := protocol.SendArtifact(ctx, client, protocol.ArtifactPayload{
+		RunID:      "run_binary",
+		TaskID:     "task_binary",
+		AttemptID:  "attempt_binary",
+		ArtifactID: "artifact_binary",
+		Name:       "binary.log",
+		Kind:       "validation_log",
+		MediaType:  "application/octet-stream",
+		Content:    content,
+	}); err != nil {
+		t.Fatalf("send artifact: %v", err)
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for raw frames")
+	}
+	_ = client.Close(websocket.StatusNormalClosure, "test done")
+}
+
+func TestSendArtifactEmptyArtifactSingleFrame(t *testing.T) {
+	chunks := sendArtifactAndCollect(t, protocol.ArtifactPayload{
+		RunID:      "run_empty",
+		TaskID:     "task_empty",
+		AttemptID:  "attempt_empty",
+		ArtifactID: "artifact_empty",
+		Name:       "empty.txt",
+		Kind:       "log",
+		MediaType:  "text/plain",
+	}, 1)
+	if len(chunks) != 1 {
+		t.Fatalf("chunk count = %d, want 1", len(chunks))
+	}
+	if chunks[0].Seq != 0 || !chunks[0].Last {
+		t.Fatalf("unexpected terminal metadata: seq=%d last=%v", chunks[0].Seq, chunks[0].Last)
+	}
+	if len(chunks[0].Content) != 0 {
+		t.Fatalf("content length = %d, want 0", len(chunks[0].Content))
 	}
 }
 

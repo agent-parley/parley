@@ -6,7 +6,8 @@ import (
 )
 
 // SendArtifact sends an artifact over the session as ordered TypeArtifact
-// chunks. Small artifacts are a single frame with Seq 0 and Last true.
+// metadata headers followed by adjacent binary content frames. Small artifacts
+// are a single header+binary pair with Seq 0 and Last true.
 func SendArtifact(ctx context.Context, session *Session, payload ArtifactPayload) error {
 	if session == nil {
 		return fmt.Errorf("protocol session is required")
@@ -15,11 +16,12 @@ func SendArtifact(ctx context.Context, session *Session, payload ArtifactPayload
 	if len(content) == 0 {
 		payload.Seq = 0
 		payload.Last = true
+		payload.Content = nil
 		msg, err := NewMessage(TypeArtifact, payload)
 		if err != nil {
 			return err
 		}
-		return session.Send(ctx, msg)
+		return session.sendBinary(ctx, msg, content)
 	}
 	for seq, offset := 0, 0; offset < len(content); seq++ {
 		end := offset + ArtifactChunkBytes
@@ -29,12 +31,12 @@ func SendArtifact(ctx context.Context, session *Session, payload ArtifactPayload
 		chunk := payload
 		chunk.Seq = seq
 		chunk.Last = end == len(content)
-		chunk.Content = content[offset:end]
+		chunk.Content = nil
 		msg, err := NewMessage(TypeArtifact, chunk)
 		if err != nil {
 			return err
 		}
-		if err := session.Send(ctx, msg); err != nil {
+		if err := session.sendBinary(ctx, msg, content[offset:end]); err != nil {
 			return err
 		}
 		offset = end

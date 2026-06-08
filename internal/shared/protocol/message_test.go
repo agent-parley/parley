@@ -1,8 +1,8 @@
 package protocol_test
 
 import (
-	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,9 +14,7 @@ import (
 	"github.com/agent-parley/parley/internal/shared/protocol"
 )
 
-func TestArtifactPayloadRoundTrip(t *testing.T) {
-	// Binary content (including a NUL byte) must survive the JSON base64 round-trip.
-	content := []byte{0x00, 0x01, 'd', 'i', 'f', 'f', 0xff}
+func TestArtifactPayloadMetadataRoundTrip(t *testing.T) {
 	in := protocol.ArtifactPayload{
 		RunID:      "run_1",
 		TaskID:     "task_1",
@@ -27,7 +25,6 @@ func TestArtifactPayloadRoundTrip(t *testing.T) {
 		MediaType:  "text/x-diff",
 		Seq:        0,
 		Last:       true,
-		Content:    content,
 	}
 	msg, err := protocol.NewMessage(protocol.TypeArtifact, in)
 	if err != nil {
@@ -46,8 +43,89 @@ func TestArtifactPayloadRoundTrip(t *testing.T) {
 	if out.Seq != in.Seq || out.Last != in.Last {
 		t.Fatalf("chunk metadata mismatch: %+v", out)
 	}
-	if !bytes.Equal(out.Content, content) {
-		t.Fatalf("content mismatch: got %v want %v", out.Content, content)
+	if len(out.Content) != 0 {
+		t.Fatalf("metadata header content length = %d, want 0", len(out.Content))
+	}
+}
+
+func TestSessionRejectsUnexpectedBinaryFrame(t *testing.T) {
+	serverDone := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		sess := protocol.NewSession(conn)
+		sess.Start(context.Background())
+		<-sess.Done()
+		close(serverDone)
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, []byte("orphan")); err != nil {
+		t.Fatalf("write orphan binary: %v", err)
+	}
+	select {
+	case <-serverDone:
+	case <-ctx.Done():
+		t.Fatal("session did not close after orphan binary frame")
+	}
+}
+
+func TestSessionRejectsArtifactHeaderNotFollowedByBinary(t *testing.T) {
+	serverDone := make(chan struct{})
+	artifactHandled := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		sess := protocol.NewSession(conn)
+		sess.Handle(protocol.TypeArtifact, func(context.Context, protocol.Message) error {
+			artifactHandled <- struct{}{}
+			return nil
+		})
+		sess.Start(context.Background())
+		<-sess.Done()
+		close(serverDone)
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	writeTextMessage(t, ctx, conn, protocol.MustMessage(protocol.TypeArtifact, protocol.ArtifactPayload{
+		RunID:      "run_1",
+		TaskID:     "task_1",
+		AttemptID:  "attempt_1",
+		ArtifactID: "artifact_1",
+		Name:       "artifact.log",
+		Kind:       "validation_log",
+		MediaType:  "text/plain",
+		Seq:        0,
+		Last:       true,
+	}))
+	writeTextMessage(t, ctx, conn, protocol.MustMessage(protocol.TypePing, map[string]any{}))
+	select {
+	case <-serverDone:
+	case <-ctx.Done():
+		t.Fatal("session did not close after artifact header without binary payload")
+	}
+	select {
+	case <-artifactHandled:
+		t.Fatal("artifact handler was called before binary payload arrived")
+	default:
 	}
 }
 
@@ -124,4 +202,15 @@ func TestSessionRoundTripHandshakeAndPing(t *testing.T) {
 		t.Fatal("pong timeout")
 	}
 	_ = client.Close(websocket.StatusNormalClosure, "test done")
+}
+
+func writeTextMessage(t *testing.T, ctx context.Context, conn *websocket.Conn, msg protocol.Message) {
+	t.Helper()
+	b, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal %s message: %v", msg.Type, err)
+	}
+	if err := conn.Write(ctx, websocket.MessageText, b); err != nil {
+		t.Fatalf("write %s message: %v", msg.Type, err)
+	}
 }
