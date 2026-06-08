@@ -157,7 +157,11 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 	}
 	contextAssembler := opts.ContextAssembler
 	if contextAssembler == nil {
-		contextAssembler = contextpack.NewAssembler(contextpack.Options{})
+		contextAssembler = contextpack.NewAssembler(contextpack.Options{
+			Providers: []contextpack.SourceProvider{
+				contextpack.RepoEvidenceProvider{Git: opts.GitExecutable},
+			},
+		})
 	}
 	return &Engine{
 		store:                 st,
@@ -920,7 +924,7 @@ func (e *Engine) runIdeaIntakeStage(ctx context.Context, wr store.WorkflowRun, s
 }
 
 func (e *Engine) dispatchStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, adapterName, stageType string, input map[string]any) (report.Report, error) {
-	brief, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
+	briefMarkdown, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
 	if err != nil {
 		return report.Report{}, err
 	}
@@ -930,7 +934,7 @@ func (e *Engine) dispatchStage(ctx context.Context, wr store.WorkflowRun, stage 
 	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
 		return report.Report{}, err
 	}
-	input = withStageBriefInput(input, brief, briefArtifact.ID)
+	input = withStageBriefInput(input, briefMarkdown, briefArtifact.ID)
 	disp := contract.Dispatch{
 		ProjectID:    wr.Run.ProjectID,
 		RepositoryID: wr.Task.RepositoryID,
@@ -1185,10 +1189,10 @@ func (e *Engine) runStopReport(ctx context.Context, wr store.WorkflowRun, stage 
 	return rep, nil
 }
 
-func (e *Engine) prepareStageBrief(ctx context.Context, wr store.WorkflowRun, stage store.Stage) (contextpack.StageBrief, store.Artifact, error) {
+func (e *Engine) prepareStageBrief(ctx context.Context, wr store.WorkflowRun, stage store.Stage) (string, store.Artifact, error) {
 	bundle, err := e.store.RunBundle(ctx, wr.Run.ID)
 	if err != nil {
-		return contextpack.StageBrief{}, store.Artifact{}, err
+		return "", store.Artifact{}, err
 	}
 	repositoryPath, repositoryWarnings := e.repositoryPathForStage(ctx, wr, stage)
 	brief, err := e.contextAssembler.Assemble(ctx, contextpack.Request{
@@ -1208,16 +1212,17 @@ func (e *Engine) prepareStageBrief(ctx context.Context, wr store.WorkflowRun, st
 		},
 	})
 	if err != nil {
-		return contextpack.StageBrief{}, store.Artifact{}, err
+		return "", store.Artifact{}, err
 	}
-	artifact, err := e.store.SaveArtifact(ctx, wr.Run.ID, "stage_brief", "text/markdown", []byte(contextpack.Markdown(brief)), ".md")
+	markdown := contextpack.Markdown(brief)
+	artifact, err := e.store.SaveArtifact(ctx, wr.Run.ID, "stage_brief", "text/markdown", []byte(markdown), ".md")
 	if err != nil {
-		return contextpack.StageBrief{}, store.Artifact{}, err
+		return "", store.Artifact{}, err
 	}
 	if err := e.store.UpdateStageBriefArtifactID(ctx, stage.ID, artifact.ID); err != nil {
-		return contextpack.StageBrief{}, store.Artifact{}, err
+		return "", store.Artifact{}, err
 	}
-	return brief, artifact, nil
+	return markdown, artifact, nil
 }
 
 func (e *Engine) repositoryPathForStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage) (string, []string) {
@@ -1240,16 +1245,13 @@ func (e *Engine) repositoryPathForStage(ctx context.Context, wr store.WorkflowRu
 	return repo.Path, warnings
 }
 
-func withStageBriefInput(input map[string]any, brief contextpack.StageBrief, artifactID string) map[string]any {
+func withStageBriefInput(input map[string]any, markdown, artifactID string) map[string]any {
 	out := map[string]any{}
 	for key, value := range input {
 		out[key] = value
 	}
-	markdown := contextpack.Markdown(brief)
 	out["stage_brief_artifact_id"] = artifactID
-	out["stage_brief"] = brief
 	out["stage_brief_markdown"] = markdown
-	out["curated_context"] = markdown
 	return out
 }
 

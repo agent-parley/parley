@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -65,6 +67,26 @@ func TestDispatchStagePersistsStageBriefAndPassesItToRunner(t *testing.T) {
 	if !strings.Contains(briefText, "# Stage brief") || !strings.Contains(briefText, "## Source: workflow_snapshot") {
 		t.Fatalf("dispatch input missing source-labeled Stage brief:\n%s", briefText)
 	}
+	if _, ok := runner.disp.Input["stage_brief"]; ok {
+		t.Fatalf("dispatch input embeds stage_brief struct: %+v", runner.disp.Input)
+	}
+	if _, ok := runner.disp.Input["curated_context"]; ok {
+		t.Fatalf("dispatch input embeds duplicate curated_context: %+v", runner.disp.Input)
+	}
+	briefContentKeys := 0
+	for key, value := range runner.disp.Input {
+		text, ok := value.(string)
+		if !ok || !strings.Contains(text, "# Stage brief") {
+			continue
+		}
+		briefContentKeys++
+		if key != "stage_brief_markdown" {
+			t.Fatalf("dispatch input carries Stage brief content in %q", key)
+		}
+	}
+	if briefContentKeys != 1 {
+		t.Fatalf("dispatch input carries Stage brief content %d times, want once: %+v", briefContentKeys, runner.disp.Input)
+	}
 	stages, err := st.ListStages(ctx, wr.Run.ID)
 	if err != nil {
 		t.Fatalf("list stages: %v", err)
@@ -78,6 +100,56 @@ func TestDispatchStagePersistsStageBriefAndPassesItToRunner(t *testing.T) {
 		}
 	}
 	t.Fatal("implementation stage not found")
+}
+
+func TestStageBriefRepoEvidenceUsesConfiguredGitExecutable(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	repoPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoPath, "README.md"), []byte("# fake repo\n"), 0o600); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	spec := store.DefaultProjectSpec(dataDir)
+	spec.RepositoryPath = repoPath
+	if _, err := st.EnsureProject(ctx, spec); err != nil {
+		t.Fatalf("ensure project repo: %v", err)
+	}
+	wr, err := st.CreateWorkflowRun(ctx, "use configured git for repo evidence")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	fakeGit := filepath.Join(t.TempDir(), "fake-git")
+	gitLog := filepath.Join(t.TempDir(), "git.log")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> '" + gitLog + "'\n" +
+		"case \"$1\" in\n" +
+		"  status) echo '## fake-main' ;;\n" +
+		"  diff) echo 'fake diff' ;;\n" +
+		"  log) echo 'fake log' ;;\n" +
+		"  *) echo 'fake git' ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(fakeGit, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	runner := &capturingRunner{}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{GitExecutable: fakeGit})
+	if _, err := engine.dispatchStage(ctx, wr, wr.ImplementationStage, "capture", contract.StageTypeImplementation, implementationInput(wr, report.Report{})); err != nil {
+		t.Fatalf("dispatchStage() error = %v", err)
+	}
+	logContent, err := os.ReadFile(gitLog)
+	if err != nil {
+		t.Fatalf("read fake git log: %v", err)
+	}
+	for _, want := range []string{"status --short --branch", "diff --stat", "diff --no-ext-diff", "log --oneline -n 5"} {
+		if !strings.Contains(string(logContent), want) {
+			t.Fatalf("fake git log missing %q:\n%s", want, logContent)
+		}
+	}
 }
 
 func TestRuntimeGraphUsesFrozenTemplateEdges(t *testing.T) {
