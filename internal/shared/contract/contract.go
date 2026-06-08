@@ -27,6 +27,34 @@ const (
 	RefinementLevelDeep     = "deep"
 )
 
+const (
+	ReviewRoleCritic  = "critic"
+	ReviewRoleArbiter = "arbiter"
+)
+
+const (
+	ReviewProfileGeneralist  = "generalist"
+	ReviewProfileSecurity    = "security"
+	ReviewProfileTests       = "tests"
+	ReviewProfileAdversarial = "adversarial"
+)
+
+const (
+	ReviewIntensityLight       = "light"
+	ReviewIntensityNormal      = "normal"
+	ReviewIntensityStrict      = "strict"
+	ReviewIntensityAdversarial = "adversarial"
+)
+
+// ReviewerConfig is the user-facing Review-stage configuration. Arbitration is
+// intentionally absent: each agent Review stage always runs one critic and one
+// hidden arbiter internally.
+type ReviewerConfig struct {
+	Profile      string `json:"profile"`
+	Intensity    string `json:"intensity"`
+	Instructions string `json:"instructions,omitempty"`
+}
+
 // Dispatch is the Manager -> Runner input for an adapter stage.
 type Dispatch struct {
 	ProjectID    string         `json:"project_id"`
@@ -61,5 +89,77 @@ func ValidateRefinementLevel(level string) error {
 		return nil
 	default:
 		return fmt.Errorf("refinement_level must be one of %q, %q, or %q", RefinementLevelDirect, RefinementLevelStandard, RefinementLevelDeep)
+	}
+}
+
+func NormalizeReviewProfile(profile string) string {
+	profile = strings.ToLower(strings.TrimSpace(profile))
+	if profile == "" {
+		return ReviewProfileGeneralist
+	}
+	return profile
+}
+
+func ReviewProfileDefaults() []ReviewerConfig {
+	return []ReviewerConfig{
+		{Profile: ReviewProfileGeneralist, Intensity: ReviewIntensityNormal},
+		{Profile: ReviewProfileSecurity, Intensity: ReviewIntensityStrict},
+		{Profile: ReviewProfileTests, Intensity: ReviewIntensityNormal},
+		{Profile: ReviewProfileAdversarial, Intensity: ReviewIntensityAdversarial},
+	}
+}
+
+func DefaultReviewIntensity(profile string) string {
+	switch NormalizeReviewProfile(profile) {
+	case ReviewProfileSecurity:
+		return ReviewIntensityStrict
+	case ReviewProfileAdversarial:
+		return ReviewIntensityAdversarial
+	default:
+		return ReviewIntensityNormal
+	}
+}
+
+func NormalizeReviewIntensity(profile, intensity string) string {
+	intensity = strings.ToLower(strings.TrimSpace(intensity))
+	if intensity == "" {
+		return DefaultReviewIntensity(profile)
+	}
+	return intensity
+}
+
+func NormalizeReviewerConfig(config ReviewerConfig) ReviewerConfig {
+	config.Profile = NormalizeReviewProfile(config.Profile)
+	config.Intensity = NormalizeReviewIntensity(config.Profile, config.Intensity)
+	config.Instructions = strings.TrimSpace(config.Instructions)
+	return config
+}
+
+func ValidateReviewerConfig(config ReviewerConfig) error {
+	config = NormalizeReviewerConfig(config)
+	if !ValidReviewProfile(config.Profile) {
+		return fmt.Errorf("review profile must be one of %q, %q, %q, or %q", ReviewProfileGeneralist, ReviewProfileSecurity, ReviewProfileTests, ReviewProfileAdversarial)
+	}
+	if !ValidReviewIntensity(config.Intensity) {
+		return fmt.Errorf("review intensity must be one of %q, %q, %q, or %q", ReviewIntensityLight, ReviewIntensityNormal, ReviewIntensityStrict, ReviewIntensityAdversarial)
+	}
+	return nil
+}
+
+func ValidReviewProfile(profile string) bool {
+	switch NormalizeReviewProfile(profile) {
+	case ReviewProfileGeneralist, ReviewProfileSecurity, ReviewProfileTests, ReviewProfileAdversarial:
+		return true
+	default:
+		return false
+	}
+}
+
+func ValidReviewIntensity(intensity string) bool {
+	switch strings.ToLower(strings.TrimSpace(intensity)) {
+	case ReviewIntensityLight, ReviewIntensityNormal, ReviewIntensityStrict, ReviewIntensityAdversarial:
+		return true
+	default:
+		return false
 	}
 }

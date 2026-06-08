@@ -107,6 +107,40 @@ func TestPiPrepareBuildsPreflightSafeInvocationAndInputFiles(t *testing.T) {
 	}
 }
 
+func TestPiPrepareScopesStateByAdapterExecutionID(t *testing.T) {
+	ctx := context.Background()
+	adapter := newTestPiAdapter(t, ctx, &scriptedPiProvider{})
+	disp := piTestDispatch()
+	disp.Input["adapter_execution_id"] = "review_arbiter"
+	prepared, err := adapter.Prepare(ctx, disp)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if !strings.Contains(prepared.WorktreePath, "attempt1-review_arbiter") || !strings.Contains(prepared.AgentDir, "attempt1-review_arbiter") {
+		t.Fatalf("execution state not scoped by adapter_execution_id: worktree=%s agent=%s", prepared.WorktreePath, prepared.AgentDir)
+	}
+}
+
+func TestPiPrepareReviewUsesSharedReadOnlyWorktreeAndIndependentState(t *testing.T) {
+	ctx := context.Background()
+	adapter := newTestPiAdapter(t, ctx, &scriptedPiProvider{})
+	disp := piTestDispatch()
+	disp.StageType = contract.StageTypeReview
+	disp.Input["adapter_execution_id"] = "review_arbiter"
+	prepared, err := adapter.Prepare(ctx, disp)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if strings.Contains(prepared.WorktreePath, "review_arbiter") || !strings.Contains(prepared.AgentDir, "attempt1-review_arbiter") {
+		t.Fatalf("review state scoping mismatch: worktree=%s agent=%s", prepared.WorktreePath, prepared.AgentDir)
+	}
+	for _, mount := range prepared.Invocation.Mounts {
+		if mount.Container == containerRepoPath && mount.Mode != "ro" {
+			t.Fatalf("review repo mount mode = %s, want ro", mount.Mode)
+		}
+	}
+}
+
 func TestPiRunRepairsInvalidReportOnce(t *testing.T) {
 	ctx := context.Background()
 	fake := &scriptedPiProvider{
@@ -142,6 +176,45 @@ func TestPiRunRepairsInvalidReportOnce(t *testing.T) {
 	}
 	if len(rep.EvidenceRefs) != 1 || rep.Payload["diff_artifact_id"] == "" {
 		t.Fatalf("report evidence/payload missing diff artifact: %#v", rep)
+	}
+}
+
+func TestPiRunPreservesReviewVerdictAndPayload(t *testing.T) {
+	ctx := context.Background()
+	fake := &scriptedPiProvider{
+		runs: []func(provider.PreparedInvocation) error{
+			func(inv provider.PreparedInvocation) error {
+				workspace, _ := piMountedDirs(inv)
+				return os.WriteFile(filepath.Join(workspace, "report.json"), []byte(`{
+  "status":"completed",
+  "verdict":"changes_requested",
+  "summary":"accepted review finding",
+  "evidence_refs":["critic-artifact"],
+  "payload":{
+    "raw_findings":[{"id":"finding-1"}],
+    "arbitration_decisions":[{"finding_id":"finding-1","classification":"accepted","rationale":"real"}],
+    "residual_risk":"medium",
+    "confidence":"high"
+  },
+  "errors":[]
+}`), 0o600)
+			},
+		},
+	}
+	adapter := newTestPiAdapter(t, ctx, fake)
+	disp := piTestDispatch()
+	disp.StageType = contract.StageTypeReview
+	disp.Input = map[string]any{"review_role": contract.ReviewRoleArbiter, "review_profile": contract.ReviewProfileGeneralist, "review_intensity": contract.ReviewIntensityNormal}
+	sink := &recordingSink{}
+	rep, err := adapter.Run(ctx, disp, sink)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if rep.Verdict == nil || *rep.Verdict != report.ReviewVerdictChangesRequested {
+		t.Fatalf("verdict = %v, want changes_requested", rep.Verdict)
+	}
+	if rep.Payload["residual_risk"] != "medium" || len(rep.EvidenceRefs) != 2 {
+		t.Fatalf("review payload/evidence not preserved: %#v refs=%#v", rep.Payload, rep.EvidenceRefs)
 	}
 }
 

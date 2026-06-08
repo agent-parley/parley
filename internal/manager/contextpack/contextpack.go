@@ -460,10 +460,10 @@ func (WorkflowSnapshotProvider) Collect(ctx context.Context, req Request, bounds
 	source.Warnings = append(source.Warnings, warnings...)
 	source.Items = append(source.Items, jsonItem("prior_stage_outputs", priorReports))
 
+	recordedAttempts := uniqueAttemptIDs(req.Stages)
 	fixLoops := map[string]any{
-		"recorded_attempts": uniqueAttemptIDs(req.Stages),
-		"fix_loop_attempts": []string{},
-		"note":              "No fix-loop attempt records exist in the first-slice workflow state.",
+		"recorded_attempts": recordedAttempts,
+		"fix_loop_attempts": fixLoopAttemptIDs(recordedAttempts),
 	}
 	source.Items = append(source.Items, jsonItem("fix_loop_attempts", fixLoops))
 	return source, nil
@@ -611,6 +611,15 @@ func uniqueAttemptIDs(stages []store.Stage) []string {
 		ids = append(ids, stage.AttemptID)
 	}
 	return ids
+}
+
+func fixLoopAttemptIDs(attempts []string) []string {
+	if len(attempts) <= 1 {
+		return []string{}
+	}
+	out := make([]string, 0, len(attempts)-1)
+	out = append(out, attempts[1:]...)
+	return out
 }
 
 type RepoEvidenceProvider struct {

@@ -95,8 +95,11 @@ func TestRuntimeGraphUsesFrozenTemplateEdges(t *testing.T) {
 	if next, ok := graph.Next("change_review_agent", report.StatusChangesRequested); !ok || next != "implementation" {
 		t.Fatalf("changes_requested next = %q ok=%v, want implementation", next, ok)
 	}
-	if next, ok := graph.Next("validation", report.StatusFailed); !ok || next != "stop_report" {
-		t.Fatalf("validation failed next = %q ok=%v, want stop_report", next, ok)
+	if next, ok := graph.Next("validation", report.StatusFailed); !ok || next != "implementation" {
+		t.Fatalf("validation failed next = %q ok=%v, want implementation fix loop", next, ok)
+	}
+	if next, ok := graph.Next("change_review_agent", report.StatusApproved); !ok || next != "commit_feature_branch" {
+		t.Fatalf("approved next = %q ok=%v, want commit_feature_branch", next, ok)
 	}
 }
 
@@ -154,6 +157,12 @@ func TestAgentStageDispatchReceivesTemplateActorTargetSettings(t *testing.T) {
 	if _, err := engine.runWorkflowStage(ctx, wr, runtime, review, report.Report{}, report.Report{}, workerSnapshot{}, nil); err != nil {
 		t.Fatalf("run review stage: %v", err)
 	}
+	if len(runner.disps) != 2 {
+		t.Fatalf("review dispatch count = %d, want critic + arbiter", len(runner.disps))
+	}
+	if runner.disps[0].Input["review_role"] != contract.ReviewRoleCritic || runner.disps[1].Input["review_role"] != contract.ReviewRoleArbiter {
+		t.Fatalf("review roles = %v, %v", runner.disps[0].Input["review_role"], runner.disps[1].Input["review_role"])
+	}
 	if runner.disp.StageType != workflow.StageTypeReview {
 		t.Fatalf("dispatch stage type = %s, want review", runner.disp.StageType)
 	}
@@ -163,6 +172,84 @@ func TestAgentStageDispatchReceivesTemplateActorTargetSettings(t *testing.T) {
 	settings, ok := runner.disp.Input["workflow_stage_settings"].(map[string]any)
 	if !ok || settings["profile"] != "generalist" || settings["intensity"] != "normal" {
 		t.Fatalf("dispatch input settings = %#v", runner.disp.Input["workflow_stage_settings"])
+	}
+}
+
+func TestReviewChangesRequestedCreatesFixLoopAttempt(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "review loop", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	runner := &reviewVerdictRunner{verdict: report.ReviewVerdictChangesRequested}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
+	runtime, err := engine.loadRuntimeWorkflow(ctx, wr)
+	if err != nil {
+		t.Fatalf("load runtime workflow: %v", err)
+	}
+	reviewStage := runtime.ByID["change_review_agent"]
+	rep, err := engine.runWorkflowStage(ctx, wr, runtime, reviewStage, report.Report{}, report.Report{}, workerSnapshot{}, nil)
+	if err != nil {
+		t.Fatalf("run review stage: %v", err)
+	}
+	if rep.Status != report.StatusChangesRequested || verdictString(rep.Verdict) != string(report.ReviewVerdictChangesRequested) {
+		t.Fatalf("review report status/verdict = %s/%s", rep.Status, verdictString(rep.Verdict))
+	}
+	if got := len(acceptedFindings(rep.Payload)); got != 1 {
+		t.Fatalf("accepted findings = %d, want 1; payload=%#v", got, rep.Payload)
+	}
+	nextID, ok := runtime.Graph.Next(reviewStage.Template.ID, rep.Status)
+	if !ok || nextID != "implementation" {
+		t.Fatalf("next = %s ok=%v, want implementation", nextID, ok)
+	}
+	newWR, newRuntime, err := engine.startFixLoopAttempt(ctx, wr, runtime, reviewStage, rep, nextID)
+	if err != nil {
+		t.Fatalf("start fix loop attempt: %v", err)
+	}
+	if newWR.Attempt.ID == wr.Attempt.ID {
+		t.Fatalf("attempt did not advance: %s", newWR.Attempt.ID)
+	}
+	if got := newRuntime.ByID["implementation"].Stage.AttemptID; got != newWR.Attempt.ID {
+		t.Fatalf("implementation attempt id = %s, want %s", got, newWR.Attempt.ID)
+	}
+}
+
+func TestReviewFixLoopExhaustionBlocksThroughNeedsInput(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "review loop cap", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	runner := &reviewVerdictRunner{verdict: report.ReviewVerdictChangesRequested}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
+	runtime, err := engine.loadRuntimeWorkflow(ctx, wr)
+	if err != nil {
+		t.Fatalf("load runtime workflow: %v", err)
+	}
+	runtime.Template.Settings["max_fix_loops"] = 0
+	reviewStage := runtime.ByID["change_review_agent"]
+	rep, err := engine.runWorkflowStage(ctx, wr, runtime, reviewStage, report.Report{}, report.Report{}, workerSnapshot{}, nil)
+	if err != nil {
+		t.Fatalf("run review stage: %v", err)
+	}
+	if rep.Status != report.StatusNeedsInput || verdictString(rep.Verdict) != string(report.ReviewVerdictBlocked) {
+		t.Fatalf("review exhaustion status/verdict = %s/%s", rep.Status, verdictString(rep.Verdict))
+	}
+	if rep.Payload["fix_loop_exhausted"] != true {
+		t.Fatalf("fix_loop_exhausted payload missing: %#v", rep.Payload)
+	}
+	if next, ok := runtime.Graph.Next(reviewStage.Template.ID, rep.Status); !ok || next != "stop_report" {
+		t.Fatalf("exhausted next = %s ok=%v, want stop_report", next, ok)
 	}
 }
 
@@ -205,13 +292,59 @@ func TestStartRunFreezesSelectedWorkflowTemplateSnapshot(t *testing.T) {
 	}
 }
 
+type reviewVerdictRunner struct {
+	verdict report.Verdict
+	disps   []contract.Dispatch
+}
+
+func (r *reviewVerdictRunner) Dispatch(_ context.Context, disp contract.Dispatch) (report.Report, error) {
+	r.disps = append(r.disps, disp)
+	rep := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         disp.RunID,
+		TaskID:        disp.TaskID,
+		AttemptID:     disp.AttemptID,
+		StageID:       disp.StageID,
+		StageType:     disp.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: disp.Adapter},
+		Status:        report.StatusCompleted,
+		Summary:       "review dispatch",
+		Payload:       map[string]any{},
+		Errors:        []string{},
+	}
+	if disp.Input["review_role"] == contract.ReviewRoleCritic {
+		rep.Payload = map[string]any{"raw_findings": []any{map[string]any{"id": "finding-1", "title": "fix me"}}}
+		return rep, nil
+	}
+	rep.Verdict = &r.verdict
+	rep.Payload = map[string]any{
+		"raw_findings": disp.Input["raw_findings"],
+		"arbitration_decisions": []any{map[string]any{
+			"finding_id":     "finding-1",
+			"classification": report.ReviewFindingAccepted,
+			"rationale":      "real issue",
+			"severity":       "medium",
+			"priority":       "p1",
+		}},
+		"residual_risk": "medium",
+		"confidence":    "normal",
+	}
+	return rep, nil
+}
+
+func (r *reviewVerdictRunner) CancelAttempt(context.Context, string, string, string) error {
+	return nil
+}
+
 type capturingRunner struct {
-	disp contract.Dispatch
+	disp  contract.Dispatch
+	disps []contract.Dispatch
 }
 
 func (r *capturingRunner) Dispatch(_ context.Context, disp contract.Dispatch) (report.Report, error) {
 	r.disp = disp
-	return report.Report{
+	r.disps = append(r.disps, disp)
+	rep := report.Report{
 		SchemaVersion: report.SchemaVersion,
 		RunID:         disp.RunID,
 		TaskID:        disp.TaskID,
@@ -223,7 +356,23 @@ func (r *capturingRunner) Dispatch(_ context.Context, disp contract.Dispatch) (r
 		Summary:       "captured dispatch",
 		Payload:       map[string]any{},
 		Errors:        []string{},
-	}, nil
+	}
+	if disp.StageType == contract.StageTypeReview {
+		switch disp.Input["review_role"] {
+		case contract.ReviewRoleCritic:
+			rep.Payload = map[string]any{"raw_findings": []any{map[string]any{"id": "finding-1", "title": "tighten test"}}}
+		case contract.ReviewRoleArbiter:
+			verdict := report.ReviewVerdictPass
+			rep.Verdict = &verdict
+			rep.Payload = map[string]any{
+				"raw_findings":          disp.Input["raw_findings"],
+				"arbitration_decisions": []any{map[string]any{"finding_id": "finding-1", "classification": report.ReviewFindingRejected, "rationale": "not required"}},
+				"residual_risk":         "low",
+				"confidence":            "high",
+			}
+		}
+	}
+	return rep, nil
 }
 
 func (r *capturingRunner) CancelAttempt(context.Context, string, string, string) error { return nil }

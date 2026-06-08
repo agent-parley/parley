@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/agent-parley/parley/internal/shared/contract"
 )
 
 const (
@@ -101,6 +103,9 @@ func NormalizeTemplate(template Template) Template {
 		stage.Label = strings.TrimSpace(stage.Label)
 		stage.Actor = strings.TrimSpace(stage.Actor)
 		stage.Target = strings.TrimSpace(stage.Target)
+		if stage.Type == StageTypeReview {
+			stage.Settings = normalizeReviewSettings(stage.Settings)
+		}
 	}
 	for i := range template.Edges {
 		edge := &template.Edges[i]
@@ -141,6 +146,11 @@ func ValidateTemplate(template Template) error {
 		}
 		if !validActor(stage.Actor) {
 			errs = append(errs, fmt.Errorf("stage %q actor %q is invalid", stage.ID, stage.Actor))
+		}
+		if stage.Type == StageTypeReview {
+			if err := validateReviewStageSettings(stage); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	for _, edge := range template.Edges {
@@ -195,6 +205,58 @@ func validEdgeOn(on string) bool {
 	}
 }
 
+func normalizeReviewSettings(settings map[string]any) map[string]any {
+	if settings == nil {
+		settings = map[string]any{}
+	}
+	profile := settingString(settings, "profile")
+	intensity := settingString(settings, "intensity")
+	config := contract.NormalizeReviewerConfig(contract.ReviewerConfig{Profile: profile, Intensity: intensity, Instructions: settingString(settings, "instructions")})
+	out := map[string]any{}
+	for key, value := range settings {
+		out[key] = value
+	}
+	out["profile"] = config.Profile
+	out["intensity"] = config.Intensity
+	if config.Instructions != "" {
+		out["instructions"] = config.Instructions
+	} else {
+		delete(out, "instructions")
+	}
+	delete(out, "critic_count")
+	delete(out, "arbiter_count")
+	delete(out, "reviewer_count")
+	delete(out, "panel")
+	delete(out, "arbitration")
+	return out
+}
+
+func validateReviewStageSettings(stage StageTemplate) error {
+	config := contract.ReviewerConfig{
+		Profile:      settingString(stage.Settings, "profile"),
+		Intensity:    settingString(stage.Settings, "intensity"),
+		Instructions: settingString(stage.Settings, "instructions"),
+	}
+	if err := contract.ValidateReviewerConfig(config); err != nil {
+		return fmt.Errorf("stage %q review settings are invalid: %w", stage.ID, err)
+	}
+	if settingString(stage.Settings, "profile") == "custom" {
+		return fmt.Errorf("stage %q review profile %q is not supported in v1", stage.ID, "custom")
+	}
+	return nil
+}
+
+func settingString(settings map[string]any, key string) string {
+	if settings == nil {
+		return ""
+	}
+	value, ok := settings[key]
+	if !ok || value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
 func balancedPRDelivery() Template {
 	stages := []StageTemplate{
 		stage("idea_refinement", StageTypeIdeaRefinement, "Idea refinement", ActorHarness, ""),
@@ -206,11 +268,14 @@ func balancedPRDelivery() Template {
 		stage("pr_creation", StageTypePRCreation, "PR creation", ActorHarness, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	return predefined(BalancedPRDeliveryID, "Balanced PR Delivery", "Recommended branch-and-PR workflow with human plan review and agent code review.", true, stages, defaultEdges(stages), map[string]any{
+	settings := map[string]any{
 		"branch_policy": "feature_branch",
 		"pr_behavior":   "create_pr",
 		"merge_policy":  "human_stop",
-	})
+		"fix_loop":      true,
+		"max_fix_loops": 3,
+	}
+	return predefined(BalancedPRDeliveryID, "Balanced PR Delivery", "Recommended branch-and-PR workflow with human plan review and agent code review.", true, stages, fixLoopEdges(stages, defaultEdges(stages)), settings)
 }
 
 func autonomousPRDelivery() Template {
@@ -224,8 +289,7 @@ func autonomousPRDelivery() Template {
 		stage("memory_update", StageTypeMemoryUpdate, "Memory update", ActorAgent, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	edges := defaultEdges(stages)
-	edges = append(edges, Edge{From: "change_review_agent", To: "implementation", On: OnChangesRequested})
+	edges := fixLoopEdges(stages, defaultEdges(stages))
 	return predefined(AutonomousPRDeliveryID, "Autonomous PR Delivery", "Unattended PR workflow with agent review, fix loop, and memory update.", false, stages, edges, map[string]any{
 		"branch_policy": "feature_branch",
 		"pr_behavior":   "create_pr",
@@ -247,10 +311,12 @@ func carefulReviewDelivery() Template {
 		stage("pr_creation", StageTypePRCreation, "PR creation", ActorHarness, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	return predefined(CarefulReviewID, "Careful Review Delivery", "Branch-and-PR workflow with human review before implementation and before PR handoff.", false, stages, defaultEdges(stages), map[string]any{
+	return predefined(CarefulReviewID, "Careful Review Delivery", "Branch-and-PR workflow with human review before implementation and before PR handoff.", false, stages, fixLoopEdges(stages, defaultEdges(stages)), map[string]any{
 		"branch_policy": "feature_branch",
 		"pr_behavior":   "create_pr",
 		"review_depth":  "careful",
+		"fix_loop":      true,
+		"max_fix_loops": 3,
 	})
 }
 
@@ -264,10 +330,12 @@ func directCommitDelivery() Template {
 		stage("memory_update", StageTypeMemoryUpdate, "Memory update", ActorAgent, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	return predefined(DirectCommitID, "Direct Commit Delivery", "Advanced opt-in workflow that commits to a target branch instead of creating a PR.", false, stages, defaultEdges(stages), map[string]any{
+	return predefined(DirectCommitID, "Direct Commit Delivery", "Advanced opt-in workflow that commits to a target branch instead of creating a PR.", false, stages, fixLoopEdges(stages, defaultEdges(stages)), map[string]any{
 		"advanced":      true,
 		"branch_policy": "target_branch",
 		"pr_behavior":   "none",
+		"fix_loop":      true,
+		"max_fix_loops": 3,
 		"memory_update": true,
 	})
 }
@@ -293,8 +361,52 @@ func stage(id, stageType, label, actor, target string) StageTemplate {
 
 func reviewStage(id, label, actor, target string) StageTemplate {
 	stage := stage(id, StageTypeReview, label, actor, target)
-	stage.Settings = map[string]any{"profile": "generalist", "intensity": "normal"}
+	stage.Settings = map[string]any{
+		"profile":   contract.ReviewProfileGeneralist,
+		"intensity": contract.ReviewIntensityNormal,
+	}
 	return stage
+}
+
+func fixLoopEdges(stages []StageTemplate, edges []Edge) []Edge {
+	implementationID := ""
+	for _, stage := range stages {
+		if stage.Type == StageTypeImplementation {
+			implementationID = stage.ID
+			break
+		}
+	}
+	if implementationID == "" {
+		return edges
+	}
+	for _, stage := range stages {
+		switch {
+		case stage.Type == StageTypeValidation:
+			edges = replaceEdge(edges, stage.ID, OnFailed, implementationID)
+		case stage.Type == StageTypeReview && stage.Target == TargetCodeChanges:
+			edges = replaceEdge(edges, stage.ID, OnChangesRequested, implementationID)
+		}
+	}
+	return edges
+}
+
+func replaceEdge(edges []Edge, from, on, to string) []Edge {
+	out := make([]Edge, 0, len(edges)+1)
+	replaced := false
+	for _, edge := range edges {
+		if edge.From == from && edge.On == on {
+			if !replaced {
+				out = append(out, Edge{From: from, To: to, On: on})
+				replaced = true
+			}
+			continue
+		}
+		out = append(out, edge)
+	}
+	if !replaced {
+		out = append(out, Edge{From: from, To: to, On: on})
+	}
+	return out
 }
 
 func defaultEdges(stages []StageTemplate) []Edge {
@@ -307,7 +419,10 @@ func defaultEdges(stages []StageTemplate) []Edge {
 		}
 	}
 	for i := 0; i < len(stages)-1; i++ {
-		edges = append(edges, Edge{From: stages[i].ID, To: stages[i+1].ID, On: OnCompleted})
+		edges = append(edges,
+			Edge{From: stages[i].ID, To: stages[i+1].ID, On: OnCompleted},
+			Edge{From: stages[i].ID, To: stages[i+1].ID, On: OnApproved},
+		)
 		if stopID != "" && stages[i].ID != stopID {
 			edges = append(edges,
 				Edge{From: stages[i].ID, To: stopID, On: OnFailed},

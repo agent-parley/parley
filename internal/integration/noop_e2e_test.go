@@ -121,8 +121,9 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 			stageBriefArtifacts++
 		}
 	}
-	if reportArtifacts != wantStages {
-		t.Fatalf("expected %d report artifacts, got %d", wantStages, reportArtifacts)
+	wantReportArtifacts := wantStages + 1 // agent Review stores an intermediate critic report plus the final arbiter report.
+	if reportArtifacts != wantReportArtifacts {
+		t.Fatalf("expected %d report artifacts, got %d", wantReportArtifacts, reportArtifacts)
 	}
 	if diffArtifacts != 1 {
 		t.Fatalf("expected 1 validation diff.patch artifact, got %d", diffArtifacts)
@@ -202,6 +203,29 @@ type fakeImplementationAdapter struct {
 func (a fakeImplementationAdapter) Name() string { return "fake_impl" }
 
 func (a fakeImplementationAdapter) Run(ctx context.Context, disp contract.Dispatch, _ runnerio.Sink) (report.Report, error) {
+	if disp.StageType == contract.StageTypeReview {
+		rep := report.Report{
+			SchemaVersion: report.SchemaVersion,
+			RunID:         disp.RunID,
+			TaskID:        disp.TaskID,
+			AttemptID:     disp.AttemptID,
+			StageID:       disp.StageID,
+			StageType:     disp.StageType,
+			Actor:         report.Actor{Kind: report.ActorKindAgent, ID: a.Name()},
+			Status:        report.StatusCompleted,
+			Summary:       "fake review completed",
+			Payload:       map[string]any{},
+			Errors:        []string{},
+		}
+		if disp.Input["review_role"] == contract.ReviewRoleCritic {
+			rep.Payload = map[string]any{"raw_findings": []any{}}
+			return rep, nil
+		}
+		verdict := report.ReviewVerdictPass
+		rep.Verdict = &verdict
+		rep.Payload = map[string]any{"raw_findings": disp.Input["raw_findings"], "arbitration_decisions": []any{}, "residual_risk": "low", "confidence": "high"}
+		return rep, nil
+	}
 	wt, err := worktree.Create(ctx, worktree.CreateOptions{DataRoot: a.dataRoot, ProjectID: a.projectID, RunID: disp.RunID, TaskID: disp.TaskID, AttemptID: disp.AttemptID, SourceRepo: a.sourceRepo})
 	if err != nil {
 		return report.Report{}, err

@@ -97,8 +97,14 @@ func (g runtimeGraph) Start() string { return g.start }
 func (g runtimeGraph) StopID() string { return g.stopID }
 
 func (g runtimeGraph) Next(workflowStageID, status string) (string, bool) {
-	next, ok := g.edges[runtimeEdgeKey(workflowStageID, status)]
-	return next, ok
+	if next, ok := g.edges[runtimeEdgeKey(workflowStageID, status)]; ok {
+		return next, true
+	}
+	if status == workflow.OnApproved {
+		next, ok := g.edges[runtimeEdgeKey(workflowStageID, workflow.OnCompleted)]
+		return next, ok
+	}
+	return "", false
 }
 
 func (g runtimeGraph) Edges() map[string]string {
