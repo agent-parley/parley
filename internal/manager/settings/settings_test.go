@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/agent-parley/parley/internal/manager/agentregistry"
 )
 
 func TestLoadAbsentFilesUsesDefaults(t *testing.T) {
@@ -14,6 +16,24 @@ func TestLoadAbsentFilesUsesDefaults(t *testing.T) {
 	}
 	if loaded.Settings.Queue.AutoWhenReady != true || loaded.Settings.Queue.MaxConcurrent != 1 || loaded.Settings.Queue.BacklogCap != 100 {
 		t.Fatalf("settings = %+v, want queue defaults", loaded.Settings)
+	}
+	if len(loaded.Settings.AgentRegistry.Families) != 1 || loaded.Settings.AgentRegistry.Families[0].ID != agentregistry.FamilyPi {
+		t.Fatalf("agent families = %+v, want Pi-only defaults", loaded.Settings.AgentRegistry.Families)
+	}
+}
+
+func TestResolveDefaultsBackfillsProgrammaticPartialSettings(t *testing.T) {
+	settings := ResolveDefaults(Settings{Queue: QueueSettings{AutoWhenReady: false, MaxConcurrent: 2, BacklogCap: 10}})
+	if settings.Queue.AutoWhenReady != false || settings.Queue.MaxConcurrent != 2 || settings.Queue.BacklogCap != 10 {
+		t.Fatalf("queue = %+v, want caller-provided queue preserved", settings.Queue)
+	}
+	if len(settings.AgentRegistry.Families) != 1 || settings.AgentRegistry.Families[0].ID != agentregistry.FamilyPi {
+		t.Fatalf("agent families = %+v, want Pi defaults", settings.AgentRegistry.Families)
+	}
+
+	settings = ResolveDefaults(Settings{AgentRegistry: agentregistry.Defaults()})
+	if settings.Queue.AutoWhenReady != true || settings.Queue.MaxConcurrent != 1 || settings.Queue.BacklogCap != 100 {
+		t.Fatalf("queue = %+v, want queue defaults when only registry is provided", settings.Queue)
 	}
 }
 
@@ -30,6 +50,70 @@ func TestLoadProjectOverridesGlobal(t *testing.T) {
 	queue := loaded.Settings.Queue
 	if queue.AutoWhenReady != true || queue.MaxConcurrent != 2 || queue.BacklogCap != 25 {
 		t.Fatalf("queue = %+v, want project overrides layered on global", queue)
+	}
+}
+
+func TestLoadAgentRegistryProjectOverridesGlobal(t *testing.T) {
+	dir := t.TempDir()
+	globalPath := filepath.Join(dir, "global.toml")
+	projectPath := filepath.Join(dir, "project.toml")
+	writeFile(t, globalPath, `[agents]
+default_profile_id = "global_worker"
+
+[agents.profiles.global_worker]
+family_id = "pi"
+name = "Global worker"
+role = "implementation"
+headless = true
+model = "global-model"
+context_policy = "task_contract_only"
+output_style = "structured_report"
+suggested_stage_types = ["implementation"]
+
+[agents.profiles.pi_headless_worker]
+model = "global-default-model"
+suggested_stage_types = ["implementation", "pr_creation"]
+`)
+	writeFile(t, projectPath, `[agents]
+default_profile_id = "pi_headless_worker"
+
+[agents.profiles.pi_headless_worker]
+name = "Project worker"
+model = "project-model"
+`)
+	loaded, err := Load(LoadOptions{GlobalPath: globalPath, ProjectPath: projectPath})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	registry := loaded.Settings.AgentRegistry
+	if registry.DefaultProfileID != agentregistry.ProfilePiHeadlessWorker {
+		t.Fatalf("default profile = %q, want project override", registry.DefaultProfileID)
+	}
+	worker, ok := agentregistry.ProfileByID(registry, agentregistry.ProfilePiHeadlessWorker)
+	if !ok {
+		t.Fatalf("profile %q missing", agentregistry.ProfilePiHeadlessWorker)
+	}
+	if worker.Name != "Project worker" || worker.Model != "project-model" {
+		t.Fatalf("worker profile = %+v, want project overrides", worker)
+	}
+	if strings.Join(worker.SuggestedStageTypes, ",") != "implementation,pr_creation" {
+		t.Fatalf("worker suggested stages = %#v, want inherited global stages", worker.SuggestedStageTypes)
+	}
+	globalWorker, ok := agentregistry.ProfileByID(registry, "global_worker")
+	if !ok || globalWorker.FamilyID != agentregistry.FamilyPi {
+		t.Fatalf("global worker = %+v/%v, want retained Pi profile", globalWorker, ok)
+	}
+}
+
+func TestLoadRejectsUnsupportedAgentFamilies(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	writeFile(t, path, "[agents.families.docker]\nname = \"Docker\"\n")
+	_, err := Load(LoadOptions{ProjectPath: path})
+	if err == nil {
+		t.Fatal("Load() error = nil, want unsupported family failure")
+	}
+	if !strings.Contains(err.Error(), "only \"pi\" is supported") {
+		t.Fatalf("error = %q, want Pi-only failure", err.Error())
 	}
 }
 

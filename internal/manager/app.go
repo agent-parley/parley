@@ -58,9 +58,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	if cfg.Adapter == "" {
 		cfg.Adapter = "noop"
 	}
-	if cfg.Settings == (settings.Settings{}) {
-		cfg.Settings = settings.Defaults()
-	}
+	cfg.Settings = settings.ResolveDefaults(cfg.Settings)
 	if err := settings.Validate(cfg.Settings); err != nil {
 		return nil, err
 	}

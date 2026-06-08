@@ -1,4 +1,5 @@
-// Package settings loads Parley's optional non-secret TOML settings.
+// Package settings loads Parley's optional non-secret TOML settings, including
+// queue defaults and metadata-only agent registry overrides.
 //
 // Secret-safety rule: a settings file is rejected when any key whose name
 // contains token, secret, password, auth, or key holds a material value. Keep
