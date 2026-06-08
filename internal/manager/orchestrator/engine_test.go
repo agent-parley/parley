@@ -102,6 +102,129 @@ func TestDispatchStagePersistsStageBriefAndPassesItToRunner(t *testing.T) {
 	t.Fatal("implementation stage not found")
 }
 
+func TestDispatchStageRepairsMalformedReportBeforeCompletion(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRun(ctx, "repair a malformed implementation report")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	runner := &malformedThenRepairedRunner{}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	rep, err := engine.dispatchStage(ctx, wr, wr.ImplementationStage, "repairable", contract.StageTypeImplementation, implementationInput(wr, report.Report{}))
+	if err != nil {
+		t.Fatalf("dispatchStage() error = %v", err)
+	}
+	if rep.Status != report.StatusCompleted {
+		t.Fatalf("status = %s, want completed", rep.Status)
+	}
+	if len(runner.disps) != 2 {
+		t.Fatalf("dispatch count = %d, want initial + repair", len(runner.disps))
+	}
+	if runner.disps[0].AttemptID != runner.disps[1].AttemptID {
+		t.Fatalf("repair attempt id = %s, want shared attempt %s", runner.disps[1].AttemptID, runner.disps[0].AttemptID)
+	}
+	repairInput := runner.disps[1].Input
+	if repairInput["report_repair"] != true || repairInput["report_repair_attempt"] != 1 {
+		t.Fatalf("repair input missing bounded repair markers: %+v", repairInput)
+	}
+	if _, ok := repairInput["invalid_report"].(map[string]any); !ok {
+		t.Fatalf("repair input missing invalid report: %+v", repairInput)
+	}
+	if _, ok := repairInput["expected_report_schema"].(map[string]any); !ok {
+		t.Fatalf("repair input missing expected schema: %+v", repairInput)
+	}
+	contractText, _ := repairInput["contract_markdown"].(string)
+	for _, want := range []string{"Repair the malformed stage report", "Invalid candidate report", "Expected report envelope", "Do not modify `/project/repo`"} {
+		if !strings.Contains(contractText, want) {
+			t.Fatalf("repair contract missing %q:\n%s", want, contractText)
+		}
+	}
+	events, err := st.ListEvents(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if !hasEventType(events, "report.invalid") {
+		t.Fatalf("missing report.invalid event: %#v", eventTypes(events))
+	}
+}
+
+func TestReviewArbiterMissingVerdictIsRepaired(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "review malformed arbiter output", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	runner := &arbiterRepairRunner{}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
+	runtime, err := engine.loadRuntimeWorkflow(ctx, wr)
+	if err != nil {
+		t.Fatalf("load runtime workflow: %v", err)
+	}
+	reviewStage := runtime.ByID["change_review_agent"]
+	rep, err := engine.runWorkflowStage(ctx, wr, runtime, reviewStage, report.Report{}, report.Report{}, workerSnapshot{}, nil)
+	if err != nil {
+		t.Fatalf("run review stage: %v", err)
+	}
+	if rep.Status != report.StatusCompleted || verdictString(rep.Verdict) != string(report.ReviewVerdictPass) {
+		t.Fatalf("review status/verdict = %s/%s, want completed/pass", rep.Status, verdictString(rep.Verdict))
+	}
+	if len(runner.disps) != 3 {
+		t.Fatalf("dispatch count = %d, want critic + arbiter + arbiter repair", len(runner.disps))
+	}
+	repair := runner.disps[2]
+	if repair.Input["review_role"] != contract.ReviewRoleArbiter || repair.Input["report_repair"] != true {
+		t.Fatalf("arbiter repair input = %+v", repair.Input)
+	}
+	if repair.AttemptID != wr.Attempt.ID {
+		t.Fatalf("repair attempt id = %s, want %s", repair.AttemptID, wr.Attempt.ID)
+	}
+	events, err := st.ListEvents(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if !hasEventType(events, "report.invalid") {
+		t.Fatalf("missing report.invalid event: %#v", eventTypes(events))
+	}
+}
+
+func TestMalformedReportRepairExhaustionRoutesInvalidWithoutCrash(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	runner := &alwaysMalformedRunner{}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	runID, err := engine.StartRun(ctx, "malformed adapter report should not pass or crash")
+	if err != nil {
+		t.Fatalf("StartRun() error = %v", err)
+	}
+	waitForRunStatus(t, st, runID, store.RunStatusInvalid)
+	events, err := st.ListEvents(ctx, runID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	for _, want := range []string{"report.invalid", "adapter.failed", "stage.invalid", "run.failed"} {
+		if !hasEventType(events, want) {
+			t.Fatalf("missing %s event: %#v", want, eventTypes(events))
+		}
+	}
+	if len(runner.disps) != 2 {
+		t.Fatalf("dispatch count = %d, want initial + bounded repair", len(runner.disps))
+	}
+}
+
 func TestStageBriefRepoEvidenceUsesConfiguredGitExecutable(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
@@ -508,3 +631,109 @@ func (r *capturingRunner) Dispatch(_ context.Context, disp contract.Dispatch) (r
 }
 
 func (r *capturingRunner) CancelAttempt(context.Context, string, string, string) error { return nil }
+
+type malformedThenRepairedRunner struct {
+	disps []contract.Dispatch
+}
+
+func (r *malformedThenRepairedRunner) Dispatch(_ context.Context, disp contract.Dispatch) (report.Report, error) {
+	r.disps = append(r.disps, disp)
+	if disp.Input["report_repair"] == true {
+		return validAdapterReport(disp, "repaired report"), nil
+	}
+	return report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         disp.RunID,
+		TaskID:        disp.TaskID,
+		AttemptID:     disp.AttemptID,
+		StageID:       disp.StageID,
+		StageType:     disp.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: disp.Adapter},
+		Status:        "surprised",
+		Summary:       "not a valid status",
+		Payload:       map[string]any{},
+		Errors:        []string{},
+	}, nil
+}
+
+func (r *malformedThenRepairedRunner) CancelAttempt(context.Context, string, string, string) error {
+	return nil
+}
+
+type arbiterRepairRunner struct {
+	disps       []contract.Dispatch
+	arbiterSeen int
+}
+
+func (r *arbiterRepairRunner) Dispatch(_ context.Context, disp contract.Dispatch) (report.Report, error) {
+	r.disps = append(r.disps, disp)
+	rep := validAdapterReport(disp, "review dispatch")
+	switch disp.Input["review_role"] {
+	case contract.ReviewRoleCritic:
+		rep.Payload = map[string]any{"raw_findings": []any{map[string]any{"id": "finding-1", "title": "tighten report repair test"}}}
+	case contract.ReviewRoleArbiter:
+		r.arbiterSeen++
+		rep.Payload = map[string]any{
+			"raw_findings": disp.Input["raw_findings"],
+			"arbitration_decisions": []any{map[string]any{
+				"finding_id":     "finding-1",
+				"classification": report.ReviewFindingRejected,
+				"rationale":      "not required",
+				"severity":       "low",
+				"priority":       "p3",
+			}},
+			"residual_risk": "low",
+			"confidence":    "high",
+		}
+		if disp.Input["report_repair"] == true {
+			verdict := report.ReviewVerdictPass
+			rep.Verdict = &verdict
+		}
+	}
+	return rep, nil
+}
+
+func (r *arbiterRepairRunner) CancelAttempt(context.Context, string, string, string) error {
+	return nil
+}
+
+type alwaysMalformedRunner struct {
+	disps []contract.Dispatch
+}
+
+func (r *alwaysMalformedRunner) Dispatch(_ context.Context, disp contract.Dispatch) (report.Report, error) {
+	r.disps = append(r.disps, disp)
+	return report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         disp.RunID,
+		TaskID:        disp.TaskID,
+		AttemptID:     disp.AttemptID,
+		StageID:       disp.StageID,
+		StageType:     disp.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: disp.Adapter},
+		Status:        "surprised",
+		Summary:       "still malformed",
+		Payload:       map[string]any{},
+		Errors:        []string{},
+	}, nil
+}
+
+func (r *alwaysMalformedRunner) CancelAttempt(context.Context, string, string, string) error {
+	return nil
+}
+
+func validAdapterReport(disp contract.Dispatch, summary string) report.Report {
+	return report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         disp.RunID,
+		TaskID:        disp.TaskID,
+		AttemptID:     disp.AttemptID,
+		StageID:       disp.StageID,
+		StageType:     disp.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: disp.Adapter},
+		Status:        report.StatusCompleted,
+		Summary:       summary,
+		Payload:       map[string]any{},
+		Errors:        []string{},
+	}
+}

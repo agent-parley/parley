@@ -98,7 +98,7 @@ func (r *Runner) handleDispatch(ctx context.Context, msg protocol.Message) error
 			rep = failedReport(disp, runErr)
 		}
 		if err := rep.Validate(); err != nil {
-			rep = invalidReport(disp, err)
+			rep = invalidReport(disp, rep, err)
 		}
 		terminal := "completed"
 		if rep.Status == report.StatusFailed || rep.Status == report.StatusInvalid {
@@ -203,7 +203,24 @@ func failedReport(disp contract.Dispatch, err error) report.Report {
 	}
 }
 
-func invalidReport(disp contract.Dispatch, err error) report.Report {
+func invalidReport(disp contract.Dispatch, candidate report.Report, err error) report.Report {
+	invalidCandidate := map[string]any{
+		"schema_version": candidate.SchemaVersion,
+		"run_id":         candidate.RunID,
+		"task_id":        candidate.TaskID,
+		"attempt_id":     candidate.AttemptID,
+		"stage_id":       candidate.StageID,
+		"stage_type":     candidate.StageType,
+		"actor":          map[string]any{"kind": candidate.Actor.Kind, "id": candidate.Actor.ID},
+		"status":         candidate.Status,
+		"summary":        candidate.Summary,
+		"evidence_refs":  append([]string{}, candidate.EvidenceRefs...),
+		"payload":        candidate.Payload,
+		"errors":         append([]string{}, candidate.Errors...),
+	}
+	if candidate.Verdict != nil {
+		invalidCandidate["verdict"] = string(*candidate.Verdict)
+	}
 	return report.Report{
 		SchemaVersion: report.SchemaVersion,
 		RunID:         disp.RunID,
@@ -214,7 +231,7 @@ func invalidReport(disp contract.Dispatch, err error) report.Report {
 		Actor:         report.Actor{Kind: report.ActorKindHarness, ID: "runner"},
 		Status:        report.StatusInvalid,
 		Summary:       "adapter returned invalid report",
-		Payload:       map[string]any{},
+		Payload:       map[string]any{"invalid_report": invalidCandidate},
 		Errors:        []string{err.Error()},
 	}
 }

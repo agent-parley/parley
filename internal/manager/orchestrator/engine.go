@@ -946,27 +946,15 @@ func (e *Engine) dispatchStage(ctx context.Context, wr store.WorkflowRun, stage 
 		Adapter:      adapterName,
 		Input:        input,
 	}
-	if adapterName != "" && stageType != contract.StageTypeValidation {
-		if _, err := e.emit(ctx, stageEvent(wr, stage, "adapter.invocation_prepared", event.Actor{Kind: event.ActorKindAdapter, ID: adapterName}, "adapter invocation prepared", map[string]any{"adapter": adapterName})); err != nil {
-			return report.Report{}, err
-		}
-		if _, err := e.emit(ctx, stageEvent(wr, stage, "adapter.started", event.Actor{Kind: event.ActorKindAdapter, ID: adapterName}, "adapter started", map[string]any{"adapter": adapterName})); err != nil {
-			return report.Report{}, err
-		}
-	}
-	if e.runner == nil {
-		rep := dispatchFailedReport(wr, stage, adapterName, fmt.Errorf("runner unavailable"))
-		return rep, e.completeStage(context.Background(), wr, stage, rep)
-	}
-	rep, err := e.runner.Dispatch(ctx, disp)
+	rep, err := e.dispatchWithReportRepair(ctx, wr, stage, disp, reportRepairOptions{
+		AdapterName:   adapterName,
+		StageType:     stageType,
+		EmitLifecycle: adapterName != "" && stageType != contract.StageTypeValidation,
+		LifecycleData: map[string]any{"adapter": adapterName},
+		Validator:     baseReportValidator(wr, stage, stageType, adapterName),
+	})
 	if err != nil {
-		if errors.Is(err, protocol.ErrSessionClosed) {
-			// The dispatch failed because the runner vanished mid-stage — classify
-			// it so the run terminal reads runner_disconnected regardless of whether
-			// this path or HandleRunnerDown finalizes the run first.
-			e.markRunnerDown(wr.Run.ID, "runner_disconnected")
-		}
-		rep = dispatchFailedReport(wr, stage, adapterName, err)
+		return report.Report{}, err
 	}
 	if err := e.completeStage(context.Background(), wr, stage, rep); err != nil {
 		return report.Report{}, err
