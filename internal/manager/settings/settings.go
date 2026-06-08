@@ -7,13 +7,15 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/agent-parley/parley/internal/manager/agentregistry"
 	"github.com/pelletier/go-toml/v2"
 )
 
 const DefaultProjectConfigPath = ".parley/config.toml"
 
 type Settings struct {
-	Queue QueueSettings `toml:"queue"`
+	Queue         QueueSettings          `toml:"queue"`
+	AgentRegistry agentregistry.Registry `toml:"-"`
 }
 
 type QueueSettings struct {
@@ -34,7 +36,8 @@ type Loaded struct {
 }
 
 type fileSettings struct {
-	Queue *fileQueueSettings `toml:"queue"`
+	Queue  *fileQueueSettings       `toml:"queue"`
+	Agents *agentregistry.Overrides `toml:"agents"`
 }
 
 type fileQueueSettings struct {
@@ -44,7 +47,35 @@ type fileQueueSettings struct {
 }
 
 func Defaults() Settings {
-	return Settings{Queue: QueueSettings{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 100}}
+	return Settings{
+		Queue:         QueueSettings{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 100},
+		AgentRegistry: agentregistry.Defaults(),
+	}
+}
+
+func IsZero(s Settings) bool {
+	return s.Queue == (QueueSettings{}) && agentRegistryIsZero(s.AgentRegistry)
+}
+
+func ResolveDefaults(s Settings) Settings {
+	defaults := Defaults()
+	if IsZero(s) {
+		return defaults
+	}
+	if s.Queue == (QueueSettings{}) {
+		s.Queue = defaults.Queue
+	} else {
+		if s.Queue.MaxConcurrent == 0 {
+			s.Queue.MaxConcurrent = defaults.Queue.MaxConcurrent
+		}
+		if s.Queue.BacklogCap == 0 {
+			s.Queue.BacklogCap = defaults.Queue.BacklogCap
+		}
+	}
+	if agentRegistryIsZero(s.AgentRegistry) {
+		s.AgentRegistry = defaults.AgentRegistry
+	}
+	return s
 }
 
 func Load(opts LoadOptions) (Loaded, error) {
@@ -66,6 +97,7 @@ func Load(opts LoadOptions) (Loaded, error) {
 			return Loaded{}, err
 		}
 	}
+	loaded.Settings = ResolveDefaults(loaded.Settings)
 	if err := Validate(loaded.Settings); err != nil {
 		return Loaded{}, err
 	}
@@ -79,7 +111,14 @@ func Validate(s Settings) error {
 	if s.Queue.BacklogCap < 1 {
 		return fmt.Errorf("queue.backlog_cap must be at least 1")
 	}
+	if err := agentregistry.Validate(s.AgentRegistry); err != nil {
+		return err
+	}
 	return nil
+}
+
+func agentRegistryIsZero(registry agentregistry.Registry) bool {
+	return registry.SchemaVersion == 0 && registry.DefaultProfileID == "" && len(registry.Families) == 0 && len(registry.Profiles) == 0
 }
 
 func mergeFile(dst *Settings, sourceName, path string) error {
@@ -105,7 +144,9 @@ func mergeFile(dst *Settings, sourceName, path string) error {
 	if err := validateFileSettings(file, sourceName, path); err != nil {
 		return err
 	}
-	merge(dst, file)
+	if err := merge(dst, sourceName, file); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -122,19 +163,26 @@ func validateFileSettings(file fileSettings, sourceName, path string) error {
 	return nil
 }
 
-func merge(dst *Settings, file fileSettings) {
-	if file.Queue == nil {
-		return
+func merge(dst *Settings, sourceName string, file fileSettings) error {
+	if file.Queue != nil {
+		if file.Queue.AutoWhenReady != nil {
+			dst.Queue.AutoWhenReady = *file.Queue.AutoWhenReady
+		}
+		if file.Queue.MaxConcurrent != nil {
+			dst.Queue.MaxConcurrent = *file.Queue.MaxConcurrent
+		}
+		if file.Queue.BacklogCap != nil {
+			dst.Queue.BacklogCap = *file.Queue.BacklogCap
+		}
 	}
-	if file.Queue.AutoWhenReady != nil {
-		dst.Queue.AutoWhenReady = *file.Queue.AutoWhenReady
+	if file.Agents != nil {
+		registry, err := agentregistry.ApplyOverrides(dst.AgentRegistry, sourceName, *file.Agents)
+		if err != nil {
+			return err
+		}
+		dst.AgentRegistry = registry
 	}
-	if file.Queue.MaxConcurrent != nil {
-		dst.Queue.MaxConcurrent = *file.Queue.MaxConcurrent
-	}
-	if file.Queue.BacklogCap != nil {
-		dst.Queue.BacklogCap = *file.Queue.BacklogCap
-	}
+	return nil
 }
 
 func rejectSecretMaterial(content []byte, path string) error {
