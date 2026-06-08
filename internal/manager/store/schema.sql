@@ -2,6 +2,8 @@ CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
+  project_rules TEXT NOT NULL DEFAULT '',
+  project_preferences TEXT NOT NULL DEFAULT '',
   queue_auto_when_ready INTEGER NOT NULL DEFAULT 1,
   queue_max_concurrent INTEGER NOT NULL DEFAULT 1,
   queue_backlog_cap INTEGER NOT NULL DEFAULT 100,
