@@ -88,6 +88,8 @@ type Project struct {
 	ID                 string
 	Name               string
 	Description        string
+	ProjectRules       string
+	ProjectPreferences string
 	WorkspacePath      string
 	QueueAutoWhenReady bool
 	QueueMaxConcurrent int
@@ -305,6 +307,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureWorkflowTemplates(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureProjectRulesPreferencesSchema(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureDefaultProject(ctx); err != nil {
 		return err
 	}
@@ -367,6 +372,24 @@ func (s *Store) tableColumns(ctx context.Context, table string) (map[string]sqli
 func (s *Store) ensureDefaultProject(ctx context.Context) error {
 	_, err := s.EnsureProject(ctx, DefaultProjectSpec(s.dataDir))
 	return err
+}
+
+func (s *Store) ensureProjectRulesPreferencesSchema(ctx context.Context) error {
+	cols, err := s.tableColumns(ctx, "projects")
+	if err != nil {
+		return err
+	}
+	if _, ok := cols["project_rules"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE projects ADD COLUMN project_rules TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add project rules column: %w", err)
+		}
+	}
+	if _, ok := cols["project_preferences"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE projects ADD COLUMN project_preferences TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add project preferences column: %w", err)
+		}
+	}
+	return nil
 }
 
 func DefaultProjectSpec(dataDir string) ProjectSpec {
@@ -438,8 +461,8 @@ func (s *Store) normalizeProjectSpec(spec ProjectSpec) ProjectSpec {
 func (s *Store) GetProject(ctx context.Context, projectID string) (Project, error) {
 	var project Project
 	var auto int
-	err := s.db.QueryRowContext(ctx, `SELECT p.id, p.name, p.description, w.path, p.queue_auto_when_ready, p.queue_max_concurrent, p.queue_backlog_cap, p.created_at, p.updated_at
-FROM projects p JOIN workspaces w ON w.project_id = p.id WHERE p.id = ?`, projectID).Scan(&project.ID, &project.Name, &project.Description, &project.WorkspacePath, &auto, &project.QueueMaxConcurrent, &project.QueueBacklogCap, &project.CreatedAt, &project.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT p.id, p.name, p.description, p.project_rules, p.project_preferences, w.path, p.queue_auto_when_ready, p.queue_max_concurrent, p.queue_backlog_cap, p.created_at, p.updated_at
+FROM projects p JOIN workspaces w ON w.project_id = p.id WHERE p.id = ?`, projectID).Scan(&project.ID, &project.Name, &project.Description, &project.ProjectRules, &project.ProjectPreferences, &project.WorkspacePath, &auto, &project.QueueMaxConcurrent, &project.QueueBacklogCap, &project.CreatedAt, &project.UpdatedAt)
 	if err != nil {
 		return Project{}, fmt.Errorf("get project %s: %w", projectID, err)
 	}
@@ -448,7 +471,7 @@ FROM projects p JOIN workspaces w ON w.project_id = p.id WHERE p.id = ?`, projec
 }
 
 func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT p.id, p.name, p.description, w.path, p.queue_auto_when_ready, p.queue_max_concurrent, p.queue_backlog_cap, p.created_at, p.updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT p.id, p.name, p.description, p.project_rules, p.project_preferences, w.path, p.queue_auto_when_ready, p.queue_max_concurrent, p.queue_backlog_cap, p.created_at, p.updated_at
 FROM projects p JOIN workspaces w ON w.project_id = p.id ORDER BY p.created_at DESC, p.id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list projects: %w", err)
@@ -458,7 +481,7 @@ FROM projects p JOIN workspaces w ON w.project_id = p.id ORDER BY p.created_at D
 	for rows.Next() {
 		var project Project
 		var auto int
-		if err := rows.Scan(&project.ID, &project.Name, &project.Description, &project.WorkspacePath, &auto, &project.QueueMaxConcurrent, &project.QueueBacklogCap, &project.CreatedAt, &project.UpdatedAt); err != nil {
+		if err := rows.Scan(&project.ID, &project.Name, &project.Description, &project.ProjectRules, &project.ProjectPreferences, &project.WorkspacePath, &auto, &project.QueueMaxConcurrent, &project.QueueBacklogCap, &project.CreatedAt, &project.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan project: %w", err)
 		}
 		project.QueueAutoWhenReady = auto != 0

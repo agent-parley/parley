@@ -59,15 +59,21 @@ func TestAssemblerBuildsSourceLabeledStageFilteredBrief(t *testing.T) {
 	if preferencesCandidate.Authority != SourceItemAuthorityCandidate || !strings.Contains(preferencesCandidate.AuthorityNote, "Non-authoritative repo suggestion") {
 		t.Fatalf("repo preferences candidate = %+v", preferencesCandidate)
 	}
+	if status := itemByLabel(preferencesSource, "project_preferences_status"); status.Authority != SourceItemAuthorityInformational || !strings.Contains(status.Text, "No project preferences configured") {
+		t.Fatalf("project preferences status = %+v", status)
+	}
 	if queueDefaults := itemByLabel(preferencesSource, "project_queue_defaults"); queueDefaults.Authority != SourceItemAuthorityAuthoritative {
 		t.Fatalf("queue defaults authority = %+v", queueDefaults)
 	}
-	if !hasDeferredSource(brief, "editable_project_rules_preferences_app_state") {
-		t.Fatalf("missing project rules/preferences app-state deferred source: %+v", brief.DeferredSources)
+	if hasDeferredSource(brief, SourceTaskPlan) || hasDeferredSource(brief, SourcePlanningArtifacts) {
+		t.Fatalf("task_plan/planning_artifacts are live sources, not deferred: %+v", brief.DeferredSources)
+	}
+	if hasDeferredSource(brief, "editable_project_rules_preferences_app_state") {
+		t.Fatalf("project rules/preferences app-state is no longer deferred: %+v", brief.DeferredSources)
 	}
 
 	markdown := Markdown(brief)
-	for _, want := range []string{"## Source: task_plan", "## Source: repo_evidence", "## Source: project_rules", "## Source: workflow_snapshot", "## Source: planning_artifacts", "## Source: project_preferences", "Conflict precedence", "candidate_project_rules:.parley/rules.md", "candidate_project_preferences:.parley/preferences.md", "Authority: `candidate`", "Non-authoritative repo suggestion", "No project rules configured in first-slice project state"} {
+	for _, want := range []string{"## Source: task_plan", "## Source: workflow_snapshot", "## Source: repo_evidence", "## Source: project_rules", "## Source: planning_artifacts", "## Source: project_preferences", "Conflict precedence", "candidate_project_rules:.parley/rules.md", "candidate_project_preferences:.parley/preferences.md", "Authority: `candidate`", "Non-authoritative repo suggestion", "No project rules configured in Parley app state", "No approved task plan artifact is available", "No supplemental planning artifacts are available"} {
 		if !strings.Contains(markdown, want) {
 			t.Fatalf("markdown missing %q:\n%s", want, markdown)
 		}
@@ -81,15 +87,15 @@ func TestProjectRulesAppStateIsAuthoritativeAndRepoRulesRemainCandidate(t *testi
 		".parley/rules.md": "Never bypass approval gates.\n",
 	})
 	req := briefRequest(repo, contract.StageTypeImplementation)
-	req.Project.Description = "Ship only after validation passes."
+	req.Project.ProjectRules = "Ship only after validation passes."
 	brief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, req)
 	if err != nil {
 		t.Fatalf("Assemble() error = %v", err)
 	}
 
 	rulesSource := sourceByLabel(brief, SourceProjectRules)
-	authoritative := itemByLabel(rulesSource, "project_description")
-	if authoritative.Authority != SourceItemAuthorityAuthoritative || authoritative.Text != req.Project.Description {
+	authoritative := itemByLabel(rulesSource, "project_rules")
+	if authoritative.Authority != SourceItemAuthorityAuthoritative || authoritative.Text != req.Project.ProjectRules || authoritative.MediaType != "text/markdown" {
 		t.Fatalf("authoritative rules item = %+v", authoritative)
 	}
 	if status := itemByLabel(rulesSource, "project_rules_status"); status.Label != "" {
@@ -100,10 +106,37 @@ func TestProjectRulesAppStateIsAuthoritativeAndRepoRulesRemainCandidate(t *testi
 		t.Fatalf("repo rules candidate = %+v", candidate)
 	}
 	markdown := Markdown(brief)
-	for _, want := range []string{"project_description", "Authority: `authoritative`", "candidate_project_rules:.parley/rules.md", "does not receive project_rules precedence"} {
+	for _, want := range []string{"project_rules", "Authority: `authoritative`", "candidate_project_rules:.parley/rules.md", "does not receive project_rules precedence"} {
 		if !strings.Contains(markdown, want) {
 			t.Fatalf("markdown missing %q:\n%s", want, markdown)
 		}
+	}
+}
+
+func TestProjectPreferencesAppStateIsAuthoritativeAndRepoPreferencesRemainCandidate(t *testing.T) {
+	ctx := context.Background()
+	repo := initBriefRepo(t, ctx, map[string]string{
+		"go.mod":                 "module example.test/parley\n",
+		".parley/preferences.md": "Prefer concise final reports.\n",
+	})
+	req := briefRequest(repo, contract.StageTypeImplementation)
+	req.Project.ProjectPreferences = "Prefer detailed validation summaries."
+	brief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+
+	preferencesSource := sourceByLabel(brief, SourceProjectPreferences)
+	authoritative := itemByLabel(preferencesSource, "project_preferences")
+	if authoritative.Authority != SourceItemAuthorityAuthoritative || authoritative.Text != req.Project.ProjectPreferences || authoritative.MediaType != "text/markdown" {
+		t.Fatalf("authoritative preferences item = %+v", authoritative)
+	}
+	if status := itemByLabel(preferencesSource, "project_preferences_status"); status.Label != "" {
+		t.Fatalf("unexpected empty-state status with app-state preferences: %+v", status)
+	}
+	candidate := itemByLabel(preferencesSource, "candidate_project_preferences:.parley/preferences.md")
+	if candidate.Authority != SourceItemAuthorityCandidate || candidate.Text != "Prefer concise final reports.\n" {
+		t.Fatalf("repo preferences candidate = %+v", candidate)
 	}
 }
 
@@ -175,10 +208,10 @@ func TestAssemblerIncludesApprovedTaskPlanAndPlanningArtifacts(t *testing.T) {
 		t.Fatalf("planning artifact item = %+v", contractItem)
 	}
 	if hasDeferredSource(brief, SourceTaskPlan) || hasDeferredSource(brief, SourcePlanningArtifacts) {
-		t.Fatalf("task_plan/planning_artifacts should not be deferred: %+v", brief.DeferredSources)
+		t.Fatalf("task_plan/planning_artifacts should not be deferred once providers are live: %+v", brief.DeferredSources)
 	}
 	markdown := Markdown(brief)
-	for _, want := range []string{"2. `approved_task_plan` (source: `task_plan`)", "6. `planning_artifacts` (source: `planning_artifacts`)", "## Source: task_plan", "## Source: planning_artifacts", "Implement the approved plan", "Original user idea"} {
+	for _, want := range []string{"2. `approved_task_plan` (source: `task_plan`)", "6. `planning_artifacts` (source: `planning_artifacts`)", "## Source: task_plan", "## Source: planning_artifacts", "Implement the approved plan.", "Original user idea."} {
 		if !strings.Contains(markdown, want) {
 			t.Fatalf("markdown missing %q:\n%s", want, markdown)
 		}

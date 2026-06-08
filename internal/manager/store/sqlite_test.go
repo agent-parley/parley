@@ -214,6 +214,135 @@ func TestProjectWorkspaceAndNoOrphanWorkflowRecords(t *testing.T) {
 	}
 }
 
+func TestProjectRulesPreferencesMigrationAddsColumnsToExistingProjects(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dataDir, "parley.db"))
+	if err != nil {
+		t.Fatalf("open legacy sqlite: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TABLE projects (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  queue_auto_when_ready INTEGER NOT NULL DEFAULT 1,
+  queue_max_concurrent INTEGER NOT NULL DEFAULT 1,
+  queue_backlog_cap INTEGER NOT NULL DEFAULT 100,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)`); err != nil {
+		t.Fatalf("create legacy projects table: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO projects(id, name, description, queue_auto_when_ready, queue_max_concurrent, queue_backlog_cap, created_at, updated_at) VALUES (?, ?, '', 1, 1, 100, 'legacy', 'legacy')`, DefaultProjectID, "Legacy project"); err != nil {
+		t.Fatalf("insert legacy project: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy sqlite: %v", err)
+	}
+
+	st, err := Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("open migrated store: %v", err)
+	}
+	defer st.Close()
+	project, err := st.GetProject(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get migrated project: %v", err)
+	}
+	if project.ProjectRules != "" || project.ProjectPreferences != "" {
+		t.Fatalf("migrated project rules/preferences = %q/%q, want empty defaults", project.ProjectRules, project.ProjectPreferences)
+	}
+	updated, err := st.UpdateProjectRules(ctx, DefaultProjectID, "Migrated DB accepts rules.\n")
+	if err != nil {
+		t.Fatalf("update migrated project rules: %v", err)
+	}
+	if updated.ProjectRules != "Migrated DB accepts rules.\n" {
+		t.Fatalf("updated migrated project rules = %q", updated.ProjectRules)
+	}
+}
+
+func TestProjectRulesPreferencesCanBeUpdatedAndPromotedFromRepoCandidates(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	updated, err := st.UpdateProjectRules(ctx, DefaultProjectID, "Run targeted validation before commit.\n")
+	if err != nil {
+		t.Fatalf("update project rules: %v", err)
+	}
+	if updated.ProjectRules != "Run targeted validation before commit.\n" {
+		t.Fatalf("project rules = %q", updated.ProjectRules)
+	}
+	rules, err := st.GetProjectRules(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get project rules: %v", err)
+	}
+	if rules != updated.ProjectRules {
+		t.Fatalf("get project rules = %q, want %q", rules, updated.ProjectRules)
+	}
+
+	updated, err = st.UpdateProjectPreferences(ctx, DefaultProjectID, "Prefer short reports.\n")
+	if err != nil {
+		t.Fatalf("update project preferences: %v", err)
+	}
+	if updated.ProjectPreferences != "Prefer short reports.\n" {
+		t.Fatalf("project preferences = %q", updated.ProjectPreferences)
+	}
+	preferences, err := st.GetProjectPreferences(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get project preferences: %v", err)
+	}
+	if preferences != updated.ProjectPreferences {
+		t.Fatalf("get project preferences = %q, want %q", preferences, updated.ProjectPreferences)
+	}
+
+	repo := t.TempDir()
+	for rel, content := range map[string]string{
+		ProjectRulesCandidatePath:       "Never bypass human approval gates.\n",
+		ProjectPreferencesCandidatePath: "Prefer concise status updates.\n",
+	} {
+		path := filepath.Join(repo, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", rel, err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	promotedRules, err := st.PromoteProjectRulesFromRepository(ctx, DefaultProjectID, repo)
+	if err != nil {
+		t.Fatalf("promote project rules: %v", err)
+	}
+	if promotedRules.ProjectRules != "Never bypass human approval gates.\n" {
+		t.Fatalf("promoted rules = %q", promotedRules.ProjectRules)
+	}
+	promotedPreferences, err := st.PromoteProjectPreferencesFromRepository(ctx, DefaultProjectID, repo)
+	if err != nil {
+		t.Fatalf("promote project preferences: %v", err)
+	}
+	if promotedPreferences.ProjectPreferences != "Prefer concise status updates.\n" {
+		t.Fatalf("promoted preferences = %q", promotedPreferences.ProjectPreferences)
+	}
+
+	if _, err := st.EnsureProject(ctx, DefaultProjectSpec(dataDir)); err != nil {
+		t.Fatalf("ensure project after promote: %v", err)
+	}
+	persisted, err := st.GetProject(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get project after ensure: %v", err)
+	}
+	if persisted.ProjectRules != promotedRules.ProjectRules || persisted.ProjectPreferences != promotedPreferences.ProjectPreferences {
+		t.Fatalf("ensure project erased app-state rules/preferences: %+v", persisted)
+	}
+}
+
 func TestProjectMemoryIsSQLiteOnlyAndCuratorGated(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
