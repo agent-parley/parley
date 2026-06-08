@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -11,7 +10,6 @@ import (
 	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
-	"github.com/agent-parley/parley/internal/shared/protocol"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
 
@@ -39,11 +37,12 @@ func (e *Engine) runReviewStage(ctx context.Context, wr store.WorkflowRun, runti
 	criticInput["critic_count"] = 1
 	criticInput["arbiter_count"] = 1
 	criticInput["arbitration_internal"] = true
-	criticRep, err := e.dispatchReviewPass(ctx, wr, stage, stage.Adapter, contract.ReviewRoleCritic, criticInput)
+	criticRep, err := e.dispatchReviewPass(ctx, wr, stage, stage.Adapter, contract.ReviewRoleCritic, criticInput, func(rep report.Report) (report.Report, error) {
+		return normalizeIntermediateReviewReport(wr, stage, rep)
+	})
 	if err != nil {
 		return report.Report{}, err
 	}
-	criticRep = normalizeIntermediateReviewReport(wr, stage, criticRep)
 	if criticRep.Status != report.StatusCompleted {
 		if err := e.completeStage(context.Background(), wr, stage, criticRep); err != nil {
 			return report.Report{}, err
@@ -73,11 +72,12 @@ func (e *Engine) runReviewStage(ctx context.Context, wr store.WorkflowRun, runti
 	arbiterInput["raw_findings"] = rawFindings
 	arbiterInput["critic_report"] = reportInput(criticRep)
 	arbiterInput["critic_report_artifact_id"] = criticArtifact.ID
-	arbiterRep, err := e.dispatchReviewPass(ctx, wr, stage, stage.Adapter, contract.ReviewRoleArbiter, arbiterInput)
+	finalRep, err := e.dispatchReviewPass(ctx, wr, stage, stage.Adapter, contract.ReviewRoleArbiter, arbiterInput, func(rep report.Report) (report.Report, error) {
+		return normalizeArbiterReviewReport(wr, stage, runtime.Template, templateStage, rep, criticRep, criticArtifact.ID)
+	})
 	if err != nil {
 		return report.Report{}, err
 	}
-	finalRep := normalizeArbiterReviewReport(wr, stage, runtime.Template, templateStage, arbiterRep, criticRep, criticArtifact.ID)
 	if finalRep.Status == report.StatusChangesRequested {
 		exhausted, err := e.fixLoopExhausted(context.Background(), wr, runtime.Template, templateStage)
 		if err != nil {
@@ -93,17 +93,8 @@ func (e *Engine) runReviewStage(ctx context.Context, wr store.WorkflowRun, runti
 	return finalRep, nil
 }
 
-func (e *Engine) dispatchReviewPass(ctx context.Context, wr store.WorkflowRun, stage store.Stage, adapterName, role string, input map[string]any) (report.Report, error) {
+func (e *Engine) dispatchReviewPass(ctx context.Context, wr store.WorkflowRun, stage store.Stage, adapterName, role string, input map[string]any, validator reportRepairValidator) (report.Report, error) {
 	data := map[string]any{"adapter": adapterName, "review_role": role, "critic_count": 1, "arbiter_count": 1}
-	if _, err := e.emit(ctx, stageEvent(wr, stage, "adapter.invocation_prepared", event.Actor{Kind: event.ActorKindAdapter, ID: adapterName}, "review "+role+" invocation prepared", data)); err != nil {
-		return report.Report{}, err
-	}
-	if _, err := e.emit(ctx, stageEvent(wr, stage, "adapter.started", event.Actor{Kind: event.ActorKindAdapter, ID: adapterName}, "review "+role+" started", data)); err != nil {
-		return report.Report{}, err
-	}
-	if e.runner == nil {
-		return dispatchFailedReport(wr, stage, adapterName, fmt.Errorf("runner unavailable")), nil
-	}
 	disp := contract.Dispatch{
 		ProjectID:    wr.Run.ProjectID,
 		RepositoryID: wr.Task.RepositoryID,
@@ -115,14 +106,15 @@ func (e *Engine) dispatchReviewPass(ctx context.Context, wr store.WorkflowRun, s
 		Adapter:      adapterName,
 		Input:        input,
 	}
-	rep, err := e.runner.Dispatch(ctx, disp)
-	if err != nil {
-		if errors.Is(err, protocol.ErrSessionClosed) {
-			e.markRunnerDown(wr.Run.ID, "runner_disconnected")
-		}
-		return dispatchFailedReport(wr, stage, adapterName, err), nil
-	}
-	return stampReport(wr, stage, contract.StageTypeReview, rep), nil
+	return e.dispatchWithReportRepair(ctx, wr, stage, disp, reportRepairOptions{
+		AdapterName:     adapterName,
+		StageType:       contract.StageTypeReview,
+		EmitLifecycle:   true,
+		LifecycleData:   data,
+		PreparedSummary: "review " + role + " invocation prepared",
+		StartedSummary:  "review " + role + " started",
+		Validator:       validator,
+	})
 }
 
 func reviewBaseInput(wr store.WorkflowRun, stage workflow.StageTemplate, lastReport, lastValidationReport report.Report, snapshot workerSnapshot, snapshotErr error) map[string]any {
@@ -164,22 +156,23 @@ func reviewBaseInput(wr store.WorkflowRun, stage workflow.StageTemplate, lastRep
 	return input
 }
 
-func normalizeIntermediateReviewReport(wr store.WorkflowRun, stage store.Stage, rep report.Report) report.Report {
+func normalizeIntermediateReviewReport(wr store.WorkflowRun, stage store.Stage, rep report.Report) (report.Report, error) {
 	rep = stampReport(wr, stage, contract.StageTypeReview, rep)
 	if rep.Payload == nil {
 		rep.Payload = map[string]any{}
 	}
 	rep.Payload["review_role"] = contract.ReviewRoleCritic
 	if err := rep.Validate(); err != nil {
-		return invalidReviewReport(wr, stage, "review critic returned invalid report", err)
+		return invalidAdapterReport(wr, stage, stage.Adapter, "review critic returned invalid report", rep, err), err
 	}
 	if rep.Status == report.StatusApproved || rep.Status == report.StatusChangesRequested {
-		return invalidReviewReport(wr, stage, "review critic returned arbiter-only status", fmt.Errorf("critic status %q is not allowed", rep.Status))
+		err := fmt.Errorf("critic status %q is not allowed", rep.Status)
+		return invalidAdapterReport(wr, stage, stage.Adapter, "review critic returned arbiter-only status", rep, err), err
 	}
-	return rep
+	return rep, nil
 }
 
-func normalizeArbiterReviewReport(wr store.WorkflowRun, stage store.Stage, template workflow.Template, templateStage workflow.StageTemplate, arbiterRep, criticRep report.Report, criticArtifactID string) report.Report {
+func normalizeArbiterReviewReport(wr store.WorkflowRun, stage store.Stage, template workflow.Template, templateStage workflow.StageTemplate, arbiterRep, criticRep report.Report, criticArtifactID string) (report.Report, error) {
 	rep := stampReport(wr, stage, contract.StageTypeReview, arbiterRep)
 	if rep.Payload == nil {
 		rep.Payload = map[string]any{}
@@ -200,7 +193,7 @@ func normalizeArbiterReviewReport(wr store.WorkflowRun, stage store.Stage, templ
 		rep.Payload["arbitration_decisions"] = []any{}
 	}
 	if err := validateArbitrationDecisions(rep.Payload); err != nil {
-		return invalidReviewReport(wr, stage, "review arbiter returned invalid arbitration decisions", err)
+		return invalidAdapterReport(wr, stage, stage.Adapter, "review arbiter returned invalid arbitration decisions", rep, err), err
 	}
 	rep.Payload["accepted_findings"] = acceptedArbitrationDecisions(rep.Payload)
 	if !containsString(rep.EvidenceRefs, criticArtifactID) {
@@ -208,33 +201,37 @@ func normalizeArbiterReviewReport(wr store.WorkflowRun, stage store.Stage, templ
 	}
 	if rep.Status == report.StatusFailed || rep.Status == report.StatusInvalid || rep.Status == report.StatusNeedsInput {
 		if err := rep.Validate(); err != nil {
-			return invalidReviewReport(wr, stage, "review arbiter returned invalid report", err)
+			return invalidAdapterReport(wr, stage, stage.Adapter, "review arbiter returned invalid report", rep, err), err
 		}
-		return rep
+		return rep, nil
 	}
 	if rep.Status != report.StatusCompleted && rep.Status != report.StatusApproved && rep.Status != report.StatusChangesRequested {
-		return invalidReviewReport(wr, stage, "review arbiter returned invalid status", fmt.Errorf("review arbiter status %q cannot be verdict-routed", rep.Status))
+		err := fmt.Errorf("review arbiter status %q cannot be verdict-routed", rep.Status)
+		return invalidAdapterReport(wr, stage, stage.Adapter, "review arbiter returned invalid status", rep, err), err
 	}
 	if rep.Verdict == nil {
-		return invalidReviewReport(wr, stage, "review arbiter omitted verdict", fmt.Errorf("review verdict is required"))
+		err := fmt.Errorf("review verdict is required")
+		return invalidAdapterReport(wr, stage, stage.Adapter, "review arbiter omitted verdict", rep, err), err
 	}
 	switch *rep.Verdict {
 	case report.ReviewVerdictPass:
 		rep.Status = report.StatusCompleted
 	case report.ReviewVerdictChangesRequested:
 		if len(acceptedArbitrationDecisions(rep.Payload)) == 0 {
-			return invalidReviewReport(wr, stage, "review arbiter requested changes without accepted findings", fmt.Errorf("changes_requested requires at least one accepted arbitration decision"))
+			err := fmt.Errorf("changes_requested requires at least one accepted arbitration decision")
+			return invalidAdapterReport(wr, stage, stage.Adapter, "review arbiter requested changes without accepted findings", rep, err), err
 		}
 		rep.Status = report.StatusChangesRequested
 	case report.ReviewVerdictBlocked, report.ReviewVerdictEscalate:
 		rep.Status = report.StatusNeedsInput
 	default:
-		return invalidReviewReport(wr, stage, "review arbiter returned invalid verdict", fmt.Errorf("invalid review verdict %q", *rep.Verdict))
+		err := fmt.Errorf("invalid review verdict %q", *rep.Verdict)
+		return invalidAdapterReport(wr, stage, stage.Adapter, "review arbiter returned invalid verdict", rep, err), err
 	}
 	if err := rep.Validate(); err != nil {
-		return invalidReviewReport(wr, stage, "review arbiter returned invalid report", err)
+		return invalidAdapterReport(wr, stage, stage.Adapter, "review arbiter returned invalid report", rep, err), err
 	}
-	return rep
+	return rep, nil
 }
 
 func exhaustedReviewReport(rep report.Report, maxLoops int) report.Report {
@@ -249,22 +246,6 @@ func exhaustedReviewReport(rep report.Report, maxLoops int) report.Report {
 	rep.Status = report.StatusNeedsInput
 	rep.Summary = fmt.Sprintf("review fix loop exhausted after %d fix loop attempt(s): %s", maxLoops, rep.Summary)
 	return rep
-}
-
-func invalidReviewReport(wr store.WorkflowRun, stage store.Stage, summary string, err error) report.Report {
-	return report.Report{
-		SchemaVersion: report.SchemaVersion,
-		RunID:         wr.Run.ID,
-		TaskID:        wr.Task.ID,
-		AttemptID:     wr.Attempt.ID,
-		StageID:       stage.ID,
-		StageType:     stage.StageType,
-		Actor:         report.Actor{Kind: report.ActorKindHarness, ID: "manager"},
-		Status:        report.StatusInvalid,
-		Summary:       summary,
-		Payload:       map[string]any{},
-		Errors:        []string{err.Error()},
-	}
 }
 
 func stampReport(wr store.WorkflowRun, stage store.Stage, stageType string, rep report.Report) report.Report {
