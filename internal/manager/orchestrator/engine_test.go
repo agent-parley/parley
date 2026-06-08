@@ -175,6 +175,66 @@ func TestAgentStageDispatchReceivesTemplateActorTargetSettings(t *testing.T) {
 	}
 }
 
+func TestMemoryUpdateStageAppliesCuratedCandidatesWithoutDispatchingWorkflowAgent(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "remember safe lessons", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	runner := &capturingRunner{}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
+	runtime, err := engine.loadRuntimeWorkflow(ctx, wr)
+	if err != nil {
+		t.Fatalf("load runtime workflow: %v", err)
+	}
+	implementation := runtime.ByID["implementation"]
+	sourceReport := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		StageID:       implementation.Stage.ID,
+		StageType:     implementation.Stage.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: "impl"},
+		Status:        report.StatusCompleted,
+		Summary:       "implementation emitted memory candidates",
+		Payload: map[string]any{"memory_candidates": []any{
+			map[string]any{"kind": "gotcha", "title": "Validation needs git", "body": "Validation containers need git installed before worktree inspection succeeds.", "source_summary": "implementation report"},
+			map[string]any{"kind": "lesson", "title": "Bad secret", "body": "access token ghp_example should not be stored"},
+		}},
+		Errors: []string{},
+	}
+	if err := engine.completeStage(ctx, wr, implementation.Stage, sourceReport); err != nil {
+		t.Fatalf("complete source stage: %v", err)
+	}
+	memoryStage := runtime.ByID["memory_update"]
+	rep, err := engine.runWorkflowStage(ctx, wr, runtime, memoryStage, sourceReport, report.Report{}, workerSnapshot{}, nil)
+	if err != nil {
+		t.Fatalf("run memory update stage: %v", err)
+	}
+	if rep.Status != report.StatusCompleted {
+		t.Fatalf("memory update status = %s", rep.Status)
+	}
+	if len(runner.disps) != 0 {
+		t.Fatalf("memory update dispatched arbitrary workflow agent %d time(s)", len(runner.disps))
+	}
+	if rep.Payload["applied_count"] != 1 || rep.Payload["rejected_count"] != 1 || rep.Payload["writes_private_sqlite_only"] != true {
+		t.Fatalf("memory update payload = %#v", rep.Payload)
+	}
+	entries, err := st.ListProjectMemoryEntries(ctx, wr.Run.ProjectID)
+	if err != nil {
+		t.Fatalf("list project memory: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Title != "Validation needs git" || entries[0].CuratorStageID != memoryStage.Stage.ID {
+		t.Fatalf("project memory entries = %#v", entries)
+	}
+}
+
 func TestReviewChangesRequestedCreatesFixLoopAttempt(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())

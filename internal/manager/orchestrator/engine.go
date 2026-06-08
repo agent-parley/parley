@@ -293,6 +293,9 @@ func (e *Engine) adapterForTemplateStage(stage workflow.StageTemplate) string {
 	if stage.Type == workflow.StageTypeValidation {
 		return e.validationAdapter
 	}
+	if stage.Type == workflow.StageTypeMemoryUpdate {
+		return ""
+	}
 	if stage.Actor == workflow.ActorAgent {
 		return e.implementationAdapter
 	}
@@ -816,7 +819,7 @@ func (e *Engine) runWorkflowStage(ctx context.Context, wr store.WorkflowRun, run
 		if templateStage.Actor == workflow.ActorHuman {
 			return e.runHumanStage(ctx, wr, stage, templateStage)
 		}
-		return e.dispatchStage(ctx, wr, stage, stage.Adapter, templateStage.Type, e.stageDispatchInput(runtime, templateStage, map[string]any{"idea": wr.Run.Idea}))
+		return e.runMemoryUpdateStage(ctx, wr, runtime, runtimeStage, lastReport)
 	case workflow.StageTypeCommit:
 		reportForCommit := lastValidationReport
 		if reportForCommit.StageID == "" {

@@ -148,6 +148,25 @@ CREATE TABLE IF NOT EXISTS events (
   UNIQUE(scope, sequence)
 );
 
+CREATE TABLE IF NOT EXISTS project_memory_entries (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  source_run_id TEXT NOT NULL REFERENCES runs(id),
+  source_task_id TEXT NOT NULL REFERENCES tasks(id),
+  source_stage_id TEXT NOT NULL REFERENCES stages(id),
+  source_artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+  curator_stage_id TEXT NOT NULL REFERENCES stages(id),
+  source_summary TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(project_id, source_run_id) REFERENCES runs(project_id, id),
+  FOREIGN KEY(project_id, source_task_id) REFERENCES tasks(project_id, id),
+  UNIQUE(project_id, kind, title)
+);
+
 CREATE INDEX IF NOT EXISTS idx_projects_created_at ON projects(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_workspaces_project_id ON workspaces(project_id);
 CREATE INDEX IF NOT EXISTS idx_repositories_project_id ON repositories(project_id);
@@ -166,3 +185,5 @@ CREATE INDEX IF NOT EXISTS idx_events_project_sequence ON events(project_id, seq
 CREATE INDEX IF NOT EXISTS idx_events_scope_sequence ON events(scope, sequence);
 CREATE INDEX IF NOT EXISTS idx_artifacts_run_id ON artifacts(run_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_project_id ON artifacts(project_id);
+CREATE INDEX IF NOT EXISTS idx_project_memory_entries_project ON project_memory_entries(project_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_project_memory_entries_source_run ON project_memory_entries(source_run_id);
