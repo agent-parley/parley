@@ -30,10 +30,10 @@ func TestAssemblerBuildsSourceLabeledStageFilteredBrief(t *testing.T) {
 	if brief.Name != "Stage brief" || brief.SchemaVersion != SchemaVersion {
 		t.Fatalf("brief identity = %+v", brief)
 	}
-	if got := strings.Join(brief.IndexedSources, ","); got != "workflow_snapshot,repo_evidence,project_rules,project_preferences" {
+	if got := strings.Join(brief.IndexedSources, ","); got != "task_plan,repo_evidence,project_rules,workflow_snapshot,planning_artifacts,project_preferences" {
 		t.Fatalf("indexed sources = %s", got)
 	}
-	for _, label := range []string{SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectRules, SourceProjectPreferences} {
+	for _, label := range []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectPreferences} {
 		if !hasSource(brief, label) {
 			t.Fatalf("missing source label %s in %+v", label, brief.Sources)
 		}
@@ -67,7 +67,7 @@ func TestAssemblerBuildsSourceLabeledStageFilteredBrief(t *testing.T) {
 	}
 
 	markdown := Markdown(brief)
-	for _, want := range []string{"## Source: workflow_snapshot", "## Source: repo_evidence", "## Source: project_rules", "## Source: project_preferences", "Conflict precedence", "candidate_project_rules:.parley/rules.md", "candidate_project_preferences:.parley/preferences.md", "Authority: `candidate`", "Non-authoritative repo suggestion", "No project rules configured in first-slice project state"} {
+	for _, want := range []string{"## Source: task_plan", "## Source: repo_evidence", "## Source: project_rules", "## Source: workflow_snapshot", "## Source: planning_artifacts", "## Source: project_preferences", "Conflict precedence", "candidate_project_rules:.parley/rules.md", "candidate_project_preferences:.parley/preferences.md", "Authority: `candidate`", "Non-authoritative repo suggestion", "No project rules configured in first-slice project state"} {
 		if !strings.Contains(markdown, want) {
 			t.Fatalf("markdown missing %q:\n%s", want, markdown)
 		}
@@ -117,8 +117,71 @@ func TestAssemblerStageAllowlistOmitsSourcesPerStageType(t *testing.T) {
 	if hasSource(brief, SourceProjectPreferences) {
 		t.Fatalf("validation stage unexpectedly received preferences: %+v", brief.Sources)
 	}
-	if !hasSource(brief, SourceWorkflowSnapshot) || !hasSource(brief, SourceRepoEvidence) || !hasSource(brief, SourceProjectRules) {
-		t.Fatalf("validation sources = %+v", brief.Sources)
+	for _, label := range []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts} {
+		if !hasSource(brief, label) {
+			t.Fatalf("validation sources missing %s: %+v", label, brief.Sources)
+		}
+	}
+}
+
+func TestAssemblerIncludesApprovedTaskPlanAndPlanningArtifacts(t *testing.T) {
+	ctx := context.Background()
+	planID := "artifact_plan"
+	contractID := "artifact_contract"
+	stage := store.Stage{ID: "stage_current", ProjectID: "p1", RunID: "run1", TaskID: "task1", AttemptID: "attempt1", StageType: contract.StageTypeImplementation, Adapter: "noop", Status: store.StageStatusPending}
+	req := Request{
+		Project: store.Project{ID: "p1", Name: "Project", QueueAutoWhenReady: true, QueueMaxConcurrent: 1, QueueBacklogCap: 100},
+		Run:     store.Run{ID: "run1", ProjectID: "p1", TaskID: "task1", Idea: "build", Status: store.RunStatusRunning},
+		Task:    store.Task{ID: "task1", ProjectID: "p1", Idea: "build", Status: store.RunStatusRunning},
+		Attempt: store.Attempt{ID: "attempt1", ProjectID: "p1", RunID: "run1", TaskID: "task1", Status: store.RunStatusRunning},
+		Stages: []store.Stage{
+			{ID: "stage_idea", ProjectID: "p1", RunID: "run1", TaskID: "task1", AttemptID: "attempt1", StageType: contract.StageTypeIdeaRefinement, Status: "completed", TaskPlanArtifactID: planID},
+			stage,
+		},
+		Artifacts: []store.Artifact{
+			{ID: planID, ProjectID: "p1", RunID: "run1", TaskID: "task1", Kind: SourceTaskPlan, MediaType: "text/markdown", CreatedAt: "2026-06-07T12:00:00Z"},
+			{ID: contractID, ProjectID: "p1", RunID: "run1", TaskID: "task1", Kind: "task_contract", MediaType: "text/markdown", CreatedAt: "2026-06-07T12:00:01Z"},
+		},
+		CurrentStage: stage,
+		ReadArtifact: func(_ context.Context, artifactID string) ([]byte, error) {
+			switch artifactID {
+			case planID:
+				return []byte("# Task Plan\n\nImplement the approved plan.\n"), nil
+			case contractID:
+				return []byte("# Parley Task Contract\n\nOriginal user idea.\n"), nil
+			default:
+				return nil, os.ErrNotExist
+			}
+		},
+	}
+	brief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	planSource := sourceByLabel(brief, SourceTaskPlan)
+	if planSource.PrecedenceRank != 2 {
+		t.Fatalf("task_plan precedence = %d, want 2", planSource.PrecedenceRank)
+	}
+	planItem := itemByLabel(planSource, "approved_task_plan")
+	if planItem.Authority != SourceItemAuthorityAuthoritative || !strings.Contains(planItem.Text, "Implement the approved plan") {
+		t.Fatalf("approved task plan item = %+v", planItem)
+	}
+	planningSource := sourceByLabel(brief, SourcePlanningArtifacts)
+	if planningSource.PrecedenceRank != 6 {
+		t.Fatalf("planning_artifacts precedence = %d, want 6", planningSource.PrecedenceRank)
+	}
+	contractItem := itemByLabel(planningSource, "planning_artifact:task_contract")
+	if contractItem.Authority != SourceItemAuthorityAuthoritative || !strings.Contains(contractItem.Text, "Original user idea") {
+		t.Fatalf("planning artifact item = %+v", contractItem)
+	}
+	if hasDeferredSource(brief, SourceTaskPlan) || hasDeferredSource(brief, SourcePlanningArtifacts) {
+		t.Fatalf("task_plan/planning_artifacts should not be deferred: %+v", brief.DeferredSources)
+	}
+	markdown := Markdown(brief)
+	for _, want := range []string{"2. `approved_task_plan` (source: `task_plan`)", "6. `planning_artifacts` (source: `planning_artifacts`)", "## Source: task_plan", "## Source: planning_artifacts", "Implement the approved plan", "Original user idea"} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("markdown missing %q:\n%s", want, markdown)
+		}
 	}
 }
 

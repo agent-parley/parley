@@ -21,9 +21,11 @@ import (
 const (
 	SchemaVersion = 1
 
+	SourceTaskPlan           = "task_plan"
 	SourceWorkflowSnapshot   = "workflow_snapshot"
 	SourceRepoEvidence       = "repo_evidence"
 	SourceProjectRules       = "project_rules"
+	SourcePlanningArtifacts  = "planning_artifacts"
 	SourceProjectPreferences = "project_preferences"
 
 	SourceItemAuthorityAuthoritative = "authoritative"
@@ -227,9 +229,11 @@ func (a *Assembler) allowedSources(stageType string) []string {
 
 func defaultProviders() []SourceProvider {
 	return []SourceProvider{
+		TaskPlanProvider{},
 		WorkflowSnapshotProvider{},
 		RepoEvidenceProvider{},
 		ProjectRulesProvider{},
+		PlanningArtifactsProvider{},
 		ProjectPreferencesProvider{},
 	}
 }
@@ -238,10 +242,10 @@ func defaultAllowlist() map[string][]string {
 	return map[string][]string{
 		contract.StageTypeIdeaIntake:     {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectPreferences},
 		contract.StageTypeIdeaRefinement: {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectPreferences},
-		contract.StageTypeReview:         {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectRules, SourceProjectPreferences},
-		contract.StageTypeImplementation: {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectRules, SourceProjectPreferences},
-		contract.StageTypeValidation:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectRules},
-		contract.StageTypeCommit:         {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectRules},
+		contract.StageTypeReview:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectPreferences},
+		contract.StageTypeImplementation: {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectPreferences},
+		contract.StageTypeValidation:     {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts},
+		contract.StageTypeCommit:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts},
 		contract.StageTypePRCreation:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
 		contract.StageTypePRReady:        {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
 		contract.StageTypeMemoryUpdate:   {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectPreferences},
@@ -258,13 +262,11 @@ func cloneAllowlist(in map[string][]string) map[string][]string {
 }
 
 func builtinSourceLabels() []string {
-	return []string{SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectRules, SourceProjectPreferences}
+	return []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectPreferences}
 }
 
 func deferredSources() []DeferredSource {
 	return []DeferredSource{
-		{Label: "task_plan", Reason: "deferred until B1 idea refinement produces an approved plan"},
-		{Label: "planning_artifacts", Reason: "deferred until B1 planning artifacts exist"},
 		{Label: "private_memory", Reason: "deferred until B6 memory-update stage and curated project memory exist"},
 		{Label: "editable_project_rules_preferences_app_state", Reason: "deferred until a future slice adds editable Parley app-state project rules/preferences; repo .parley/rules.md and .parley/preferences.md remain non-authoritative candidates until promoted"},
 		{Label: "external_forge_metadata", Reason: "deferred until forge issue/PR metadata source is built"},
@@ -278,7 +280,7 @@ func conflictPrecedence() []PrecedenceRule {
 		{Rank: 3, Label: "current_repo_evidence", Source: SourceRepoEvidence},
 		{Rank: 4, Label: "project_rules", Source: SourceProjectRules},
 		{Rank: 5, Label: "workflow_stage_settings", Source: SourceWorkflowSnapshot},
-		{Rank: 6, Label: "planning_artifacts"},
+		{Rank: 6, Label: "planning_artifacts", Source: SourcePlanningArtifacts},
 		{Rank: 7, Label: "project_memory"},
 		{Rank: 8, Label: "project_preferences", Source: SourceProjectPreferences},
 	}
@@ -286,12 +288,16 @@ func conflictPrecedence() []PrecedenceRule {
 
 func precedenceRank(label string) int {
 	switch label {
+	case SourceTaskPlan:
+		return 2
 	case SourceRepoEvidence:
 		return 3
 	case SourceProjectRules:
 		return 4
 	case SourceWorkflowSnapshot:
 		return 5
+	case SourcePlanningArtifacts:
+		return 6
 	case SourceProjectPreferences:
 		return 8
 	default:
@@ -433,6 +439,120 @@ func truncateText(text string, max int) (string, bool) {
 	}
 	cut := strings.ToValidUTF8(text[:max-len(marker)], "")
 	return cut + marker, true
+}
+
+type TaskPlanProvider struct{}
+
+func (TaskPlanProvider) Label() string { return SourceTaskPlan }
+
+func (TaskPlanProvider) Collect(ctx context.Context, req Request, bounds Bounds) (Source, error) {
+	source := Source{Label: SourceTaskPlan, Title: "Approved task plan", PrecedenceRank: precedenceRank(SourceTaskPlan), Summary: "Approved idea-refinement task plan persisted by the harness for later stages."}
+	stage, artifact, ok := taskPlanArtifact(req)
+	if !ok {
+		source.Items = append(source.Items, withAuthority(textItem("task_plan_status", "No approved task plan artifact is available for this stage."), SourceItemAuthorityInformational, "Status only; no task_plan source content is available."))
+		return source, nil
+	}
+	if req.ReadArtifact == nil {
+		source.Warnings = append(source.Warnings, "artifact reader unavailable; task plan content omitted")
+		return source, nil
+	}
+	content, err := req.ReadArtifact(ctx, artifact.ID)
+	if err != nil {
+		source.Warnings = append(source.Warnings, fmt.Sprintf("read task plan artifact %s: %v", artifact.ID, err))
+		return source, nil
+	}
+	item := SourceItem{
+		Label:         "approved_task_plan",
+		MediaType:     artifact.MediaType,
+		Text:          string(content),
+		Bytes:         len(content),
+		Authority:     SourceItemAuthorityAuthoritative,
+		AuthorityNote: fmt.Sprintf("Approved task plan from stage %s; follows current explicit user instruction and outranks repo evidence per ADR 0026.", stage.ID),
+	}
+	if item.MediaType == "" {
+		item.MediaType = "text/markdown"
+	}
+	source.Items = append(source.Items, item)
+	return source, nil
+}
+
+func taskPlanArtifact(req Request) (store.Stage, store.Artifact, bool) {
+	artifacts := artifactsByID(req.Artifacts)
+	order := stageOrder(req.Stages)
+	currentIndex := len(req.Stages)
+	if idx, ok := order[req.CurrentStage.ID]; ok {
+		currentIndex = idx
+	}
+	for _, stage := range req.Stages {
+		idx, ok := order[stage.ID]
+		if !ok || idx >= currentIndex || stage.TaskPlanArtifactID == "" || !stageHasApprovedPlan(stage) {
+			continue
+		}
+		artifact, ok := artifacts[stage.TaskPlanArtifactID]
+		if !ok {
+			continue
+		}
+		return stage, artifact, true
+	}
+	return store.Stage{}, store.Artifact{}, false
+}
+
+func stageHasApprovedPlan(stage store.Stage) bool {
+	return stage.Status == report.StatusCompleted || stage.Status == report.StatusApproved
+}
+
+type PlanningArtifactsProvider struct{}
+
+func (PlanningArtifactsProvider) Label() string { return SourcePlanningArtifacts }
+
+func (PlanningArtifactsProvider) Collect(ctx context.Context, req Request, bounds Bounds) (Source, error) {
+	source := Source{Label: SourcePlanningArtifacts, Title: "Planning artifacts", PrecedenceRank: precedenceRank(SourcePlanningArtifacts), Summary: "Supplemental idea-intake planning artifacts below the approved task plan in precedence."}
+	artifacts := planningArtifacts(req)
+	if len(artifacts) == 0 {
+		source.Items = append(source.Items, withAuthority(textItem("planning_artifacts_status", "No supplemental planning artifacts are available for this stage."), SourceItemAuthorityInformational, "Status only; no planning_artifacts source content is available."))
+		return source, nil
+	}
+	if req.ReadArtifact == nil {
+		source.Warnings = append(source.Warnings, "artifact reader unavailable; planning artifact contents omitted")
+		return source, nil
+	}
+	for _, artifact := range artifacts {
+		content, err := req.ReadArtifact(ctx, artifact.ID)
+		if err != nil {
+			source.Warnings = append(source.Warnings, fmt.Sprintf("read planning artifact %s: %v", artifact.ID, err))
+			continue
+		}
+		mediaType := artifact.MediaType
+		if mediaType == "" {
+			mediaType = "text/plain"
+		}
+		label := "planning_artifact:" + artifact.Kind
+		if artifact.Kind == "" {
+			label = "planning_artifact:" + artifact.ID
+		}
+		source.Items = append(source.Items, SourceItem{Label: label, MediaType: mediaType, Text: string(content), Bytes: len(content), Authority: SourceItemAuthorityAuthoritative, AuthorityNote: "Harness-persisted planning artifact from idea refinement; lower precedence than the approved task plan per ADR 0026."})
+	}
+	return source, nil
+}
+
+func planningArtifacts(req Request) []store.Artifact {
+	var out []store.Artifact
+	for _, artifact := range req.Artifacts {
+		switch artifact.Kind {
+		case "task_contract", "planning_artifact", SourcePlanningArtifacts:
+			out = append(out, artifact)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
+	return out
+}
+
+func artifactsByID(artifacts []store.Artifact) map[string]store.Artifact {
+	out := make(map[string]store.Artifact, len(artifacts))
+	for _, artifact := range artifacts {
+		out[artifact.ID] = artifact
+	}
+	return out
 }
 
 type WorkflowSnapshotProvider struct{}
