@@ -10,7 +10,6 @@ import (
 	"sync"
 
 	"github.com/coder/websocket"
-	"github.com/coder/websocket/wsjson"
 
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
@@ -50,22 +49,22 @@ const (
 
 var ErrSessionClosed = errors.New("protocol session closed")
 
-// ArtifactChunkBytes is the raw byte budget for one artifact chunk. The JSON
-// transport base64-encodes []byte fields, so each websocket frame is larger
-// than this raw chunk size.
+// ArtifactChunkBytes is the raw byte budget for one artifact chunk. Artifact
+// content travels as an adjacent binary websocket frame; the JSON artifact
+// envelope carries metadata only.
 const ArtifactChunkBytes = 1 << 20
 
-// MaxMessageBytes bounds a single protocol message. coder/websocket defaults
+// MaxMessageBytes bounds a single websocket message. coder/websocket defaults
 // the read limit to 32 KiB, which is far too small for this channel: artifact
-// chunks are carried inline as base64 JSON (see ArtifactPayload). The limit
-// only needs to cover one chunk plus envelope overhead; whole artifacts are
-// split across TypeArtifact frames.
+// binary frames are ArtifactChunkBytes, and other JSON payloads need headroom.
 const MaxMessageBytes = 4 * ArtifactChunkBytes
 
 // Message is the symmetric Manager<->Runner JSON envelope.
 type Message struct {
 	Type    string          `json:"type"`
 	Payload json.RawMessage `json:"payload"`
+
+	artifact *ArtifactPayload
 }
 
 type HelloPayload struct {
@@ -92,9 +91,10 @@ type CancelPayload struct {
 type EventPayload = event.Event
 
 // ArtifactPayload transfers a durable artifact from Runner to Manager over the
-// session. Large artifacts are split across ordered TypeArtifact frames with
+// session. Large artifacts are split across ordered TypeArtifact headers with
 // Seq starting at 0 and Last marking the terminal chunk. Content is the raw
-// bytes for this chunk, carried inline as base64 JSON.
+// bytes for this chunk, carried in the binary websocket frame immediately after
+// the JSON metadata header.
 type ArtifactPayload struct {
 	RunID      string `json:"run_id"`
 	TaskID     string `json:"task_id"`
@@ -105,7 +105,7 @@ type ArtifactPayload struct {
 	MediaType  string `json:"media_type"`
 	Seq        int    `json:"seq"`
 	Last       bool   `json:"last"`
-	Content    []byte `json:"content"`
+	Content    []byte `json:"content,omitempty"`
 }
 
 type ReportPayload = report.Report
@@ -145,6 +145,12 @@ func MustMessage(typ string, payload any) Message {
 
 func DecodePayload[T any](msg Message) (T, error) {
 	var out T
+	if msg.artifact != nil {
+		if target, ok := any(&out).(*ArtifactPayload); ok {
+			*target = *msg.artifact
+			return out, nil
+		}
+	}
 	if len(msg.Payload) == 0 {
 		return out, fmt.Errorf("message %s has empty payload", msg.Type)
 	}
@@ -157,9 +163,11 @@ func DecodePayload[T any](msg Message) (T, error) {
 type Handler func(context.Context, Message) error
 
 type writeRequest struct {
-	ctx  context.Context
-	msg  Message
-	done chan error
+	ctx       context.Context
+	msg       Message
+	binary    []byte
+	hasBinary bool
+	done      chan error
 }
 
 // Session wraps a websocket connection without encoding which side dialed.
@@ -196,13 +204,21 @@ func (s *Session) Start(ctx context.Context) {
 }
 
 func (s *Session) Send(ctx context.Context, msg Message) error {
+	return s.send(ctx, msg, nil, false)
+}
+
+func (s *Session) sendBinary(ctx context.Context, msg Message, binary []byte) error {
+	return s.send(ctx, msg, binary, true)
+}
+
+func (s *Session) send(ctx context.Context, msg Message, binary []byte, hasBinary bool) error {
 	if msg.Type == "" {
 		return fmt.Errorf("message type is required")
 	}
 	if len(msg.Payload) == 0 {
 		msg.Payload = json.RawMessage(`{}`)
 	}
-	req := writeRequest{ctx: ctx, msg: msg, done: make(chan error, 1)}
+	req := writeRequest{ctx: ctx, msg: msg, binary: binary, hasBinary: hasBinary, done: make(chan error, 1)}
 	select {
 	case s.writes <- req:
 	case <-s.done:
@@ -233,10 +249,10 @@ func (s *Session) writer(ctx context.Context) {
 	for {
 		select {
 		case req := <-s.writes:
-			err := wsjson.Write(req.ctx, s.conn, req.msg)
+			err := s.write(req)
 			req.done <- err
 			if err != nil {
-				debugf("writer write error (type=%s, payload_bytes=%d): %v", req.msg.Type, len(req.msg.Payload), err)
+				debugf("writer write error (type=%s, payload_bytes=%d, binary_bytes=%d): %v", req.msg.Type, len(req.msg.Payload), len(req.binary), err)
 				s.close()
 				return
 			}
@@ -249,10 +265,28 @@ func (s *Session) writer(ctx context.Context) {
 	}
 }
 
+func (s *Session) write(req writeRequest) error {
+	b, err := json.Marshal(req.msg)
+	if err != nil {
+		return fmt.Errorf("marshal %s message: %w", req.msg.Type, err)
+	}
+	if err := s.conn.Write(req.ctx, websocket.MessageText, b); err != nil {
+		return err
+	}
+	if req.hasBinary {
+		if err := s.conn.Write(req.ctx, websocket.MessageBinary, req.binary); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Session) reader(ctx context.Context) {
+	var pendingArtifact *ArtifactPayload
+	var pendingPayload json.RawMessage
 	for {
-		var msg Message
-		if err := wsjson.Read(ctx, s.conn, &msg); err != nil {
+		typ, data, err := s.conn.Read(ctx)
+		if err != nil {
 			if status := websocket.CloseStatus(err); status == websocket.StatusNormalClosure || status == websocket.StatusGoingAway {
 				debugf("reader: peer closed session normally (%s)", status)
 			} else {
@@ -261,23 +295,78 @@ func (s *Session) reader(ctx context.Context) {
 			s.close()
 			return
 		}
-		if msg.Type == "" {
-			debugf("reader received empty-type message")
-			s.close()
-			return
-		}
-		s.mu.RLock()
-		handler := s.handlers[msg.Type]
-		s.mu.RUnlock()
-		if handler == nil {
-			continue
-		}
-		if err := handler(ctx, msg); err != nil {
-			debugf("handler %q returned error: %v", msg.Type, err)
+		switch typ {
+		case websocket.MessageText:
+			if pendingArtifact != nil {
+				debugf("reader received text frame before binary artifact content (artifact_id=%s)", pendingArtifact.ArtifactID)
+				s.close()
+				return
+			}
+			var msg Message
+			if err := json.Unmarshal(data, &msg); err != nil {
+				debugf("reader decode text frame: %v", err)
+				s.close()
+				return
+			}
+			if msg.Type == "" {
+				debugf("reader received empty-type message")
+				s.close()
+				return
+			}
+			if msg.Type == TypeArtifact {
+				artifact, err := DecodePayload[ArtifactPayload](msg)
+				if err != nil {
+					debugf("reader decode artifact header: %v", err)
+					s.close()
+					return
+				}
+				if len(artifact.Content) != 0 {
+					debugf("reader artifact header carried %d JSON content bytes", len(artifact.Content))
+					s.close()
+					return
+				}
+				artifact.Content = nil
+				pendingArtifact = &artifact
+				pendingPayload = msg.Payload
+				continue
+			}
+			if err := s.dispatch(ctx, msg); err != nil {
+				debugf("handler %q returned error: %v", msg.Type, err)
+				s.close()
+				return
+			}
+		case websocket.MessageBinary:
+			if pendingArtifact == nil {
+				debugf("reader received binary frame without pending artifact header")
+				s.close()
+				return
+			}
+			artifact := *pendingArtifact
+			artifact.Content = data
+			msg := Message{Type: TypeArtifact, Payload: pendingPayload, artifact: &artifact}
+			pendingArtifact = nil
+			pendingPayload = nil
+			if err := s.dispatch(ctx, msg); err != nil {
+				debugf("handler %q returned error: %v", msg.Type, err)
+				s.close()
+				return
+			}
+		default:
+			debugf("reader received unsupported websocket frame type %v", typ)
 			s.close()
 			return
 		}
 	}
+}
+
+func (s *Session) dispatch(ctx context.Context, msg Message) error {
+	s.mu.RLock()
+	handler := s.handlers[msg.Type]
+	s.mu.RUnlock()
+	if handler == nil {
+		return nil
+	}
+	return handler(ctx, msg)
 }
 
 func (s *Session) close() {
