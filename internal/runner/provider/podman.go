@@ -1,15 +1,14 @@
 package provider
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/agent-parley/parley/internal/runner/runnerio"
@@ -50,24 +49,16 @@ func (p *Podman) Run(ctx context.Context, inv PreparedInvocation, sink runnerio.
 
 	args := podmanRunArgs(inv, containerName)
 	cmd := exec.Command(executable, args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return Result{}, fmt.Errorf("podman stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return Result{}, fmt.Errorf("podman stderr pipe: %w", err)
-	}
+	stdout := newOutputWriter(ctx, sink, inv.Adapter, "stdout")
+	stderr := newOutputWriter(ctx, sink, inv.Adapter, "stderr")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	result := Result{StartedAt: time.Now().UTC()}
 	if err := cmd.Start(); err != nil {
 		result.EndedAt = time.Now().UTC()
 		return result, fmt.Errorf("start podman: %w", err)
 	}
-
-	streamErrs := make(chan error, 2)
-	go streamOutput(ctx, sink, inv.Adapter, "stdout", stdout, streamErrs)
-	go streamOutput(ctx, sink, inv.Adapter, "stderr", stderr, streamErrs)
 
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
@@ -92,10 +83,11 @@ func (p *Podman) Run(ctx context.Context, inv PreparedInvocation, sink runnerio.
 	result.ExitCode = exitCode(waitErr)
 
 	var joined []error
-	for i := 0; i < 2; i++ {
-		if streamErr := <-streamErrs; streamErr != nil {
-			joined = append(joined, streamErr)
-		}
+	if err := stdout.Flush(); err != nil {
+		joined = append(joined, err)
+	}
+	if err := stderr.Flush(); err != nil {
+		joined = append(joined, err)
 	}
 	if ctx.Err() != nil {
 		joined = append(joined, fmt.Errorf("podman run canceled: %w", ctx.Err()))
@@ -104,6 +96,65 @@ func (p *Podman) Run(ctx context.Context, inv PreparedInvocation, sink runnerio.
 		joined = append(joined, fmt.Errorf("podman run exited with code %d: %w", result.ExitCode, waitErr))
 	}
 	return result, errors.Join(joined...)
+}
+
+type outputWriter struct {
+	ctx       context.Context
+	sink      runnerio.Sink
+	adapterID string
+	stream    string
+
+	mu  sync.Mutex
+	buf []byte
+	err error
+}
+
+func newOutputWriter(ctx context.Context, sink runnerio.Sink, adapterID, stream string) *outputWriter {
+	return &outputWriter{ctx: ctx, sink: sink, adapterID: adapterID, stream: stream}
+}
+
+func (w *outputWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for _, b := range p {
+		w.buf = append(w.buf, b)
+		if b == '\n' {
+			w.emitLocked()
+		}
+	}
+	return len(p), nil
+}
+
+func (w *outputWriter) Flush() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if len(w.buf) > 0 {
+		w.emitLocked()
+	}
+	return w.err
+}
+
+func (w *outputWriter) emitLocked() {
+	line := trimScannerLineEnding(string(w.buf))
+	w.buf = w.buf[:0]
+	if w.err != nil {
+		return
+	}
+	if err := w.sink.Emit(w.ctx, event.Event{
+		SchemaVersion: event.SchemaVersion,
+		Type:          "adapter.output",
+		Actor:         event.Actor{Kind: event.ActorKindAdapter, ID: w.adapterID},
+		Summary:       line,
+		Data: map[string]any{
+			"provider": "podman",
+			"stream":   w.stream,
+			"line":     line,
+		},
+	}); err != nil {
+		w.err = fmt.Errorf("emit podman %s output: %w", w.stream, err)
+	}
 }
 
 func podmanRunArgs(inv PreparedInvocation, containerName string) []string {
@@ -145,39 +196,6 @@ func podmanRunArgs(inv PreparedInvocation, containerName string) []string {
 	args = append(args, inv.ContainerImage)
 	args = append(args, inv.Command...)
 	return args
-}
-
-func streamOutput(ctx context.Context, sink runnerio.Sink, adapterID, stream string, r io.Reader, errCh chan<- error) {
-	reader := bufio.NewReader(r)
-	for {
-		line, readErr := reader.ReadString('\n')
-		if len(line) > 0 {
-			line = trimScannerLineEnding(line)
-			if err := sink.Emit(ctx, event.Event{
-				SchemaVersion: event.SchemaVersion,
-				Type:          "adapter.output",
-				Actor:         event.Actor{Kind: event.ActorKindAdapter, ID: adapterID},
-				Summary:       line,
-				Data: map[string]any{
-					"provider": "podman",
-					"stream":   stream,
-					"line":     line,
-				},
-			}); err != nil {
-				errCh <- fmt.Errorf("emit podman %s output: %w", stream, err)
-				return
-			}
-		}
-		if readErr == nil {
-			continue
-		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		errCh <- fmt.Errorf("read podman %s output: %w", stream, readErr)
-		return
-	}
-	errCh <- nil
 }
 
 func trimScannerLineEnding(line string) string {
