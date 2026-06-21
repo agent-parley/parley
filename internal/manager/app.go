@@ -106,6 +106,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	}
 	engine := orchestrator.NewEngineWithOptions(st, runner, renderer, hub, orchestrator.EngineOptions{
 		ImplementationAdapter: cfg.Adapter,
+		PlanningAdapter:       cfg.Adapter,
 		ValidationAdapter:     "validation",
 		DataRoot:              cfg.DataDir,
 		ProjectID:             project.ID,

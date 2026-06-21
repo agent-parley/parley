@@ -28,6 +28,11 @@ const (
 )
 
 const (
+	AdapterInputModeImplementation = "implementation"
+	AdapterInputModePlanning       = "planning"
+)
+
+const (
 	ReviewRoleCritic  = "critic"
 	ReviewRoleArbiter = "arbiter"
 )

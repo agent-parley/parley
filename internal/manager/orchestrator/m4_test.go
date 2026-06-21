@@ -107,6 +107,143 @@ func TestIdeaIntakeFreezesVerbatimIdeaIntoContractAndSnapshot(t *testing.T) {
 	}
 }
 
+func TestStandardIdeaIntakeDispatchesPlannerAndPersistsSemanticTaskPlan(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "add audit logging to login failures", RefinementLevel: contract.RefinementLevelStandard})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	plan := semanticPlannerTestPlan(wr)
+	runner := &planningRunner{plan: plan}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{PlanningAdapter: "planner", DataRoot: t.TempDir(), ProjectID: "p1"})
+	rep, err := engine.runIdeaIntake(ctx, wr)
+	if err != nil {
+		t.Fatalf("runIdeaIntake() error = %v", err)
+	}
+	if rep.Actor.Kind != report.ActorKindAgent || rep.Actor.ID != "planner" {
+		t.Fatalf("actor = %#v, want planner agent", rep.Actor)
+	}
+	if len(runner.disps) != 1 {
+		t.Fatalf("planner dispatch count = %d, want 1", len(runner.disps))
+	}
+	disp := runner.disps[0]
+	if disp.Adapter != "planner" || disp.Input["input_mode"] != contract.AdapterInputModePlanning {
+		t.Fatalf("dispatch = adapter %q input %#v", disp.Adapter, disp.Input)
+	}
+	if disp.Input["workflow_stage_actor"] != workflow.ActorAgent || disp.Input["workflow_stage_target"] != workflow.TargetPlan {
+		t.Fatalf("dispatch missing planner actor/target: %#v", disp.Input)
+	}
+	briefText, _ := disp.Input["stage_brief_markdown"].(string)
+	if !strings.Contains(briefText, "# Stage brief") {
+		t.Fatalf("planner dispatch missing Stage brief:\n%s", briefText)
+	}
+	planID, _ := rep.Payload["task_plan_artifact_id"].(string)
+	artifact, planContent, err := st.GetArtifact(ctx, planID)
+	if err != nil {
+		t.Fatalf("read task plan: %v", err)
+	}
+	if artifact.Kind != "task_plan" || artifact.MediaType != "text/markdown" {
+		t.Fatalf("task plan artifact shape changed: %#v", artifact)
+	}
+	if string(planContent) != plan {
+		t.Fatalf("task plan content =\n%s\nwant=\n%s", planContent, plan)
+	}
+	if !strings.Contains(string(planContent), "login failure path") || !strings.Contains(string(planContent), "## Assumptions") || !strings.Contains(string(planContent), "## Open Questions") {
+		t.Fatalf("semantic plan missing expected content:\n%s", planContent)
+	}
+	var rawSnapshot string
+	if err := st.DB().QueryRowContext(ctx, `SELECT snapshot_json FROM workflow_snapshots WHERE run_id = ? ORDER BY id DESC LIMIT 1`, wr.Run.ID).Scan(&rawSnapshot); err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal([]byte(rawSnapshot), &snapshot); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if snapshot["workflow_template_id"] != workflow.DefaultTemplateID || snapshot["idea_verbatim"] != wr.Run.Idea || snapshot["task_plan_artifact_id"] != planID {
+		t.Fatalf("snapshot changed unexpectedly: %+v", snapshot)
+	}
+}
+
+func TestDirectIdeaIntakeDoesNotDispatchPlanner(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "fix typo", RefinementLevel: contract.RefinementLevelDirect})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	runner := &planningRunner{plan: "should not be used"}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{PlanningAdapter: "planner", DataRoot: t.TempDir(), ProjectID: "p1"})
+	rep, err := engine.runIdeaIntake(ctx, wr)
+	if err != nil {
+		t.Fatalf("runIdeaIntake() error = %v", err)
+	}
+	if len(runner.disps) != 0 {
+		t.Fatalf("direct dispatch count = %d, want 0", len(runner.disps))
+	}
+	if rep.Actor.Kind != report.ActorKindHarness {
+		t.Fatalf("direct actor = %#v, want harness", rep.Actor)
+	}
+	planID, _ := rep.Payload["task_plan_artifact_id"].(string)
+	_, planContent, err := st.GetArtifact(ctx, planID)
+	if err != nil {
+		t.Fatalf("read task plan: %v", err)
+	}
+	if !strings.Contains(string(planContent), "## Direct Plan") {
+		t.Fatalf("direct plan changed:\n%s", planContent)
+	}
+}
+
+type planningRunner struct {
+	plan  string
+	disps []contract.Dispatch
+}
+
+func (r *planningRunner) Dispatch(_ context.Context, disp contract.Dispatch) (report.Report, error) {
+	r.disps = append(r.disps, disp)
+	return report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         disp.RunID,
+		TaskID:        disp.TaskID,
+		AttemptID:     disp.AttemptID,
+		StageID:       disp.StageID,
+		StageType:     disp.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: disp.Adapter},
+		Status:        report.StatusCompleted,
+		Summary:       "semantic planner produced a task plan",
+		Payload:       map[string]any{"task_plan_markdown": r.plan},
+		Errors:        []string{},
+	}, nil
+}
+
+func (r *planningRunner) CancelAttempt(context.Context, string, string, string) error { return nil }
+
+func semanticPlannerTestPlan(wr store.WorkflowRun) string {
+	return "# Task Plan\n\n" +
+		"Project ID: `" + wr.Run.ProjectID + "`\n" +
+		"Run ID: `" + wr.Run.ID + "`\n" +
+		"Task ID: `" + wr.Task.ID + "`\n" +
+		"Attempt ID: `" + wr.Attempt.ID + "`\n" +
+		"Refinement level: `standard`\n\n" +
+		"## User Idea\n\n" + wr.Run.Idea + "\n\n" +
+		"## Plan Boundary\n\n" +
+		"This artifact is a task plan, not a workflow definition. It does not choose, add, remove, or reorder workflow stages.\n\n" +
+		"## Objective\n\nAdd observability to the login failure path without changing authentication policy.\n\n" +
+		"## Repo Evidence Considered\n\n- Current repo evidence should identify the authentication and logging packages before implementation.\n\n" +
+		"## Implementation Approach\n\n- Trace the login failure path, add the narrow audit event, and update focused tests.\n\n" +
+		"## Assumptions\n\n- Existing logging infrastructure can carry the audit event.\n\n" +
+		"## Open Questions\n\n- Which exact audit sink should own security-retention policy? Resolve during plan review if material.\n\n" +
+		"## Validation\n\n- Run focused authentication package tests.\n"
+}
+
 func TestTaskPlanMarkdownSupportsThreeRefinementLevels(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())

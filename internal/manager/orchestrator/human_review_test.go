@@ -20,7 +20,7 @@ func TestHumanReviewSuspendsAndRestartResumeAcceptsHumanEnvelope(t *testing.T) {
 	defer st.Close()
 
 	firstEngine := NewEngineWithOptions(st, &capturingRunner{}, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
-	runID, err := firstEngine.StartRunInput(ctx, contract.TaskInput{Idea: "needs plan review", WorkflowTemplateID: workflow.BalancedPRDeliveryID})
+	runID, err := firstEngine.StartRunInput(ctx, contract.TaskInput{Idea: "needs plan review", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: workflow.BalancedPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRunInput() error = %v", err)
 	}
@@ -62,7 +62,7 @@ func TestAgentEscalationRoutesToWiredHumanReviewAndDoubleSubmitRejected(t *testi
 
 	runner := &humanTestReviewRunner{verdict: report.ReviewVerdictEscalate}
 	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
-	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "escalate review", WorkflowTemplateID: workflow.CarefulReviewID})
+	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "escalate review", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: workflow.CarefulReviewID})
 	if err != nil {
 		t.Fatalf("StartRunInput() error = %v", err)
 	}
@@ -91,7 +91,7 @@ func TestMalformedHumanReviewRejectedWhileAwaiting(t *testing.T) {
 	defer st.Close()
 
 	engine := NewEngineWithOptions(st, &capturingRunner{}, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
-	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "bad human form", WorkflowTemplateID: workflow.BalancedPRDeliveryID})
+	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "bad human form", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: workflow.BalancedPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRunInput() error = %v", err)
 	}

@@ -52,11 +52,18 @@ func (Noop) Run(ctx context.Context, disp contract.Dispatch, sink runnerio.Sink)
 	if idea, ok := disp.Input["idea"]; ok {
 		payload["idea"] = idea
 	}
+	if disp.Input != nil && disp.Input["input_mode"] == contract.AdapterInputModePlanning {
+		payload["task_plan_markdown"] = noopTaskPlanMarkdown(disp)
+	}
 
 	if err := sink.Emit(ctx, progressEvent(disp, "noop adapter produced artifact", map[string]any{"artifact_id": artifactID})); err != nil {
 		return report.Report{}, err
 	}
 
+	summary := "noop implementation completed"
+	if disp.Input != nil && disp.Input["input_mode"] == contract.AdapterInputModePlanning {
+		summary = "noop planner produced a task plan"
+	}
 	return report.Report{
 		SchemaVersion: report.SchemaVersion,
 		RunID:         disp.RunID,
@@ -67,11 +74,36 @@ func (Noop) Run(ctx context.Context, disp contract.Dispatch, sink runnerio.Sink)
 		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: "noop"},
 		Status:        report.StatusCompleted,
 		Verdict:       nil,
-		Summary:       "noop implementation completed",
+		Summary:       summary,
 		EvidenceRefs:  []string{artifactID},
 		Payload:       payload,
 		Errors:        []string{},
 	}, nil
+}
+
+func noopTaskPlanMarkdown(disp contract.Dispatch) string {
+	idea := fmt.Sprint(disp.Input["idea"])
+	return fmt.Sprintf("# Task Plan\n\n"+
+		"Project ID: `%s`\n"+
+		"Run ID: `%s`\n"+
+		"Task ID: `%s`\n"+
+		"Attempt ID: `%s`\n"+
+		"Refinement level: `standard`\n\n"+
+		"## User Idea\n\n%s\n\n"+
+		"## Plan Boundary\n\n"+
+		"This artifact is a task plan, not a workflow definition. It does not choose, add, remove, or reorder workflow stages.\n\n"+
+		"## Objective\n\n"+
+		"Plan the submitted idea while preserving repository behavior outside the requested change.\n\n"+
+		"## Repo Evidence Considered\n\n"+
+		"- Noop adapter does not inspect repository content; real planner adapters should use the Stage Brief and /project/repo evidence.\n\n"+
+		"## Implementation Approach\n\n"+
+		"- Inspect the affected code path, make the smallest coherent change, and add or update focused tests.\n\n"+
+		"## Assumptions\n\n"+
+		"- The submitted idea is the authoritative task statement.\n\n"+
+		"## Open Questions\n\n"+
+		"- No blocking question was raised during single-shot planning; resolve any project-specific details during plan review.\n\n"+
+		"## Validation\n\n"+
+		"- Run the narrowest meaningful tests for the changed path.\n", disp.ProjectID, disp.RunID, disp.TaskID, disp.AttemptID, idea)
 }
 
 func progressEvent(disp contract.Dispatch, summary string, data map[string]any) event.Event {

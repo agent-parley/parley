@@ -148,7 +148,7 @@ func TestStageCompletionEmitsPerformerAndStageTerminal(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	defer st.Close()
-	wr, err := st.CreateWorkflowRun(ctx, "freeze idea")
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "freeze idea", RefinementLevel: contract.RefinementLevelDirect})
 	if err != nil {
 		t.Fatalf("create workflow: %v", err)
 	}

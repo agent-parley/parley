@@ -207,6 +207,21 @@ type fakeImplementationAdapter struct {
 func (a fakeImplementationAdapter) Name() string { return "fake_impl" }
 
 func (a fakeImplementationAdapter) Run(ctx context.Context, disp contract.Dispatch, _ runnerio.Sink) (report.Report, error) {
+	if disp.Input != nil && disp.Input["input_mode"] == contract.AdapterInputModePlanning {
+		return report.Report{
+			SchemaVersion: report.SchemaVersion,
+			RunID:         disp.RunID,
+			TaskID:        disp.TaskID,
+			AttemptID:     disp.AttemptID,
+			StageID:       disp.StageID,
+			StageType:     disp.StageType,
+			Actor:         report.Actor{Kind: report.ActorKindAgent, ID: a.Name()},
+			Status:        report.StatusCompleted,
+			Summary:       "fake planner produced a task plan",
+			Payload:       map[string]any{"task_plan_markdown": fakePlannerTaskPlan(disp)},
+			Errors:        []string{},
+		}, nil
+	}
 	if disp.StageType == contract.StageTypeReview {
 		rep := report.Report{
 			SchemaVersion: report.SchemaVersion,
@@ -251,6 +266,24 @@ func (a fakeImplementationAdapter) Run(ctx context.Context, disp contract.Dispat
 		Payload:       map[string]any{"worktree": wt.Path},
 		Errors:        []string{},
 	}, nil
+}
+
+func fakePlannerTaskPlan(disp contract.Dispatch) string {
+	return "# Task Plan\n\n" +
+		"Project ID: `" + disp.ProjectID + "`\n" +
+		"Run ID: `" + disp.RunID + "`\n" +
+		"Task ID: `" + disp.TaskID + "`\n" +
+		"Attempt ID: `" + disp.AttemptID + "`\n" +
+		"Refinement level: `standard`\n\n" +
+		"## User Idea\n\n" + disp.Input["idea"].(string) + "\n\n" +
+		"## Plan Boundary\n\n" +
+		"This artifact is a task plan, not a workflow definition. It does not choose, add, remove, or reorder workflow stages.\n\n" +
+		"## Objective\n\nAdd the requested local-first harness behavior.\n\n" +
+		"## Repo Evidence Considered\n\n- Fake integration planner uses bounded harness evidence.\n\n" +
+		"## Implementation Approach\n\n- Apply the smallest implementation change and validate it.\n\n" +
+		"## Assumptions\n\n- The fake implementation adapter owns code changes in this test.\n\n" +
+		"## Open Questions\n\n- None blocking for the fake loop.\n\n" +
+		"## Validation\n\n- Run the configured validation command.\n"
 }
 
 type fakeSandboxProvider struct{}
