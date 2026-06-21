@@ -19,6 +19,7 @@ type RunController interface {
 	StartQueuedRun(context.Context, string) error
 	CancelRun(context.Context, string) error
 	SubmitHumanReview(context.Context, string, string, orchestrator.HumanReviewSubmission) (report.Report, error)
+	SubmitDeepIdeaAnswers(context.Context, string, string, orchestrator.DeepIdeaAnswersSubmission) (orchestrator.DeepIdeaAnswerReceipt, error)
 	QueueState(context.Context) (orchestrator.QueueState, error)
 }
 

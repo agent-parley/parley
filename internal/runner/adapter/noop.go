@@ -83,12 +83,16 @@ func (Noop) Run(ctx context.Context, disp contract.Dispatch, sink runnerio.Sink)
 
 func noopTaskPlanMarkdown(disp contract.Dispatch) string {
 	idea := fmt.Sprint(disp.Input["idea"])
+	level := fmt.Sprint(disp.Input["refinement_level"])
+	if level == "" || level == "<nil>" {
+		level = contract.RefinementLevelStandard
+	}
 	return fmt.Sprintf("# Task Plan\n\n"+
 		"Project ID: `%s`\n"+
 		"Run ID: `%s`\n"+
 		"Task ID: `%s`\n"+
 		"Attempt ID: `%s`\n"+
-		"Refinement level: `standard`\n\n"+
+		"Refinement level: `%s`\n\n"+
 		"## User Idea\n\n%s\n\n"+
 		"## Plan Boundary\n\n"+
 		"This artifact is a task plan, not a workflow definition. It does not choose, add, remove, or reorder workflow stages.\n\n"+
@@ -103,7 +107,7 @@ func noopTaskPlanMarkdown(disp contract.Dispatch) string {
 		"## Open Questions\n\n"+
 		"- No blocking question was raised during single-shot planning; resolve any project-specific details during plan review.\n\n"+
 		"## Validation\n\n"+
-		"- Run the narrowest meaningful tests for the changed path.\n", disp.ProjectID, disp.RunID, disp.TaskID, disp.AttemptID, idea)
+		"- Run the narrowest meaningful tests for the changed path.\n", disp.ProjectID, disp.RunID, disp.TaskID, disp.AttemptID, level, idea)
 }
 
 func progressEvent(disp contract.Dispatch, summary string, data map[string]any) event.Event {

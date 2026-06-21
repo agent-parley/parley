@@ -131,6 +131,34 @@ func TestHandleRunsRejectsInvalidRefinementLevel(t *testing.T) {
 	assertContains(t, rec.Body.String(), "refinement_level must be one of")
 }
 
+func TestHandleDeepIdeaAnswersFormRedirectsToRun(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "deep clarify", RefinementLevel: contract.RefinementLevelDeep})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	controller := &fakeRunController{state: defaultRouteQueueState()}
+	controller.deepIdeaFunc = func(_ context.Context, runID, stageID string, submission orchestrator.DeepIdeaAnswersSubmission) (orchestrator.DeepIdeaAnswerReceipt, error) {
+		if runID != wr.Run.ID || stageID != "stage_idea" {
+			t.Fatalf("SubmitDeepIdeaAnswers run=%s stage=%s", runID, stageID)
+		}
+		if submission.ActorID != "alice" || submission.AnswerText != "Use the audit sink." {
+			t.Fatalf("submission = %#v", submission)
+		}
+		return orchestrator.DeepIdeaAnswerReceipt{RunID: runID, StageID: stageID, ArtifactID: "artifact_answers", Round: 1}, nil
+	}
+	srv := newRouteTestServer(t, st, controller)
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/projects/default/runs/"+wr.Run.ID+"/idea-stages/stage_idea/answers", cookie, url.Values{"actor_id": {"alice"}, "answer_text": {"Use the audit sink."}, "_csrf": {csrf}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST answers status = %d want %d body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
+	}
+	if got := rec.Header().Get("Location"); got != "/projects/default/runs/"+wr.Run.ID {
+		t.Fatalf("Location = %q", got)
+	}
+}
+
 func TestHandleStartQueuedRunRedirectsOnSuccess(t *testing.T) {
 	ctx := context.Background()
 	st := openRouteTestStore(t)
@@ -242,6 +270,7 @@ type fakeRunController struct {
 	startQueuedRunFunc func(context.Context, string) error
 	cancelRunFunc      func(context.Context, string) error
 	humanReviewFunc    func(context.Context, string, string, orchestrator.HumanReviewSubmission) (report.Report, error)
+	deepIdeaFunc       func(context.Context, string, string, orchestrator.DeepIdeaAnswersSubmission) (orchestrator.DeepIdeaAnswerReceipt, error)
 }
 
 func (f *fakeRunController) StartProjectRun(ctx context.Context, projectID, idea string) (string, error) {
@@ -280,6 +309,13 @@ func (f *fakeRunController) SubmitHumanReview(ctx context.Context, runID, stageI
 		return f.humanReviewFunc(ctx, runID, stageID, submission)
 	}
 	return report.Report{}, errors.New("unexpected SubmitHumanReview call")
+}
+
+func (f *fakeRunController) SubmitDeepIdeaAnswers(ctx context.Context, runID, stageID string, submission orchestrator.DeepIdeaAnswersSubmission) (orchestrator.DeepIdeaAnswerReceipt, error) {
+	if f.deepIdeaFunc != nil {
+		return f.deepIdeaFunc(ctx, runID, stageID, submission)
+	}
+	return orchestrator.DeepIdeaAnswerReceipt{}, errors.New("unexpected SubmitDeepIdeaAnswers call")
 }
 
 func (f *fakeRunController) QueueState(ctx context.Context) (orchestrator.QueueState, error) {

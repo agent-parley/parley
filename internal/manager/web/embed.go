@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"os"
@@ -72,9 +73,17 @@ type RunData struct {
 
 type RunView struct {
 	store.RunBundle
-	ArtifactViews []ArtifactView
-	DiffPatch     ArtifactView
-	PRReady       PRReadyView
+	ArtifactViews        []ArtifactView
+	DiffPatch            ArtifactView
+	PRReady              PRReadyView
+	PendingIdeaQuestions *IdeaQuestionView
+}
+
+type IdeaQuestionView struct {
+	StageID   string
+	Round     int
+	MaxRounds int
+	Questions []string
 }
 
 type ArtifactView struct {
@@ -97,7 +106,7 @@ func NewRunData(bundle store.RunBundle, csrf, title string) RunData {
 }
 
 func NewRunView(bundle store.RunBundle) RunView {
-	view := RunView{RunBundle: bundle, PRReady: prReadyFromEvents(bundle)}
+	view := RunView{RunBundle: bundle, PRReady: prReadyFromEvents(bundle), PendingIdeaQuestions: pendingIdeaQuestions(bundle)}
 	for _, artifact := range bundle.Artifacts {
 		artifactView := newArtifactView(artifact)
 		view.ArtifactViews = append(view.ArtifactViews, artifactView)
@@ -175,6 +184,49 @@ func isHTMLMediaType(mediaType string) bool {
 	return strings.HasPrefix(mediaType, "text/html") || strings.Contains(mediaType, "html")
 }
 
+func pendingIdeaQuestions(bundle store.RunBundle) *IdeaQuestionView {
+	if bundle.Run.Status != store.RunStatusAwaitingHuman {
+		return nil
+	}
+	type questionPacket struct {
+		StageID   string   `json:"stage_id"`
+		Round     int      `json:"round"`
+		MaxRounds int      `json:"max_rounds"`
+		Questions []string `json:"questions"`
+	}
+	type answerPacket struct {
+		Round int `json:"round"`
+	}
+	answered := map[int]bool{}
+	var latest questionPacket
+	for _, artifact := range bundle.Artifacts {
+		switch artifact.Kind {
+		case "idea_refinement_answers":
+			var packet answerPacket
+			if readArtifactJSON(artifact, &packet) == nil && packet.Round > 0 {
+				answered[packet.Round] = true
+			}
+		case "idea_refinement_questions":
+			var packet questionPacket
+			if readArtifactJSON(artifact, &packet) == nil && packet.Round > latest.Round {
+				latest = packet
+			}
+		}
+	}
+	if latest.StageID == "" || latest.Round == 0 || answered[latest.Round] || len(latest.Questions) == 0 {
+		return nil
+	}
+	return &IdeaQuestionView{StageID: latest.StageID, Round: latest.Round, MaxRounds: latest.MaxRounds, Questions: latest.Questions}
+}
+
+func readArtifactJSON(artifact store.Artifact, target any) error {
+	content, err := os.ReadFile(artifact.Path)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(content, target)
+}
+
 func prReadyFromEvents(bundle store.RunBundle) PRReadyView {
 	var out PRReadyView
 	for _, ev := range bundle.Events {
@@ -209,7 +261,7 @@ func statusClass(status string) string {
 		return "status-completed"
 	case "failed", "invalid", "down", "cancelled":
 		return "status-failed"
-	case "running", "suspect":
+	case "running", "awaiting_human", "suspect":
 		return "status-running"
 	default:
 		return "status-pending"

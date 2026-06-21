@@ -24,7 +24,7 @@ func TestIdeaIntakeFreezesVerbatimIdeaIntoContractAndSnapshot(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	defer st.Close()
-	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "add a thing\n<script>alert(1)</script>", RefinementLevel: contract.RefinementLevelDeep})
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "add a thing\n<script>alert(1)</script>", RefinementLevel: contract.RefinementLevelDirect})
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -44,8 +44,8 @@ func TestIdeaIntakeFreezesVerbatimIdeaIntoContractAndSnapshot(t *testing.T) {
 	if planID == "" {
 		t.Fatalf("missing task plan artifact id: %+v", rep.Payload)
 	}
-	if rep.Payload["refinement_level"] != contract.RefinementLevelDeep {
-		t.Fatalf("refinement level = %v, want %s", rep.Payload["refinement_level"], contract.RefinementLevelDeep)
+	if rep.Payload["refinement_level"] != contract.RefinementLevelDirect {
+		t.Fatalf("refinement level = %v, want %s", rep.Payload["refinement_level"], contract.RefinementLevelDirect)
 	}
 	_, contractContent, err := st.GetArtifact(ctx, contractID)
 	if err != nil {
@@ -59,7 +59,7 @@ func TestIdeaIntakeFreezesVerbatimIdeaIntoContractAndSnapshot(t *testing.T) {
 		t.Fatalf("read task plan: %v", err)
 	}
 	planText := string(planContent)
-	for _, want := range []string{"# Task Plan", "Refinement level: `deep`", "## Deep Plan", "This artifact is a task plan, not a workflow definition."} {
+	for _, want := range []string{"# Task Plan", "Refinement level: `direct`", "## Direct Plan", "This artifact is a task plan, not a workflow definition."} {
 		if !strings.Contains(planText, want) {
 			t.Fatalf("task plan missing %q:\n%s", want, planText)
 		}
@@ -89,8 +89,8 @@ func TestIdeaIntakeFreezesVerbatimIdeaIntoContractAndSnapshot(t *testing.T) {
 	if snapshot["task_plan_artifact_id"] != planID {
 		t.Fatalf("snapshot task plan id = %v, want %s", snapshot["task_plan_artifact_id"], planID)
 	}
-	if snapshot["refinement_level"] != contract.RefinementLevelDeep {
-		t.Fatalf("snapshot refinement level = %v, want %s", snapshot["refinement_level"], contract.RefinementLevelDeep)
+	if snapshot["refinement_level"] != contract.RefinementLevelDirect {
+		t.Fatalf("snapshot refinement level = %v, want %s", snapshot["refinement_level"], contract.RefinementLevelDirect)
 	}
 	if snapshot["workflow_template_id"] != workflow.DefaultTemplateID {
 		t.Fatalf("snapshot workflow template id = %v, want %s", snapshot["workflow_template_id"], workflow.DefaultTemplateID)
