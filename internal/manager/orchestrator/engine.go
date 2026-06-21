@@ -81,6 +81,7 @@ type Engine struct {
 	runnerSlots           int
 	gate                  func(context.Context, store.Run) (bool, error)
 	implementationAdapter string
+	planningAdapter       string
 	validationAdapter     string
 	dataRoot              string
 	projectID             string
@@ -92,6 +93,7 @@ type Engine struct {
 
 type EngineOptions struct {
 	ImplementationAdapter string
+	PlanningAdapter       string
 	ValidationAdapter     string
 	DataRoot              string
 	ProjectID             string
@@ -135,6 +137,10 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 	if implementationAdapter == "" {
 		implementationAdapter = "noop"
 	}
+	planningAdapter := opts.PlanningAdapter
+	if planningAdapter == "" {
+		planningAdapter = implementationAdapter
+	}
 	validationAdapter := opts.ValidationAdapter
 	if validationAdapter == "" {
 		validationAdapter = "validation"
@@ -176,6 +182,7 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 		queuePolicy:           queuePolicy,
 		runnerSlots:           runnerSlots,
 		implementationAdapter: implementationAdapter,
+		planningAdapter:       planningAdapter,
 		validationAdapter:     validationAdapter,
 		dataRoot:              dataRoot,
 		projectID:             projectID,
@@ -917,20 +924,134 @@ func (e *Engine) runIdeaIntake(ctx context.Context, wr store.WorkflowRun) (repor
 }
 
 func (e *Engine) runIdeaIntakeStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, template workflow.Template) (report.Report, error) {
-	_, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
+	briefMarkdown, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
 	if err != nil {
 		return report.Report{}, err
 	}
 	stage.StageBriefArtifactID = briefArtifact.ID
-	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
-		return report.Report{}, err
-	}
 	contractMarkdown := taskContractMarkdown(wr)
 	contractArtifact, err := e.store.SaveArtifact(ctx, wr.Run.ID, "task_contract", "text/markdown", []byte(contractMarkdown), ".md")
 	if err != nil {
 		return report.Report{}, err
 	}
-	planMarkdown := taskPlanMarkdown(wr)
+	if contract.NormalizeRefinementLevel(wr.Run.RefinementLevel) == contract.RefinementLevelStandard {
+		return e.runStandardIdeaPlanningStage(ctx, wr, stage, template, contractMarkdown, contractArtifact.ID, briefMarkdown, briefArtifact.ID)
+	}
+	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
+		return report.Report{}, err
+	}
+	return e.completeIdeaIntakeWithPlan(ctx, wr, stage, template, contractArtifact.ID, taskPlanMarkdown(wr), report.Actor{Kind: report.ActorKindHarness, ID: "idea_intake"}, "idea refined into a task plan and frozen workflow snapshot")
+}
+
+func (e *Engine) runStandardIdeaPlanningStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, template workflow.Template, contractMarkdown, contractArtifactID, briefMarkdown, briefArtifactID string) (report.Report, error) {
+	if err := e.store.UpdateStageAdapter(ctx, stage.ID, e.planningAdapter); err != nil {
+		return report.Report{}, err
+	}
+	stage.Adapter = e.planningAdapter
+	e.setActiveStage(wr.Run.ID, stage)
+	defer e.clearActiveStage(wr.Run.ID, stage.ID)
+	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
+		return report.Report{}, err
+	}
+	input := e.stageDispatchInput(runtimeWorkflow{Template: template}, plannerTemplateStage(template, stage), map[string]any{
+		"input_mode":                contract.AdapterInputModePlanning,
+		"idea":                      wr.Run.Idea,
+		"refinement_level":          contract.RefinementLevelStandard,
+		"contract_markdown":         contractMarkdown,
+		"task_contract_artifact_id": contractArtifactID,
+	})
+	input = withStageBriefInput(input, briefMarkdown, briefArtifactID)
+	disp := contract.Dispatch{
+		ProjectID:    wr.Run.ProjectID,
+		RepositoryID: wr.Task.RepositoryID,
+		RunID:        wr.Run.ID,
+		TaskID:       wr.Task.ID,
+		AttemptID:    wr.Attempt.ID,
+		StageID:      stage.ID,
+		StageType:    stage.StageType,
+		Adapter:      e.planningAdapter,
+		Input:        input,
+	}
+	plannerReport, err := e.dispatchWithReportRepair(ctx, wr, stage, disp, reportRepairOptions{
+		AdapterName:   e.planningAdapter,
+		StageType:     stage.StageType,
+		EmitLifecycle: e.planningAdapter != "",
+		LifecycleData: map[string]any{"adapter": e.planningAdapter, "input_mode": contract.AdapterInputModePlanning},
+		Validator:     planningReportValidator(wr, stage, e.planningAdapter),
+	})
+	if err != nil {
+		return report.Report{}, err
+	}
+	if plannerReport.Status != report.StatusCompleted {
+		if err := e.completeStage(context.Background(), wr, stage, plannerReport); err != nil {
+			return report.Report{}, err
+		}
+		return plannerReport, nil
+	}
+	actor := plannerReport.Actor
+	if actor.Kind == "" {
+		actor = report.Actor{Kind: report.ActorKindAgent, ID: e.planningAdapter}
+	}
+	return e.completeIdeaIntakeWithPlan(ctx, wr, stage, template, contractArtifactID, normalizePlannerTaskPlan(payloadString(plannerReport.Payload, "task_plan_markdown")), actor, "planner agent refined the idea into a task plan and frozen workflow snapshot")
+}
+
+func plannerTemplateStage(template workflow.Template, stage store.Stage) workflow.StageTemplate {
+	for _, templateStage := range template.Stages {
+		if templateStage.ID == stage.WorkflowStageID {
+			templateStage.Actor = workflow.ActorAgent
+			if templateStage.Target == "" {
+				templateStage.Target = workflow.TargetPlan
+			}
+			return templateStage
+		}
+	}
+	return workflow.StageTemplate{ID: stage.WorkflowStageID, Type: stage.StageType, Label: "Idea refinement", Actor: workflow.ActorAgent, Target: workflow.TargetPlan}
+}
+
+func planningReportValidator(wr store.WorkflowRun, stage store.Stage, adapterName string) reportRepairValidator {
+	base := baseReportValidator(wr, stage, stage.StageType, adapterName)
+	return func(rep report.Report) (report.Report, error) {
+		validated, err := base(rep)
+		if err != nil {
+			return validated, err
+		}
+		if validated.Status == report.StatusNeedsInput {
+			err := fmt.Errorf("standard idea intake is single-shot and must not return needs_input")
+			return invalidAdapterReport(wr, stage, adapterName, "planner returned invalid task plan", validated, err), err
+		}
+		if validated.Status != report.StatusCompleted {
+			return validated, nil
+		}
+		plan := payloadString(validated.Payload, "task_plan_markdown")
+		if err := validatePlannerTaskPlan(plan); err != nil {
+			return invalidAdapterReport(wr, stage, adapterName, "planner returned invalid task plan", validated, err), err
+		}
+		return validated, nil
+	}
+}
+
+func validatePlannerTaskPlan(plan string) error {
+	plan = strings.TrimSpace(plan)
+	if plan == "" {
+		return fmt.Errorf("payload.task_plan_markdown is required")
+	}
+	for _, required := range []string{"# Task Plan", "This artifact is a task plan, not a workflow definition.", "## Assumptions", "## Open Questions"} {
+		if !strings.Contains(plan, required) {
+			return fmt.Errorf("payload.task_plan_markdown must include %q", required)
+		}
+	}
+	return nil
+}
+
+func normalizePlannerTaskPlan(plan string) string {
+	plan = strings.TrimSpace(plan)
+	if plan == "" {
+		return plan
+	}
+	return plan + "\n"
+}
+
+func (e *Engine) completeIdeaIntakeWithPlan(ctx context.Context, wr store.WorkflowRun, stage store.Stage, template workflow.Template, contractArtifactID, planMarkdown string, actor report.Actor, summary string) (report.Report, error) {
 	planArtifact, err := e.store.SaveArtifact(ctx, wr.Run.ID, "task_plan", "text/markdown", []byte(planMarkdown), ".md")
 	if err != nil {
 		return report.Report{}, err
@@ -939,7 +1060,7 @@ func (e *Engine) runIdeaIntakeStage(ctx context.Context, wr store.WorkflowRun, s
 		return report.Report{}, err
 	}
 	stage.TaskPlanArtifactID = planArtifact.ID
-	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, template, contractArtifact.ID, planArtifact.ID, true)); err != nil {
+	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, template, contractArtifactID, planArtifact.ID, true)); err != nil {
 		return report.Report{}, err
 	}
 	rep := report.Report{
@@ -949,14 +1070,14 @@ func (e *Engine) runIdeaIntakeStage(ctx context.Context, wr store.WorkflowRun, s
 		AttemptID:     wr.Attempt.ID,
 		StageID:       stage.ID,
 		StageType:     stage.StageType,
-		Actor:         report.Actor{Kind: report.ActorKindHarness, ID: "idea_intake"},
+		Actor:         actor,
 		Status:        report.StatusCompleted,
-		Summary:       "idea refined into a task plan and frozen workflow snapshot",
-		EvidenceRefs:  []string{contractArtifact.ID, planArtifact.ID},
+		Summary:       summary,
+		EvidenceRefs:  []string{contractArtifactID, planArtifact.ID},
 		Payload: map[string]any{
 			"idea_verbatim":             wr.Run.Idea,
 			"refinement_level":          wr.Run.RefinementLevel,
-			"task_contract_artifact_id": contractArtifact.ID,
+			"task_contract_artifact_id": contractArtifactID,
 			"task_plan_artifact_id":     planArtifact.ID,
 			"workflow_snapshot_frozen":  true,
 			"implementation_stage_id":   wr.ImplementationStage.ID,

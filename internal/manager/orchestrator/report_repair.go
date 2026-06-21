@@ -263,6 +263,12 @@ func expectedReportSchema(disp contract.Dispatch) map[string]any {
 			"critic_report_artifact_id": "required for arbiter dispatches after normalization",
 		}
 	}
+	if disp.Input != nil && disp.Input["input_mode"] == contract.AdapterInputModePlanning {
+		schema["status"] = []string{report.StatusCompleted, report.StatusFailed, report.StatusInvalid}
+		schema["payload"] = map[string]any{
+			"task_plan_markdown": "required Markdown task plan containing # Task Plan, the plan-boundary sentence, ## Assumptions, and ## Open Questions",
+		}
+	}
 	return schema
 }
 

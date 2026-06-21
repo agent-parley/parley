@@ -141,6 +141,41 @@ func TestPiPrepareReviewUsesSharedReadOnlyWorktreeAndIndependentState(t *testing
 	}
 }
 
+func TestPiPreparePlanningUsesReadOnlyRepoAndPlanningPrompt(t *testing.T) {
+	ctx := context.Background()
+	adapter := newTestPiAdapter(t, ctx, &scriptedPiProvider{})
+	disp := piTestDispatch()
+	disp.StageType = contract.StageTypeIdeaRefinement
+	disp.Input = map[string]any{
+		"input_mode":        contract.AdapterInputModePlanning,
+		"idea":              "add audit logging to login failures",
+		"contract_markdown": "# Parley Task Contract\n\n## User idea (verbatim)\n\nadd audit logging to login failures\n",
+	}
+	prepared, err := adapter.Prepare(ctx, disp)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	for _, mount := range prepared.Invocation.Mounts {
+		if mount.Container == containerRepoPath && mount.Mode != "ro" {
+			t.Fatalf("planning repo mount mode = %s, want ro", mount.Mode)
+		}
+	}
+	prompt := prepared.Invocation.Command[len(prepared.Invocation.Command)-1]
+	if !strings.Contains(prompt, "single-shot task plan") || !strings.Contains(prompt, "payload.task_plan_markdown") {
+		t.Fatalf("planning prompt missing task-plan instruction: %#v", prepared.Invocation.Command)
+	}
+	workerInput := readTestFile(t, prepared.WorkerInputPath)
+	for _, want := range []string{"Standard idea-intake planner", "Do not ask the user questions", "payload.task_plan_markdown", "## Assumptions", "## Open Questions"} {
+		if !strings.Contains(workerInput, want) {
+			t.Fatalf("planning worker input missing %q:\n%s", want, workerInput)
+		}
+	}
+	appendSystem := readTestFile(t, prepared.AppendSystemPath)
+	if !strings.Contains(appendSystem, "Parley planning worker") || !strings.Contains(appendSystem, "Do not modify /project/repo during planning") {
+		t.Fatalf("planning APPEND_SYSTEM.md missing planning rules:\n%s", appendSystem)
+	}
+}
+
 func TestPiRunRepairsInvalidReportOnce(t *testing.T) {
 	ctx := context.Background()
 	fake := &scriptedPiProvider{
