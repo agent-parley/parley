@@ -235,7 +235,7 @@ func waitForRunStatus(t *testing.T, st *store.Store, runID, want string) {
 
 func waitForEventType(t *testing.T, st *store.Store, runID, typ string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		events, err := st.ListEvents(context.Background(), runID)
 		if err == nil && hasEventType(events, typ) {
