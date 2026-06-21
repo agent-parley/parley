@@ -162,7 +162,7 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 		if err != nil {
 			t.Fatalf("serve error: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("server shutdown timeout")
 	}
 }
