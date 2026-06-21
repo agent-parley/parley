@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	errRunAwaitingHuman       = errors.New("run awaiting human review")
+	errRunAwaitingHuman       = errors.New("run awaiting human input")
 	ErrHumanReviewNotAwaiting = errors.New("run is not awaiting that human stage")
 	ErrInvalidHumanReview     = errors.New("invalid human review submission")
 )

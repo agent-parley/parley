@@ -337,7 +337,7 @@ func (e *Engine) CancelRun(ctx context.Context, runID string) error {
 	}
 	if wr.Run.Status == store.RunStatusAwaitingHuman {
 		e.queueMu.Unlock()
-		return e.cancelRunTerminal(ctx, wr, "workflow cancelled while awaiting human review")
+		return e.cancelRunTerminal(ctx, wr, "workflow cancelled while awaiting human input")
 	}
 	e.queueMu.Unlock()
 	e.markCancelling(runID)
@@ -934,8 +934,11 @@ func (e *Engine) runIdeaIntakeStage(ctx context.Context, wr store.WorkflowRun, s
 	if err != nil {
 		return report.Report{}, err
 	}
-	if contract.NormalizeRefinementLevel(wr.Run.RefinementLevel) == contract.RefinementLevelStandard {
+	switch contract.NormalizeRefinementLevel(wr.Run.RefinementLevel) {
+	case contract.RefinementLevelStandard:
 		return e.runStandardIdeaPlanningStage(ctx, wr, stage, template, contractMarkdown, contractArtifact.ID, briefMarkdown, briefArtifact.ID)
+	case contract.RefinementLevelDeep:
+		return e.runDeepIdeaPlanningStage(ctx, wr, stage, template, contractMarkdown, contractArtifact.ID, briefMarkdown, briefArtifact.ID)
 	}
 	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
 		return report.Report{}, err
@@ -995,6 +998,89 @@ func (e *Engine) runStandardIdeaPlanningStage(ctx context.Context, wr store.Work
 	return e.completeIdeaIntakeWithPlan(ctx, wr, stage, template, contractArtifactID, normalizePlannerTaskPlan(payloadString(plannerReport.Payload, "task_plan_markdown")), actor, "planner agent refined the idea into a task plan and frozen workflow snapshot")
 }
 
+func (e *Engine) runDeepIdeaPlanningStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, template workflow.Template, contractMarkdown, contractArtifactID, briefMarkdown, briefArtifactID string) (report.Report, error) {
+	if err := e.store.UpdateStageAdapter(ctx, stage.ID, e.planningAdapter); err != nil {
+		return report.Report{}, err
+	}
+	stage.Adapter = e.planningAdapter
+	conversation, err := e.deepIdeaConversation(ctx, wr.Run.ID)
+	if err != nil {
+		return report.Report{}, err
+	}
+	answeredRounds := conversation.answeredRounds()
+	questionsRemaining := defaultDeepIdeaMaxQuestionRounds - answeredRounds
+	if questionsRemaining < 0 {
+		questionsRemaining = 0
+	}
+	forceFinalPlan := questionsRemaining == 0
+	e.setActiveStage(wr.Run.ID, stage)
+	defer e.clearActiveStage(wr.Run.ID, stage.ID)
+	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
+		return report.Report{}, err
+	}
+	templateStage := plannerTemplateStage(template, stage)
+	input := e.stageDispatchInput(runtimeWorkflow{Template: template}, templateStage, map[string]any{
+		"input_mode":                contract.AdapterInputModePlanning,
+		"idea":                      wr.Run.Idea,
+		"refinement_level":          contract.RefinementLevelDeep,
+		"contract_markdown":         contractMarkdown,
+		"task_contract_artifact_id": contractArtifactID,
+		"question_round":            answeredRounds + 1,
+		"max_question_rounds":       defaultDeepIdeaMaxQuestionRounds,
+		"questions_remaining":       questionsRemaining,
+		"answers_so_far":            conversation.dispatchHistory(),
+		"force_final_plan":          forceFinalPlan,
+	})
+	input = withStageBriefInput(input, briefMarkdown, briefArtifactID)
+	disp := contract.Dispatch{
+		ProjectID:    wr.Run.ProjectID,
+		RepositoryID: wr.Task.RepositoryID,
+		RunID:        wr.Run.ID,
+		TaskID:       wr.Task.ID,
+		AttemptID:    wr.Attempt.ID,
+		StageID:      stage.ID,
+		StageType:    stage.StageType,
+		Adapter:      e.planningAdapter,
+		Input:        input,
+	}
+	plannerReport, err := e.dispatchWithReportRepair(ctx, wr, stage, disp, reportRepairOptions{
+		AdapterName:   e.planningAdapter,
+		StageType:     stage.StageType,
+		EmitLifecycle: e.planningAdapter != "",
+		LifecycleData: map[string]any{"adapter": e.planningAdapter, "input_mode": contract.AdapterInputModePlanning, "refinement_level": contract.RefinementLevelDeep, "question_round": answeredRounds + 1, "questions_remaining": questionsRemaining, "force_final_plan": forceFinalPlan},
+		Validator:     deepPlanningReportValidator(wr, stage, e.planningAdapter, questionsRemaining),
+	})
+	if err != nil {
+		return report.Report{}, err
+	}
+	if plannerReport.Status == report.StatusNeedsInput {
+		questions := deepPlannerQuestions(plannerReport.Payload)
+		if questionsRemaining <= 0 {
+			actor := plannerReport.Actor
+			if actor.Kind == "" {
+				actor = report.Actor{Kind: report.ActorKindAgent, ID: e.planningAdapter}
+			}
+			plan := exhaustedDeepTaskPlan(wr, conversation, questions)
+			return e.completeIdeaIntakeWithPlan(ctx, wr, stage, template, contractArtifactID, plan, actor, "deep planner exhausted question budget; produced task plan with stated assumptions")
+		}
+		if err := e.suspendForDeepIdeaAnswers(context.Background(), wr, stage, templateStage, plannerReport, questions, contractArtifactID, briefArtifactID, answeredRounds+1, defaultDeepIdeaMaxQuestionRounds); err != nil {
+			return report.Report{}, err
+		}
+		return report.Report{}, errRunAwaitingHuman
+	}
+	if plannerReport.Status != report.StatusCompleted {
+		if err := e.completeStage(context.Background(), wr, stage, plannerReport); err != nil {
+			return report.Report{}, err
+		}
+		return plannerReport, nil
+	}
+	actor := plannerReport.Actor
+	if actor.Kind == "" {
+		actor = report.Actor{Kind: report.ActorKindAgent, ID: e.planningAdapter}
+	}
+	return e.completeIdeaIntakeWithPlan(ctx, wr, stage, template, contractArtifactID, normalizePlannerTaskPlan(payloadString(plannerReport.Payload, "task_plan_markdown")), actor, "deep planner refined the idea into a task plan and frozen workflow snapshot")
+}
+
 func plannerTemplateStage(template workflow.Template, stage store.Stage) workflow.StageTemplate {
 	for _, templateStage := range template.Stages {
 		if templateStage.ID == stage.WorkflowStageID {
@@ -1025,6 +1111,29 @@ func planningReportValidator(wr store.WorkflowRun, stage store.Stage, adapterNam
 		plan := payloadString(validated.Payload, "task_plan_markdown")
 		if err := validatePlannerTaskPlan(plan); err != nil {
 			return invalidAdapterReport(wr, stage, adapterName, "planner returned invalid task plan", validated, err), err
+		}
+		return validated, nil
+	}
+}
+
+func deepPlanningReportValidator(wr store.WorkflowRun, stage store.Stage, adapterName string, questionsRemaining int) reportRepairValidator {
+	base := baseReportValidator(wr, stage, stage.StageType, adapterName)
+	return func(rep report.Report) (report.Report, error) {
+		validated, err := base(rep)
+		if err != nil {
+			return validated, err
+		}
+		switch validated.Status {
+		case report.StatusCompleted:
+			plan := payloadString(validated.Payload, "task_plan_markdown")
+			if err := validatePlannerTaskPlan(plan); err != nil {
+				return invalidAdapterReport(wr, stage, adapterName, "planner returned invalid task plan", validated, err), err
+			}
+		case report.StatusNeedsInput:
+			if questionsRemaining > 0 && len(deepPlannerQuestions(validated.Payload)) == 0 {
+				err := fmt.Errorf("payload.questions is required when deep idea intake returns needs_input")
+				return invalidAdapterReport(wr, stage, adapterName, "planner returned invalid clarifying questions", validated, err), err
+			}
 		}
 		return validated, nil
 	}
@@ -1509,8 +1618,8 @@ func (e *Engine) stopRun(ctx context.Context, wr store.WorkflowRun, status, summ
 		return e.cancelRunTerminal(ctx, wr, summary)
 	}
 	// Map to the documented run.* terminal taxonomy (event.schema.md): failed and
-	// invalid are failure terminals; needs_input has no resume path in the skeleton
-	// so it terminates as abandoned.
+	// invalid are failure terminals. A stage that completes with needs_input outside
+	// a durable suspend/resume path still terminates as abandoned.
 	runStatus := store.RunStatusFailed
 	eventType := "run.failed"
 	switch status {

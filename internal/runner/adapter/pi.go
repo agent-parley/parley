@@ -464,6 +464,9 @@ func capturePiDiff(ctx context.Context, prepared PiPreparedRun, sink runnerio.Si
 }
 
 func initialPrompt(disp contract.Dispatch) string {
+	if isDeepPlanningDispatch(disp) {
+		return "Read /project/workspace/worker-input.md, inspect /project/repo as read-only evidence, continue the Deep idea-refinement exchange exactly as requested, and write /project/workspace/report.json when finished."
+	}
 	if isPlanningDispatch(disp) {
 		return "Read /project/workspace/worker-input.md, inspect /project/repo as read-only evidence, produce the single-shot task plan requested there in payload.task_plan_markdown, and write /project/workspace/report.json when finished."
 	}
@@ -527,7 +530,7 @@ func workerInputMarkdown(disp contract.Dispatch) string {
 	b.WriteString("- Do not read or write host paths outside the mounted `/project` layout.\n\n")
 	b.WriteString("## Required Report\n\n")
 	if isPlanningDispatch(disp) {
-		appendPlanningRequiredReport(&b)
+		appendPlanningRequiredReport(&b, disp)
 	} else if disp.StageType == contract.StageTypeReview {
 		appendReviewRequiredReport(&b, disp)
 	} else {
@@ -538,7 +541,18 @@ func workerInputMarkdown(disp contract.Dispatch) string {
 
 func appendPlanningWorkerContract(b *strings.Builder, disp contract.Dispatch) {
 	b.WriteString("## Planning Contract\n\n")
-	b.WriteString("You are the Standard idea-intake planner. Produce a single-shot semantic task plan from the user's idea and the repo evidence available in `/project/repo` and the Stage Brief. Do not ask the user questions, do not pause, and do not return `needs_input`; surface assumptions and open questions as content inside the plan.\n\n")
+	if isDeepPlanningDispatch(disp) {
+		b.WriteString("You are the Deep idea-intake planner. Conduct an interactive multi-turn grilling session that refines the user's idea into a task plan. You may return `needs_input` with clarifying questions while question rounds remain; after the budget is exhausted or `force_final_plan` is true, return `completed` with `payload.task_plan_markdown` using answers-so-far and stated assumptions.\n\n")
+		fmt.Fprintf(b, "- Current question round: `%s`\n", inputValueString(disp.Input, "question_round"))
+		fmt.Fprintf(b, "- Max question rounds: `%s`\n", inputValueString(disp.Input, "max_question_rounds"))
+		fmt.Fprintf(b, "- Questions remaining: `%s`\n", inputValueString(disp.Input, "questions_remaining"))
+		fmt.Fprintf(b, "- Force final plan now: `%s`\n\n", inputValueString(disp.Input, "force_final_plan"))
+		b.WriteString("### Answers so far\n\n```json\n")
+		b.WriteString(inputJSON(disp.Input, "answers_so_far", []any{}))
+		b.WriteString("\n```\n\n")
+	} else {
+		b.WriteString("You are the Standard idea-intake planner. Produce a single-shot semantic task plan from the user's idea and the repo evidence available in `/project/repo` and the Stage Brief. Do not ask the user questions, do not pause, and do not return `needs_input`; surface assumptions and open questions as content inside the plan.\n\n")
+	}
 	b.WriteString("### User idea\n\n")
 	idea := inputString(disp.Input, "idea")
 	if idea == "" {
@@ -553,7 +567,12 @@ func appendPlanningWorkerContract(b *strings.Builder, disp contract.Dispatch) {
 	}
 	b.WriteString("### Required task-plan markdown\n\n")
 	b.WriteString("Return one Markdown task plan in `payload.task_plan_markdown`. The persisted artifact shape must remain the Parley task-plan artifact: Markdown, kind `task_plan`, with `# Task Plan`, run metadata, the verbatim user idea, and the plan-boundary sentence `This artifact is a task plan, not a workflow definition. It does not choose, add, remove, or reorder workflow stages.`\n\n")
-	b.WriteString("The body must be semantically derived from this idea and repository evidence, not a generic template. Include these sections at minimum: `## Objective`, `## Repo Evidence Considered`, `## Implementation Approach`, `## Assumptions`, `## Open Questions`, and `## Validation`. Open questions are non-blocking content for the later workflow-snapshot adjust step.\n\n")
+	b.WriteString("The body must be semantically derived from this idea and repository evidence, not a generic template. Include these sections at minimum: `## Objective`, `## Repo Evidence Considered`, `## Implementation Approach`, `## Assumptions`, `## Open Questions`, and `## Validation`.")
+	if isDeepPlanningDispatch(disp) {
+		b.WriteString(" For Deep refinement, incorporate the answered clarifying exchange. If more questions are necessary and the budget remains, return `needs_input` with `payload.questions` instead of a plan. If `force_final_plan` is true or no questions remain, do not ask more questions; produce the plan with stated assumptions.\n\n")
+	} else {
+		b.WriteString(" Open questions are non-blocking content for the later workflow-snapshot adjust step.\n\n")
+	}
 }
 
 func appendReviewWorkerContract(b *strings.Builder, disp contract.Dispatch) {
@@ -583,12 +602,20 @@ func appendReviewWorkerContract(b *strings.Builder, disp contract.Dispatch) {
 	}
 }
 
-func appendPlanningRequiredReport(b *strings.Builder) {
+func appendPlanningRequiredReport(b *strings.Builder, disp contract.Dispatch) {
 	b.WriteString("Write exactly one report file at `/project/workspace/report.json`. Do not create `summary.md` or `changed-files.txt`. The report must be valid JSON shaped like:\n\n")
 	b.WriteString("```json\n")
+	if isDeepPlanningDispatch(disp) {
+		b.WriteString("{\n  \"status\": \"needs_input\",\n  \"summary\": \"short question-round summary\",\n  \"evidence_refs\": [],\n  \"payload\": {\n    \"questions\": [\"What constraint matters most?\"]\n  },\n  \"errors\": []\n}\n")
+		b.WriteString("```\n\nor, when ready/final:\n\n```json\n")
+	}
 	b.WriteString("{\n  \"status\": \"completed\",\n  \"summary\": \"short planning summary\",\n  \"evidence_refs\": [],\n  \"payload\": {\n    \"task_plan_markdown\": \"# Task Plan\\n\\nProject ID: ...\"\n  },\n  \"errors\": []\n}\n")
 	b.WriteString("```\n\n")
-	b.WriteString("Allowed status values for Standard idea intake are `completed`, `failed`, or `invalid`; do not use `needs_input`. On success, `payload.task_plan_markdown` must include `# Task Plan`, the plan-boundary sentence, `## Assumptions`, and `## Open Questions`.\n")
+	if isDeepPlanningDispatch(disp) {
+		b.WriteString("Allowed status values for Deep idea intake are `completed`, `failed`, `needs_input`, or `invalid` while questions remain. Use `needs_input` only with non-empty `payload.questions`. If `force_final_plan` is true or questions_remaining is 0, do not use `needs_input`; produce `payload.task_plan_markdown` with stated assumptions. On success, `payload.task_plan_markdown` must include `# Task Plan`, the plan-boundary sentence, `## Assumptions`, and `## Open Questions`.\n")
+	} else {
+		b.WriteString("Allowed status values for Standard idea intake are `completed`, `failed`, or `invalid`; do not use `needs_input`. On success, `payload.task_plan_markdown` must include `# Task Plan`, the plan-boundary sentence, `## Assumptions`, and `## Open Questions`.\n")
+	}
 }
 
 func appendDefaultRequiredReport(b *strings.Builder) {
@@ -657,6 +684,20 @@ You are running as a non-interactive Parley %s worker.
 
 func isPlanningDispatch(disp contract.Dispatch) bool {
 	return inputString(disp.Input, "input_mode", "adapter_input_mode") == contract.AdapterInputModePlanning
+}
+
+func isDeepPlanningDispatch(disp contract.Dispatch) bool {
+	return isPlanningDispatch(disp) && inputString(disp.Input, "refinement_level") == contract.RefinementLevelDeep
+}
+
+func inputValueString(input map[string]any, key string) string {
+	if input == nil {
+		return ""
+	}
+	if raw, ok := input[key]; ok {
+		return fmt.Sprint(raw)
+	}
+	return ""
 }
 
 func inputString(input map[string]any, keys ...string) string {

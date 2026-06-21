@@ -17,6 +17,21 @@
         <button type="submit" class="danger">Cancel run</button>
       </form>
     </section>
+    {{with .View.PendingIdeaQuestions}}
+    <section class="card">
+      <h2>Deep refinement questions</h2>
+      <p class="muted">Round {{.Round}} of {{.MaxRounds}}</p>
+      <ul>
+        {{range .Questions}}<li>{{.}}</li>{{end}}
+      </ul>
+      <form method="post" action="/projects/{{$.View.Project.ID}}/runs/{{$.View.Run.ID}}/idea-stages/{{.StageID}}/answers">
+        <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+        <label for="answer_text">Answers</label>
+        <textarea id="answer_text" name="answer_text" required rows="5" placeholder="Answer the planner's questions. Parley will re-dispatch the planner with this context."></textarea>
+        <button type="submit">Resume deep refinement</button>
+      </form>
+    </section>
+    {{end}}
     {{template "stage_statuses.html" .View}}
     {{template "event_log.html" .View}}
     {{template "diff_patch.html" .View}}

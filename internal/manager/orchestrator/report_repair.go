@@ -264,9 +264,17 @@ func expectedReportSchema(disp contract.Dispatch) map[string]any {
 		}
 	}
 	if disp.Input != nil && disp.Input["input_mode"] == contract.AdapterInputModePlanning {
-		schema["status"] = []string{report.StatusCompleted, report.StatusFailed, report.StatusInvalid}
-		schema["payload"] = map[string]any{
-			"task_plan_markdown": "required Markdown task plan containing # Task Plan, the plan-boundary sentence, ## Assumptions, and ## Open Questions",
+		if fmt.Sprint(disp.Input["refinement_level"]) == contract.RefinementLevelDeep && fmt.Sprint(disp.Input["force_final_plan"]) != "true" {
+			schema["status"] = []string{report.StatusCompleted, report.StatusFailed, report.StatusNeedsInput, report.StatusInvalid}
+			schema["payload"] = map[string]any{
+				"task_plan_markdown": "required on completed: Markdown task plan containing # Task Plan, the plan-boundary sentence, ## Assumptions, and ## Open Questions",
+				"questions":          "required on needs_input: non-empty array of clarifying questions for the human operator",
+			}
+		} else {
+			schema["status"] = []string{report.StatusCompleted, report.StatusFailed, report.StatusInvalid}
+			schema["payload"] = map[string]any{
+				"task_plan_markdown": "required Markdown task plan containing # Task Plan, the plan-boundary sentence, ## Assumptions, and ## Open Questions",
+			}
 		}
 	}
 	return schema
