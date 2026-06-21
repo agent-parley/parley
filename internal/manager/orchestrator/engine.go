@@ -63,6 +63,8 @@ var (
 	ErrRunHeld       = errors.New("run held by dispatch gate")
 )
 
+const taskContractArtifactKind = "task_contract"
+
 type Engine struct {
 	store     *store.Store
 	runner    Runner
@@ -699,6 +701,12 @@ func (e *Engine) executeRun(ctx context.Context, runID string) {
 }
 
 func (e *Engine) executeRunAfter(ctx context.Context, runID, resumeAfterWorkflowStageID string) {
+	e.executeRunWithCleanup(ctx, runID, func() error {
+		return e.executeRunFrom(ctx, runID, resumeAfterWorkflowStageID)
+	})
+}
+
+func (e *Engine) executeRunWithCleanup(ctx context.Context, runID string, execute func() error) {
 	defer func() {
 		e.unregisterActiveRun(runID)
 		if e.queuePolicy.AutoWhenReady {
@@ -709,7 +717,7 @@ func (e *Engine) executeRunAfter(ctx context.Context, runID, resumeAfterWorkflow
 			}()
 		}
 	}()
-	if err := e.executeRunFrom(ctx, runID, resumeAfterWorkflowStageID); err != nil {
+	if err := execute(); err != nil {
 		if errors.Is(err, errRunAwaitingHuman) {
 			return
 		}
@@ -738,8 +746,14 @@ func (e *Engine) executeRunFrom(ctx context.Context, runID, resumeAfterWorkflowS
 		return nil
 	}
 	if resumeAfterWorkflowStageID == "" {
-		if _, err := e.emit(context.Background(), runEvent(wr, "run.started", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "run started", map[string]any{"status": store.RunStatusRunning})); err != nil {
+		started, err := e.hasRunEventType(context.Background(), runID, "run.started")
+		if err != nil {
 			return err
+		}
+		if !started {
+			if _, err := e.emit(context.Background(), runEvent(wr, "run.started", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "run started", map[string]any{"status": store.RunStatusRunning})); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -929,8 +943,7 @@ func (e *Engine) runIdeaIntakeStage(ctx context.Context, wr store.WorkflowRun, s
 		return report.Report{}, err
 	}
 	stage.StageBriefArtifactID = briefArtifact.ID
-	contractMarkdown := taskContractMarkdown(wr)
-	contractArtifact, err := e.store.SaveArtifact(ctx, wr.Run.ID, "task_contract", "text/markdown", []byte(contractMarkdown), ".md")
+	contractMarkdown, contractArtifact, err := e.taskContractArtifact(ctx, wr)
 	if err != nil {
 		return report.Report{}, err
 	}
@@ -938,7 +951,7 @@ func (e *Engine) runIdeaIntakeStage(ctx context.Context, wr store.WorkflowRun, s
 	case contract.RefinementLevelStandard:
 		return e.runStandardIdeaPlanningStage(ctx, wr, stage, template, contractMarkdown, contractArtifact.ID, briefMarkdown, briefArtifact.ID)
 	case contract.RefinementLevelDeep:
-		return e.runDeepIdeaPlanningStage(ctx, wr, stage, template, contractMarkdown, contractArtifact.ID, briefMarkdown, briefArtifact.ID)
+		return e.runDeepIdeaPlanningStage(ctx, wr, stage, template, contractMarkdown, contractArtifact.ID, briefMarkdown, briefArtifact.ID, true)
 	}
 	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
 		return report.Report{}, err
@@ -998,7 +1011,7 @@ func (e *Engine) runStandardIdeaPlanningStage(ctx context.Context, wr store.Work
 	return e.completeIdeaIntakeWithPlan(ctx, wr, stage, template, contractArtifactID, normalizePlannerTaskPlan(payloadString(plannerReport.Payload, "task_plan_markdown")), actor, "planner agent refined the idea into a task plan and frozen workflow snapshot")
 }
 
-func (e *Engine) runDeepIdeaPlanningStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, template workflow.Template, contractMarkdown, contractArtifactID, briefMarkdown, briefArtifactID string) (report.Report, error) {
+func (e *Engine) runDeepIdeaPlanningStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, template workflow.Template, contractMarkdown, contractArtifactID, briefMarkdown, briefArtifactID string, emitStageStart bool) (report.Report, error) {
 	if err := e.store.UpdateStageAdapter(ctx, stage.ID, e.planningAdapter); err != nil {
 		return report.Report{}, err
 	}
@@ -1015,8 +1028,10 @@ func (e *Engine) runDeepIdeaPlanningStage(ctx context.Context, wr store.Workflow
 	forceFinalPlan := questionsRemaining == 0
 	e.setActiveStage(wr.Run.ID, stage)
 	defer e.clearActiveStage(wr.Run.ID, stage.ID)
-	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
-		return report.Report{}, err
+	if emitStageStart {
+		if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
+			return report.Report{}, err
+		}
 	}
 	templateStage := plannerTemplateStage(template, stage)
 	input := e.stageDispatchInput(runtimeWorkflow{Template: template}, templateStage, map[string]any{
@@ -1727,6 +1742,42 @@ func stageSnapshot(stage store.Stage, templateStage workflow.StageTemplate) map[
 		out["template_stage"] = templateStage
 	}
 	return out
+}
+
+func (e *Engine) hasRunEventType(ctx context.Context, runID, eventType string) (bool, error) {
+	events, err := e.store.ListEvents(ctx, runID)
+	if err != nil {
+		return false, err
+	}
+	for _, ev := range events {
+		if ev.Type == eventType {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (e *Engine) taskContractArtifact(ctx context.Context, wr store.WorkflowRun) (string, store.Artifact, error) {
+	artifacts, err := e.store.ListArtifacts(ctx, wr.Run.ID)
+	if err != nil {
+		return "", store.Artifact{}, err
+	}
+	for _, artifact := range artifacts {
+		if artifact.Kind != taskContractArtifactKind {
+			continue
+		}
+		artifact, content, err := e.store.GetArtifact(ctx, artifact.ID)
+		if err != nil {
+			return "", store.Artifact{}, err
+		}
+		return string(content), artifact, nil
+	}
+	markdown := taskContractMarkdown(wr)
+	artifact, err := e.store.SaveArtifact(ctx, wr.Run.ID, taskContractArtifactKind, "text/markdown", []byte(markdown), ".md")
+	if err != nil {
+		return "", store.Artifact{}, err
+	}
+	return markdown, artifact, nil
 }
 
 func taskContractMarkdown(wr store.WorkflowRun) string {
