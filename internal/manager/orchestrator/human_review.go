@@ -64,7 +64,21 @@ func (e *Engine) SubmitHumanReview(ctx context.Context, runID, stageID string, s
 		return report.Report{}, ErrHumanReviewNotAwaiting
 	}
 	wr.Run.Status = store.RunStatusRunning
+	rollbackResume := func() {
+		changed, err := e.store.UpdateRunStatusFrom(
+			context.Background(),
+			wr.Run.ID,
+			store.RunStatusRunning,
+			store.RunStatusAwaitingHuman,
+		)
+		if err != nil || !changed {
+			return
+		}
+		wr.Run.Status = store.RunStatusAwaitingHuman
+		_ = e.store.UpdateStageStatus(context.Background(), runtimeStage.Stage.ID, store.StageStatusRunning)
+	}
 	if err := e.completeStage(ctx, wr, runtimeStage.Stage, rep); err != nil {
+		rollbackResume()
 		return report.Report{}, err
 	}
 	if _, err := e.emit(ctx, runEvent(wr, "run.resumed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "run resumed from human review", map[string]any{
@@ -73,6 +87,7 @@ func (e *Engine) SubmitHumanReview(ctx context.Context, runID, stageID string, s
 		"workflow_stage_id": runtimeStage.Template.ID,
 		"verdict":           verdictString(rep.Verdict),
 	})); err != nil {
+		rollbackResume()
 		return report.Report{}, err
 	}
 	runCtx, cancel := context.WithCancel(context.Background())

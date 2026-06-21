@@ -2,6 +2,8 @@ package orchestrator
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -107,6 +109,77 @@ func TestMalformedHumanReviewRejectedWhileAwaiting(t *testing.T) {
 	if run.Status != store.RunStatusAwaitingHuman {
 		t.Fatalf("run status = %s, want awaiting_human", run.Status)
 	}
+}
+
+func TestSubmitHumanReviewRollsBackRunStatusOnPostCASFailure(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	engine := NewEngineWithOptions(st, &capturingRunner{}, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	runID, err := engine.StartRunInput(ctx, contract.TaskInput{
+		Idea:               "rollback failed human resume",
+		RefinementLevel:    contract.RefinementLevelDirect,
+		WorkflowTemplateID: workflow.BalancedPRDeliveryID,
+	})
+	if err != nil {
+		t.Fatalf("StartRunInput() error = %v", err)
+	}
+	waitForRunStatus(t, st, runID, store.RunStatusAwaitingHuman)
+	stage := stageByWorkflowID(t, st, runID, "plan_review_human")
+
+	badWorkspace := filepath.Join(t.TempDir(), "bad-workspace")
+	if _, err := st.EnsureProject(ctx, store.ProjectSpec{
+		ID:                 store.DefaultProjectID,
+		Name:               "Default project",
+		WorkspacePath:      badWorkspace,
+		QueueAutoWhenReady: true,
+		QueueMaxConcurrent: 1,
+		QueueBacklogCap:    100,
+	}); err != nil {
+		t.Fatalf("point project at bad workspace: %v", err)
+	}
+	artifactDir := filepath.Join(badWorkspace, "artifacts")
+	if err := os.RemoveAll(artifactDir); err != nil {
+		t.Fatalf("remove artifact dir: %v", err)
+	}
+	if err := os.WriteFile(artifactDir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("create artifact dir blocker: %v", err)
+	}
+
+	if _, err := engine.SubmitHumanReview(ctx, runID, stage.ID, HumanReviewSubmission{Verdict: string(report.ReviewVerdictPass), Summary: "approved"}); err == nil {
+		t.Fatal("SubmitHumanReview() succeeded despite artifact store failure")
+	}
+	run, err := st.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Status != store.RunStatusAwaitingHuman {
+		t.Fatalf("run status = %s, want awaiting_human after rollback", run.Status)
+	}
+	stage = stageByWorkflowID(t, st, runID, "plan_review_human")
+	if stage.Status != store.StageStatusRunning {
+		t.Fatalf("human stage status = %s, want running after rollback", stage.Status)
+	}
+
+	restoredWorkspace := filepath.Join(t.TempDir(), "restored-workspace")
+	if _, err := st.EnsureProject(ctx, store.ProjectSpec{
+		ID:                 store.DefaultProjectID,
+		Name:               "Default project",
+		WorkspacePath:      restoredWorkspace,
+		QueueAutoWhenReady: true,
+		QueueMaxConcurrent: 1,
+		QueueBacklogCap:    100,
+	}); err != nil {
+		t.Fatalf("restore project workspace: %v", err)
+	}
+	if _, err := engine.SubmitHumanReview(ctx, runID, stage.ID, HumanReviewSubmission{Verdict: string(report.ReviewVerdictPass), Summary: "approved after retry"}); err != nil {
+		t.Fatalf("retry SubmitHumanReview() error = %v", err)
+	}
+	waitForNotRunStatus(t, st, runID, store.RunStatusAwaitingHuman)
 }
 
 func stageByWorkflowID(t *testing.T, st *store.Store, runID, workflowStageID string) store.Stage {
