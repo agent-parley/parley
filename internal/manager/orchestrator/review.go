@@ -292,15 +292,31 @@ func isFixLoopTransition(runtime runtimeWorkflow, stage workflow.StageTemplate, 
 }
 
 func (e *Engine) fixLoopExhausted(ctx context.Context, wr store.WorkflowRun, template workflow.Template, stage workflow.StageTemplate) (bool, error) {
-	count, err := e.store.CountAttemptsForRun(ctx, wr.Run.ID)
+	used, err := e.countAutonomousFixLoopAttempts(ctx, wr.Run.ID)
 	if err != nil {
 		return false, err
 	}
-	used := count - 1
-	if used < 0 {
-		used = 0
-	}
 	return used >= maxFixLoops(template, stage), nil
+}
+
+func (e *Engine) countAutonomousFixLoopAttempts(ctx context.Context, runID string) (int, error) {
+	events, err := e.store.ListEvents(ctx, runID)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, ev := range events {
+		if ev.Type != "fix_loop.attempt_started" {
+			continue
+		}
+		if ev.Data != nil {
+			if kind, _ := ev.Data["trigger_actor_kind"].(string); kind == report.ActorKindHuman {
+				continue
+			}
+		}
+		count++
+	}
+	return count, nil
 }
 
 func (e *Engine) startFixLoopAttempt(ctx context.Context, wr store.WorkflowRun, runtime runtimeWorkflow, triggerStage runtimeStage, trigger report.Report, nextID string) (store.WorkflowRun, runtimeWorkflow, error) {
@@ -333,6 +349,8 @@ func (e *Engine) startFixLoopAttempt(ctx context.Context, wr store.WorkflowRun, 
 		"trigger_stage_type":     trigger.StageType,
 		"trigger_status":         trigger.Status,
 		"trigger_verdict":        verdictString(trigger.Verdict),
+		"trigger_actor_kind":     trigger.Actor.Kind,
+		"trigger_actor_id":       trigger.Actor.ID,
 		"target_workflow_stage":  nextID,
 		"max_fix_loops":          maxFixLoops(runtime.Template, triggerStage.Template),
 	}))

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/agent-parley/parley/internal/manager/store"
+	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 )
 
@@ -20,7 +21,7 @@ func TestStartRunEnqueuesWhenAutoDisabledAndManualStartDispatches(t *testing.T) 
 	runner := newBlockingRunner()
 	policy := QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}
 	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &policy})
-	runID, err := engine.StartRun(ctx, "queued idea")
+	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "queued idea", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun() error = %v", err)
 	}
@@ -60,7 +61,7 @@ func TestCancelPendingRunDoesNotDispatch(t *testing.T) {
 	runner := newBlockingRunner()
 	policy := QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}
 	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &policy})
-	runID, err := engine.StartRun(ctx, "cancel queued")
+	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "cancel queued", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun() error = %v", err)
 	}
@@ -83,10 +84,10 @@ func TestBacklogCapRejectsNewEnqueuesAndEmitsSystemEvent(t *testing.T) {
 	defer st.Close()
 	policy := QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 1}
 	engine := NewEngineWithOptions(st, newBlockingRunner(), fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &policy})
-	if _, err := engine.StartRun(ctx, "first queued"); err != nil {
+	if _, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "first queued", WorkflowTemplateID: workflow.AutonomousPRDeliveryID}); err != nil {
 		t.Fatalf("StartRun(first) error = %v", err)
 	}
-	_, err = engine.StartRun(ctx, "second queued")
+	_, err = engine.StartRunInput(ctx, contract.TaskInput{Idea: "second queued", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	var backlogErr QueueBacklogFullError
 	if !errors.As(err, &backlogErr) {
 		t.Fatalf("StartRun(second) error = %v, want QueueBacklogFullError", err)
@@ -110,13 +111,13 @@ func TestAutoQueueDispatchesOnlyUpToReadyRunnerSlots(t *testing.T) {
 	runner := newBlockingRunner()
 	policy := QueuePolicy{AutoWhenReady: true, MaxConcurrent: 2, BacklogCap: 10}
 	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &policy, RunnerSlots: 1})
-	firstID, err := engine.StartRun(ctx, "first")
+	firstID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "first", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun(first) error = %v", err)
 	}
 	<-runner.started
 	waitForRunStatus(t, st, firstID, store.RunStatusRunning)
-	secondID, err := engine.StartRun(ctx, "second")
+	secondID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "second", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun(second) error = %v", err)
 	}
@@ -143,14 +144,14 @@ func TestRecoverAndDispatchFailsInterruptedRunningAndStartsPending(t *testing.T)
 		t.Fatalf("open store: %v", err)
 	}
 	defer st.Close()
-	interrupted, err := st.CreateWorkflowRun(ctx, "interrupted")
+	interrupted, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "interrupted", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("create interrupted run: %v", err)
 	}
 	if err := st.UpdateRunStatus(ctx, interrupted.Run.ID, store.RunStatusRunning); err != nil {
 		t.Fatalf("mark interrupted running: %v", err)
 	}
-	queued, err := st.CreateWorkflowRun(ctx, "queued")
+	queued, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "queued", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("create queued run: %v", err)
 	}
@@ -188,11 +189,11 @@ func TestDispatchSkipsGateHeldRunWithoutBlockingOthers(t *testing.T) {
 	engine.gate = func(_ context.Context, run store.Run) (bool, error) {
 		return run.Idea != "held", nil
 	}
-	heldID, err := engine.StartRun(ctx, "held")
+	heldID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "held", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun(held) error = %v", err)
 	}
-	readyID, err := engine.StartRun(ctx, "ready")
+	readyID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "ready", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun(ready) error = %v", err)
 	}

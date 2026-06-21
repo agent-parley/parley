@@ -10,6 +10,7 @@ import (
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
 	"github.com/agent-parley/parley/internal/shared/contract"
+	"github.com/agent-parley/parley/internal/shared/report"
 )
 
 type RunController interface {
@@ -17,6 +18,7 @@ type RunController interface {
 	StartProjectRunInput(context.Context, string, contract.TaskInput) (string, error)
 	StartQueuedRun(context.Context, string) error
 	CancelRun(context.Context, string) error
+	SubmitHumanReview(context.Context, string, string, orchestrator.HumanReviewSubmission) (report.Report, error)
 	QueueState(context.Context) (orchestrator.QueueState, error)
 }
 

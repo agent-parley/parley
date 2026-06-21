@@ -1,6 +1,7 @@
 package managerhttp
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -13,6 +14,7 @@ import (
 	"github.com/agent-parley/parley/internal/manager/web"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
+	"github.com/agent-parley/parley/internal/shared/report"
 )
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -58,6 +60,10 @@ func (s *Server) handleProjectPath(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 4 && parts[3] == "start" {
 		s.handleStartQueuedRun(w, r, projectID, runID)
+		return
+	}
+	if len(parts) == 6 && parts[3] == "human-stages" && parts[5] == "verdict" {
+		s.handleHumanReviewVerdict(w, r, projectID, runID, parts[4])
 		return
 	}
 	if len(parts) == 3 {
@@ -173,6 +179,10 @@ func (s *Server) handleRunPath(w http.ResponseWriter, r *http.Request) {
 		s.handleStartQueuedRun(w, r, projectID, runID)
 		return
 	}
+	if len(parts) == 4 && parts[1] == "human-stages" && parts[3] == "verdict" {
+		s.handleHumanReviewVerdict(w, r, projectID, runID, parts[2])
+		return
+	}
 	if len(parts) == 1 {
 		http.Redirect(w, r, projectRunPath(projectID, runID), http.StatusSeeOther)
 		return
@@ -229,6 +239,75 @@ func (s *Server) handleStartQueuedRun(w http.ResponseWriter, r *http.Request, pr
 		return
 	}
 	http.Redirect(w, r, projectRunPath(projectID, runID), http.StatusSeeOther)
+}
+
+func (s *Server) handleHumanReviewVerdict(w http.ResponseWriter, r *http.Request, projectID, runID, stageID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.runBelongsToProject(r, projectID, runID) {
+		http.NotFound(w, r)
+		return
+	}
+	submission, err := parseHumanReviewSubmission(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	rep, err := s.engine.SubmitHumanReview(r.Context(), runID, stageID, submission)
+	if err != nil {
+		if errors.Is(err, orchestrator.ErrHumanReviewNotAwaiting) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		if errors.Is(err, orchestrator.ErrInvalidHumanReview) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"run_id":   runID,
+		"stage_id": stageID,
+		"status":   rep.Status,
+		"verdict":  verdictResponse(rep),
+	})
+}
+
+func parseHumanReviewSubmission(r *http.Request) (orchestrator.HumanReviewSubmission, error) {
+	if strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+		var submission orchestrator.HumanReviewSubmission
+		if err := json.NewDecoder(r.Body).Decode(&submission); err != nil {
+			return orchestrator.HumanReviewSubmission{}, err
+		}
+		return submission, nil
+	}
+	if err := r.ParseForm(); err != nil {
+		return orchestrator.HumanReviewSubmission{}, err
+	}
+	submission := orchestrator.HumanReviewSubmission{
+		ActorID: r.Form.Get("actor_id"),
+		Verdict: r.Form.Get("verdict"),
+		Summary: r.Form.Get("summary"),
+	}
+	for _, finding := range r.Form["finding"] {
+		finding = strings.TrimSpace(finding)
+		if finding != "" {
+			submission.Findings = append(submission.Findings, orchestrator.HumanFinding{Summary: finding})
+		}
+	}
+	return submission, nil
+}
+
+func verdictResponse(rep report.Report) string {
+	if rep.Verdict == nil {
+		return ""
+	}
+	return string(*rep.Verdict)
 }
 
 func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request, projectID, runID string) {

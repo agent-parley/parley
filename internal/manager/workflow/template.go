@@ -47,6 +47,8 @@ const (
 	OnChangesRequested = "changes_requested"
 	OnFailed           = "failed"
 	OnNeedsInput       = "needs_input"
+	OnBlocked          = "blocked"
+	OnEscalate         = "escalate"
 	OnInvalid          = "invalid"
 )
 
@@ -198,7 +200,7 @@ func validActor(actor string) bool {
 
 func validEdgeOn(on string) bool {
 	switch on {
-	case OnCompleted, OnApproved, OnChangesRequested, OnFailed, OnNeedsInput, OnInvalid:
+	case OnCompleted, OnApproved, OnChangesRequested, OnFailed, OnNeedsInput, OnBlocked, OnEscalate, OnInvalid:
 		return true
 	default:
 		return false
@@ -275,7 +277,7 @@ func balancedPRDelivery() Template {
 		"fix_loop":      true,
 		"max_fix_loops": 3,
 	}
-	return predefined(BalancedPRDeliveryID, "Balanced PR Delivery", "Recommended branch-and-PR workflow with human plan review and agent code review.", true, stages, fixLoopEdges(stages, defaultEdges(stages)), settings)
+	return predefined(BalancedPRDeliveryID, "Balanced PR Delivery", "Recommended branch-and-PR workflow with human plan review and agent code review.", true, stages, reviewEscalationEdges(stages, fixLoopEdges(stages, defaultEdges(stages))), settings)
 }
 
 func autonomousPRDelivery() Template {
@@ -289,7 +291,7 @@ func autonomousPRDelivery() Template {
 		stage("memory_update", StageTypeMemoryUpdate, "Memory update", ActorAgent, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	edges := fixLoopEdges(stages, defaultEdges(stages))
+	edges := reviewEscalationEdges(stages, fixLoopEdges(stages, defaultEdges(stages)))
 	return predefined(AutonomousPRDeliveryID, "Autonomous PR Delivery", "Unattended PR workflow with agent review, fix loop, and memory update.", false, stages, edges, map[string]any{
 		"branch_policy": "feature_branch",
 		"pr_behavior":   "create_pr",
@@ -311,7 +313,7 @@ func carefulReviewDelivery() Template {
 		stage("pr_creation", StageTypePRCreation, "PR creation", ActorHarness, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	return predefined(CarefulReviewID, "Careful Review Delivery", "Branch-and-PR workflow with human review before implementation and before PR handoff.", false, stages, fixLoopEdges(stages, defaultEdges(stages)), map[string]any{
+	return predefined(CarefulReviewID, "Careful Review Delivery", "Branch-and-PR workflow with human review before implementation and before PR handoff.", false, stages, reviewEscalationEdges(stages, fixLoopEdges(stages, defaultEdges(stages))), map[string]any{
 		"branch_policy": "feature_branch",
 		"pr_behavior":   "create_pr",
 		"review_depth":  "careful",
@@ -330,7 +332,7 @@ func directCommitDelivery() Template {
 		stage("memory_update", StageTypeMemoryUpdate, "Memory update", ActorAgent, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	return predefined(DirectCommitID, "Direct Commit Delivery", "Advanced opt-in workflow that commits to a target branch instead of creating a PR.", false, stages, fixLoopEdges(stages, defaultEdges(stages)), map[string]any{
+	return predefined(DirectCommitID, "Direct Commit Delivery", "Advanced opt-in workflow that commits to a target branch instead of creating a PR.", false, stages, reviewEscalationEdges(stages, fixLoopEdges(stages, defaultEdges(stages))), map[string]any{
 		"advanced":      true,
 		"branch_policy": "target_branch",
 		"pr_behavior":   "none",
@@ -383,9 +385,41 @@ func fixLoopEdges(stages []StageTemplate, edges []Edge) []Edge {
 		switch {
 		case stage.Type == StageTypeValidation:
 			edges = replaceEdge(edges, stage.ID, OnFailed, implementationID)
-		case stage.Type == StageTypeReview && stage.Target == TargetCodeChanges:
+		case stage.Type == StageTypeReview:
 			edges = replaceEdge(edges, stage.ID, OnChangesRequested, implementationID)
 		}
+	}
+	return edges
+}
+
+func reviewEscalationEdges(stages []StageTemplate, edges []Edge) []Edge {
+	stopID := ""
+	for _, stage := range stages {
+		if stage.Type == StageTypeStopReport {
+			stopID = stage.ID
+			break
+		}
+	}
+	for i, stage := range stages {
+		if stage.Type != StageTypeReview || stage.Actor != ActorAgent {
+			continue
+		}
+		targetID := ""
+		for j := i + 1; j < len(stages); j++ {
+			candidate := stages[j]
+			if candidate.Type == StageTypeReview && candidate.Actor == ActorHuman && candidate.Target == stage.Target {
+				targetID = candidate.ID
+				break
+			}
+		}
+		if targetID == "" {
+			targetID = stopID
+		}
+		if targetID == "" {
+			continue
+		}
+		edges = replaceEdge(edges, stage.ID, OnBlocked, targetID)
+		edges = replaceEdge(edges, stage.ID, OnEscalate, targetID)
 	}
 	return edges
 }
@@ -429,6 +463,12 @@ func defaultEdges(stages []StageTemplate) []Edge {
 				Edge{From: stages[i].ID, To: stopID, On: OnInvalid},
 				Edge{From: stages[i].ID, To: stopID, On: OnNeedsInput},
 			)
+			if stages[i].Type == StageTypeReview {
+				edges = append(edges,
+					Edge{From: stages[i].ID, To: stopID, On: OnBlocked},
+					Edge{From: stages[i].ID, To: stopID, On: OnEscalate},
+				)
+			}
 		}
 	}
 	return edges

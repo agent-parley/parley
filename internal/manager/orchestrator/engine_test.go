@@ -206,7 +206,7 @@ func TestMalformedReportRepairExhaustionRoutesInvalidWithoutCrash(t *testing.T) 
 	defer st.Close()
 	runner := &alwaysMalformedRunner{}
 	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
-	runID, err := engine.StartRun(ctx, "malformed adapter report should not pass or crash")
+	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "malformed adapter report should not pass or crash", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun() error = %v", err)
 	}

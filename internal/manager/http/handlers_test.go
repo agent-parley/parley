@@ -14,6 +14,7 @@ import (
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
 	"github.com/agent-parley/parley/internal/shared/contract"
+	"github.com/agent-parley/parley/internal/shared/report"
 )
 
 func TestHandleRunsBacklogRejectionRendersIndexNotice(t *testing.T) {
@@ -240,6 +241,7 @@ type fakeRunController struct {
 	startRunInputFunc  func(context.Context, string, contract.TaskInput) (string, error)
 	startQueuedRunFunc func(context.Context, string) error
 	cancelRunFunc      func(context.Context, string) error
+	humanReviewFunc    func(context.Context, string, string, orchestrator.HumanReviewSubmission) (report.Report, error)
 }
 
 func (f *fakeRunController) StartProjectRun(ctx context.Context, projectID, idea string) (string, error) {
@@ -271,6 +273,13 @@ func (f *fakeRunController) CancelRun(ctx context.Context, runID string) error {
 		return f.cancelRunFunc(ctx, runID)
 	}
 	return errors.New("unexpected CancelRun call")
+}
+
+func (f *fakeRunController) SubmitHumanReview(ctx context.Context, runID, stageID string, submission orchestrator.HumanReviewSubmission) (report.Report, error) {
+	if f.humanReviewFunc != nil {
+		return f.humanReviewFunc(ctx, runID, stageID, submission)
+	}
+	return report.Report{}, errors.New("unexpected SubmitHumanReview call")
 }
 
 func (f *fakeRunController) QueueState(ctx context.Context) (orchestrator.QueueState, error) {

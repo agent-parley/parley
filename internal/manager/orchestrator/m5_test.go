@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/agent-parley/parley/internal/manager/store"
+	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/protocol"
@@ -21,7 +22,7 @@ func TestCancelMidRunRoutesToCancelled(t *testing.T) {
 	defer st.Close()
 	runner := newBlockingRunner()
 	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
-	runID, err := engine.StartRun(ctx, "cancel me")
+	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "cancel me", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun() error = %v", err)
 	}
@@ -82,7 +83,7 @@ func TestRunnerDownDuringCancellationRoutesToCancelled(t *testing.T) {
 	defer st.Close()
 	runner := newBlockingRunner()
 	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
-	runID, err := engine.StartRun(ctx, "cancel then disconnect")
+	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "cancel then disconnect", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun() error = %v", err)
 	}
@@ -118,7 +119,7 @@ func TestRunnerDownFailsInFlightRunStatePreservingly(t *testing.T) {
 	defer st.Close()
 	runner := newBlockingRunner()
 	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
-	runID, err := engine.StartRun(ctx, "runner dies")
+	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "runner dies", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun() error = %v", err)
 	}
@@ -279,7 +280,7 @@ func TestDispatchSessionClosedRoutesToRunnerDisconnected(t *testing.T) {
 	}
 	defer st.Close()
 	engine := NewEngineWithOptions(st, sessionClosedRunner{}, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
-	runID, err := engine.StartRun(ctx, "runner vanishes mid-dispatch")
+	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "runner vanishes mid-dispatch", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun() error = %v", err)
 	}
