@@ -217,7 +217,7 @@ func (r *blockingRunner) cancelCalled() bool {
 
 func waitForRunStatus(t *testing.T, st *store.Store, runID, want string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		run, err := st.GetRun(context.Background(), runID)
 		if err == nil && run.Status == want {

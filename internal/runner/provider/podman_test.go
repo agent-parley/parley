@@ -3,9 +3,11 @@ package provider
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/agent-parley/parley/internal/runner/runnerio"
@@ -59,18 +61,71 @@ func TestPodmanRunArgsUseRootlessEphemeralContainer(t *testing.T) {
 	}
 }
 
-func TestStreamOutputHandlesLineLongerThanScannerLimit(t *testing.T) {
+func TestPodmanRunStreamsStdoutAndStderr(t *testing.T) {
+	root := t.TempDir()
+	script := filepath.Join(root, "fake-podman")
+	writeFakePodmanOutput(t, script)
+
+	podman := &Podman{Executable: script}
+	sink := &recordingOutputSink{}
+	result, err := podman.Run(context.Background(), PreparedInvocation{
+		Adapter:        "container_sample",
+		ContainerImage: "fake-image",
+		Command:        []string{"sh", "-c", "echo hi"},
+		Network:        NetworkNone,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("Run() exit code = %d, want 0", result.ExitCode)
+	}
+
+	assertOutputEvent(t, sink.events, "stdout", "hello")
+	assertOutputEvent(t, sink.events, "stdout", "partial-out")
+	assertOutputEvent(t, sink.events, "stderr", "warn")
+	assertOutputEvent(t, sink.events, "stderr", "partial-err")
+}
+
+func writeFakePodmanOutput(t *testing.T, path string) {
+	t.Helper()
+	script := `#!/bin/sh
+set -eu
+if [ "$1" = "run" ]; then
+  printf 'hello\npartial-out'
+  printf 'warn\npartial-err' >&2
+  exit 0
+fi
+exit 0
+`
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake podman: %v", err)
+	}
+}
+
+func assertOutputEvent(t *testing.T, events []event.Event, stream, line string) {
+	t.Helper()
+	for _, ev := range events {
+		if ev.Type == "adapter.output" && ev.Data["stream"] == stream && ev.Data["line"] == line {
+			return
+		}
+	}
+	t.Fatalf("missing %s output %q in %+v", stream, line, events)
+}
+
+func TestOutputWriterHandlesLineLongerThanScannerLimit(t *testing.T) {
 	longLine := strings.Repeat("x", 70*1024)
 	sink := &recordingOutputSink{}
-	errCh := make(chan error, 1)
+	writer := newOutputWriter(context.Background(), sink, "container_sample", "stdout")
 
-	streamOutput(context.Background(), sink, "container_sample", "stdout", strings.NewReader(longLine), errCh)
-
-	if err := <-errCh; err != nil {
-		t.Fatalf("streamOutput() error = %v, want nil", err)
+	if _, err := writer.Write([]byte(longLine)); err != nil {
+		t.Fatalf("outputWriter.Write() error = %v, want nil", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("outputWriter.Flush() error = %v, want nil", err)
 	}
 	if len(sink.events) != 1 {
-		t.Fatalf("streamOutput() emitted %d events, want 1", len(sink.events))
+		t.Fatalf("outputWriter emitted %d events, want 1", len(sink.events))
 	}
 	ev := sink.events[0]
 	if ev.Summary != longLine {
@@ -89,10 +144,13 @@ func TestStreamOutputHandlesLineLongerThanScannerLimit(t *testing.T) {
 }
 
 type recordingOutputSink struct {
+	mu     sync.Mutex
 	events []event.Event
 }
 
 func (s *recordingOutputSink) Emit(_ context.Context, ev event.Event) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.events = append(s.events, ev)
 	return nil
 }
