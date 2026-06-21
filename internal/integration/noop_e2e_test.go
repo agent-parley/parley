@@ -68,7 +68,7 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 	engine := orchestrator.NewEngineWithOptions(st, client, renderer, hub, orchestrator.EngineOptions{ImplementationAdapter: "fake_impl", ValidationAdapter: "validation", DataRoot: dataRoot, ProjectID: projectID})
 	client.SetHandlers(engine.HandleRunnerEvent, engine.HandleRunnerArtifact, engine.HandleRunnerReport, engine.HandleRunnerResult, engine.HandleRunnerLog)
 
-	runID, err := engine.StartRun(ctx, "add a local-first harness")
+	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "add a local-first harness", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("start run: %v", err)
 	}
@@ -87,7 +87,11 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 			t.Fatalf("run did not complete; last status=%s", bundle.Run.Status)
 		}
 	}
-	wantStages := len(workflow.DefaultTemplate().Stages)
+	runtimeTemplate, err := st.LatestWorkflowTemplateSnapshot(ctx, runID)
+	if err != nil {
+		t.Fatalf("workflow snapshot: %v", err)
+	}
+	wantStages := len(runtimeTemplate.Stages)
 	if len(bundle.Stages) != wantStages {
 		t.Fatalf("expected %d stages, got %d", wantStages, len(bundle.Stages))
 	}

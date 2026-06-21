@@ -328,6 +328,10 @@ func (e *Engine) CancelRun(ctx context.Context, runID string) error {
 		e.queueMu.Unlock()
 		return err
 	}
+	if wr.Run.Status == store.RunStatusAwaitingHuman {
+		e.queueMu.Unlock()
+		return e.cancelRunTerminal(ctx, wr, "workflow cancelled while awaiting human review")
+	}
 	e.queueMu.Unlock()
 	e.markCancelling(runID)
 	if cancel := e.activeCancel(runID); cancel != nil {
@@ -684,6 +688,10 @@ func (e *Engine) HandleRunnerDown(ctx context.Context, runnerID, reason string) 
 }
 
 func (e *Engine) executeRun(ctx context.Context, runID string) {
+	e.executeRunAfter(ctx, runID, "")
+}
+
+func (e *Engine) executeRunAfter(ctx context.Context, runID, resumeAfterWorkflowStageID string) {
 	defer func() {
 		e.unregisterActiveRun(runID)
 		if e.queuePolicy.AutoWhenReady {
@@ -694,7 +702,10 @@ func (e *Engine) executeRun(ctx context.Context, runID string) {
 			}()
 		}
 	}()
-	if err := e.executeRunErr(ctx, runID); err != nil {
+	if err := e.executeRunFrom(ctx, runID, resumeAfterWorkflowStageID); err != nil {
+		if errors.Is(err, errRunAwaitingHuman) {
+			return
+		}
 		if e.isCancelling(runID) {
 			if wr, getErr := e.store.GetWorkflowRun(context.Background(), runID); getErr == nil {
 				if cancelErr := e.cancelRunTerminal(context.Background(), wr, "workflow cancelled"); cancelErr != nil {
@@ -708,6 +719,10 @@ func (e *Engine) executeRun(ctx context.Context, runID string) {
 }
 
 func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
+	return e.executeRunFrom(ctx, runID, "")
+}
+
+func (e *Engine) executeRunFrom(ctx context.Context, runID, resumeAfterWorkflowStageID string) error {
 	wr, err := e.store.GetWorkflowRun(context.Background(), runID)
 	if err != nil {
 		return err
@@ -715,8 +730,10 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 	if wr.Run.Status != store.RunStatusRunning {
 		return nil
 	}
-	if _, err := e.emit(context.Background(), runEvent(wr, "run.started", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "run started", map[string]any{"status": store.RunStatusRunning})); err != nil {
-		return err
+	if resumeAfterWorkflowStageID == "" {
+		if _, err := e.emit(context.Background(), runEvent(wr, "run.started", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "run started", map[string]any{"status": store.RunStatusRunning})); err != nil {
+			return err
+		}
 	}
 
 	runtime, err := e.loadRuntimeWorkflow(context.Background(), wr)
@@ -730,6 +747,38 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 	var lastDeliveryReport report.Report
 	var snapshot workerSnapshot
 	var snapshotErr error
+
+	if resumeAfterWorkflowStageID != "" {
+		resumeStage, ok := runtime.ByID[resumeAfterWorkflowStageID]
+		if !ok {
+			return fmt.Errorf("resume workflow stage %q not found in frozen snapshot", resumeAfterWorkflowStageID)
+		}
+		state, err := e.reconstructExecutionState(context.Background(), wr, runtime, resumeAfterWorkflowStageID)
+		if err != nil {
+			return err
+		}
+		lastReport = state.lastReport
+		lastValidationReport = state.lastValidationReport
+		lastDeliveryReport = state.lastDeliveryReport
+		snapshot = state.snapshot
+		snapshotErr = state.snapshotErr
+		nextID, ok := runtime.Graph.Next(resumeAfterWorkflowStageID, routingOutcome(resumeStage.Template, lastReport))
+		if !ok {
+			return e.stopRun(context.Background(), wr, lastReport.Status, "workflow stopped after "+resumeAfterWorkflowStageID)
+		}
+		if isFixLoopTransition(runtime, resumeStage.Template, lastReport, nextID) {
+			newWR, newRuntime, err := e.startFixLoopAttempt(context.Background(), wr, runtime, resumeStage, lastReport, nextID)
+			if err != nil {
+				return err
+			}
+			wr = newWR
+			runtime = newRuntime
+			lastValidationReport = report.Report{}
+			snapshot = workerSnapshot{}
+			snapshotErr = nil
+		}
+		currentID = nextID
+	}
 
 	for step := 0; step < maxTransitions; step++ {
 		runtimeStage, ok := runtime.ByID[currentID]
@@ -755,7 +804,7 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 		if e.isCancelling(wr.Run.ID) {
 			return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after "+runtimeStage.Template.ID)
 		}
-		nextID, ok := runtime.Graph.Next(runtimeStage.Template.ID, rep.Status)
+		nextID, ok := runtime.Graph.Next(runtimeStage.Template.ID, routingOutcome(runtimeStage.Template, rep))
 		if !ok {
 			return e.stopRun(context.Background(), wr, rep.Status, "workflow stopped after "+runtimeStage.Template.ID)
 		}
@@ -1105,30 +1154,10 @@ func (e *Engine) runHumanStage(ctx context.Context, wr store.WorkflowRun, stage 
 	if err := e.startStage(ctx, wr, stage, stage.StageType+" human stage started"); err != nil {
 		return report.Report{}, err
 	}
-	rep := report.Report{
-		SchemaVersion: report.SchemaVersion,
-		RunID:         wr.Run.ID,
-		TaskID:        wr.Task.ID,
-		AttemptID:     wr.Attempt.ID,
-		StageID:       stage.ID,
-		StageType:     stage.StageType,
-		Actor:         report.Actor{Kind: report.ActorKindHuman, ID: templateStage.ID},
-		Status:        report.StatusCompleted,
-		Summary:       "human stage recorded by workflow placeholder",
-		Payload: map[string]any{
-			"workflow_stage_id":       templateStage.ID,
-			"workflow_stage_label":    templateStage.Label,
-			"workflow_stage_actor":    templateStage.Actor,
-			"workflow_stage_target":   templateStage.Target,
-			"workflow_stage_settings": templateStage.Settings,
-			"human_input_supported":   false,
-		},
-		Errors: []string{},
-	}
-	if err := e.completeStage(context.Background(), wr, stage, rep); err != nil {
+	if err := e.suspendForHumanReview(context.Background(), wr, stage, templateStage, briefArtifact); err != nil {
 		return report.Report{}, err
 	}
-	return rep, nil
+	return report.Report{}, errRunAwaitingHuman
 }
 
 func (e *Engine) runStopReport(ctx context.Context, wr store.WorkflowRun, stage store.Stage, previous report.Report) (report.Report, error) {
