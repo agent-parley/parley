@@ -66,6 +66,12 @@ func TestDeepIdeaIntakeSuspendsAndResumesPlannerWithAnswers(t *testing.T) {
 		t.Fatalf("receipt = %#v, want first answer artifact", receipt)
 	}
 	waitForRunStatus(t, st, wr.Run.ID, store.RunStatusCompleted)
+	if got := eventTypeCount(t, st, wr.Run.ID, "run.started"); got != 1 {
+		t.Fatalf("run.started events = %d, want 1", got)
+	}
+	if got := artifactKindCount(t, st, wr.Run.ID, taskContractArtifactKind); got != 1 {
+		t.Fatalf("task contract artifacts = %d, want 1", got)
+	}
 	if got := artifactKindCount(t, st, wr.Run.ID, deepIdeaAnswersArtifactKind); got != 1 {
 		t.Fatalf("answer artifacts = %d, want 1", got)
 	}
@@ -128,6 +134,12 @@ func TestDeepIdeaIntakeQuestionBudgetFallsForwardToPlan(t *testing.T) {
 		}
 	}
 	waitForRunStatus(t, st, wr.Run.ID, store.RunStatusCompleted)
+	if got := eventTypeCount(t, st, wr.Run.ID, "run.started"); got != 1 {
+		t.Fatalf("run.started events = %d, want 1", got)
+	}
+	if got := artifactKindCount(t, st, wr.Run.ID, taskContractArtifactKind); got != 1 {
+		t.Fatalf("task contract artifacts = %d, want 1", got)
+	}
 	if got := artifactKindCount(t, st, wr.Run.ID, deepIdeaQuestionsArtifactKind); got != defaultDeepIdeaMaxQuestionRounds {
 		t.Fatalf("question artifacts = %d, want capped %d", got, defaultDeepIdeaMaxQuestionRounds)
 	}
@@ -272,6 +284,21 @@ func artifactKindCount(t *testing.T, st *store.Store, runID, kind string) int {
 	count := 0
 	for _, artifact := range artifacts {
 		if artifact.Kind == kind {
+			count++
+		}
+	}
+	return count
+}
+
+func eventTypeCount(t *testing.T, st *store.Store, runID, eventType string) int {
+	t.Helper()
+	events, err := st.ListEvents(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	count := 0
+	for _, ev := range events {
+		if ev.Type == eventType {
 			count++
 		}
 	}

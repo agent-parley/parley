@@ -243,8 +243,60 @@ func (e *Engine) SubmitDeepIdeaAnswers(ctx context.Context, runID, stageID strin
 	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	e.registerActiveRun(wr.Run.ID, cancel)
-	go e.executeRunAfter(runCtx, wr.Run.ID, "")
+	go e.executeDeepIdeaResumeAfterAnswers(runCtx, wr.Run.ID, runtimeStage.Stage.ID)
 	return DeepIdeaAnswerReceipt{RunID: wr.Run.ID, StageID: runtimeStage.Stage.ID, ArtifactID: artifact.ID, Round: pending.Round}, nil
+}
+
+func (e *Engine) executeDeepIdeaResumeAfterAnswers(ctx context.Context, runID, stageID string) {
+	e.executeRunWithCleanup(ctx, runID, func() error {
+		return e.executeDeepIdeaResumeFromStage(ctx, runID, stageID)
+	})
+}
+
+func (e *Engine) executeDeepIdeaResumeFromStage(ctx context.Context, runID, stageID string) error {
+	wr, err := e.store.GetWorkflowRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if wr.Run.Status != store.RunStatusRunning {
+		return nil
+	}
+	runtime, err := e.loadRuntimeWorkflow(ctx, wr)
+	if err != nil {
+		return err
+	}
+	runtimeStage, ok := runtimeStageByStageID(runtime, stageID)
+	if !ok || runtimeStage.Stage.Status != store.StageStatusRunning || !isIdeaRefinementStage(runtimeStage.Template.Type) {
+		return ErrDeepIdeaNotAwaiting
+	}
+	contractMarkdown, contractArtifact, err := e.taskContractArtifact(ctx, wr)
+	if err != nil {
+		return err
+	}
+	briefMarkdown, briefArtifactID, stage, err := e.stageBriefForDeepIdeaResume(ctx, wr, runtimeStage.Stage)
+	if err != nil {
+		return err
+	}
+	if _, err := e.runDeepIdeaPlanningStage(ctx, wr, stage, runtime.Template, contractMarkdown, contractArtifact.ID, briefMarkdown, briefArtifactID, false); err != nil {
+		return err
+	}
+	return e.executeRunFrom(ctx, runID, runtimeStage.Template.ID)
+}
+
+func (e *Engine) stageBriefForDeepIdeaResume(ctx context.Context, wr store.WorkflowRun, stage store.Stage) (string, string, store.Stage, error) {
+	if stage.StageBriefArtifactID != "" {
+		_, content, err := e.store.GetArtifact(ctx, stage.StageBriefArtifactID)
+		if err != nil {
+			return "", "", store.Stage{}, err
+		}
+		return string(content), stage.StageBriefArtifactID, stage, nil
+	}
+	markdown, artifact, err := e.prepareStageBrief(ctx, wr, stage)
+	if err != nil {
+		return "", "", store.Stage{}, err
+	}
+	stage.StageBriefArtifactID = artifact.ID
+	return markdown, artifact.ID, stage, nil
 }
 
 func normalizeDeepIdeaSubmission(submission DeepIdeaAnswersSubmission) (DeepIdeaAnswersSubmission, error) {
