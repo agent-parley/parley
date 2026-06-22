@@ -47,6 +47,9 @@ const (
 	RunnerOriginSpawned    = "spawned"
 	RunnerOriginRegistered = "registered"
 
+	MessageRoleUser   = "user"
+	MessageRoleSystem = "system"
+
 	ProjectMemoryKindLesson                 = "lesson"
 	ProjectMemoryKindRepoFact               = "repo_fact"
 	ProjectMemoryKindGotcha                 = "gotcha"
@@ -116,6 +119,23 @@ type Repository struct {
 	UpdatedAt string
 }
 
+type Conversation struct {
+	ID        string
+	ProjectID string
+	Title     string
+	CreatedAt string
+	UpdatedAt string
+}
+
+type Message struct {
+	ID             string
+	ProjectID      string
+	ConversationID string
+	Role           string
+	Body           string
+	CreatedAt      string
+}
+
 type Run struct {
 	ID                 string
 	ProjectID          string
@@ -133,6 +153,7 @@ type Task struct {
 	ID              string
 	ProjectID       string
 	RepositoryID    string
+	ConversationID  string
 	Idea            string
 	RefinementLevel string
 	Status          string
@@ -318,6 +339,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureProjectWorkflowSchema(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureConversationSchema(ctx); err != nil {
 		return err
 	}
 	if err := s.ensureRefinementSchema(ctx); err != nil {
@@ -512,6 +536,161 @@ func (s *Store) GetRepository(ctx context.Context, repositoryID string) (Reposit
 	}
 	repo.IsDefault = isDefault != 0
 	return repo, nil
+}
+
+func (s *Store) CreateConversation(ctx context.Context, projectID, title string) (Conversation, error) {
+	projectID = normalizeProjectID(projectID)
+	if _, err := s.GetProject(ctx, projectID); err != nil {
+		return Conversation{}, err
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = "Project chat"
+	}
+	now := nowRFC3339()
+	conversation := Conversation{ID: ids.New("conv"), ProjectID: projectID, Title: title, CreatedAt: now, UpdatedAt: now}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO conversations(id, project_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`, conversation.ID, conversation.ProjectID, conversation.Title, now, now); err != nil {
+		return Conversation{}, fmt.Errorf("insert conversation: %w", err)
+	}
+	return conversation, nil
+}
+
+func (s *Store) EnsureProjectConversation(ctx context.Context, projectID string) (Conversation, error) {
+	projectID = normalizeProjectID(projectID)
+	conversation, err := s.FirstConversationForProject(ctx, projectID)
+	if err == nil {
+		return conversation, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Conversation{}, err
+	}
+	return s.CreateConversation(ctx, projectID, "Project chat")
+}
+
+func (s *Store) FirstConversationForProject(ctx context.Context, projectID string) (Conversation, error) {
+	projectID = normalizeProjectID(projectID)
+	var conversation Conversation
+	err := s.db.QueryRowContext(ctx, `SELECT id, project_id, title, created_at, updated_at FROM conversations WHERE project_id = ? ORDER BY created_at ASC, id ASC LIMIT 1`, projectID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.Title, &conversation.CreatedAt, &conversation.UpdatedAt)
+	if err != nil {
+		return Conversation{}, fmt.Errorf("get project conversation: %w", err)
+	}
+	return conversation, nil
+}
+
+func (s *Store) GetConversation(ctx context.Context, conversationID string) (Conversation, error) {
+	conversationID = strings.TrimSpace(conversationID)
+	var conversation Conversation
+	err := s.db.QueryRowContext(ctx, `SELECT id, project_id, title, created_at, updated_at FROM conversations WHERE id = ?`, conversationID).Scan(&conversation.ID, &conversation.ProjectID, &conversation.Title, &conversation.CreatedAt, &conversation.UpdatedAt)
+	if err != nil {
+		return Conversation{}, fmt.Errorf("get conversation %s: %w", conversationID, err)
+	}
+	return conversation, nil
+}
+
+func (s *Store) ListConversationsForProject(ctx context.Context, projectID string) ([]Conversation, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, title, created_at, updated_at FROM conversations WHERE project_id = ? ORDER BY created_at ASC, id ASC`, normalizeProjectID(projectID))
+	if err != nil {
+		return nil, fmt.Errorf("list conversations: %w", err)
+	}
+	defer rows.Close()
+	var conversations []Conversation
+	for rows.Next() {
+		var conversation Conversation
+		if err := rows.Scan(&conversation.ID, &conversation.ProjectID, &conversation.Title, &conversation.CreatedAt, &conversation.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan conversation: %w", err)
+		}
+		conversations = append(conversations, conversation)
+	}
+	return conversations, rows.Err()
+}
+
+func (s *Store) AddMessage(ctx context.Context, conversationID, role, body string) (Message, error) {
+	conversation, err := s.GetConversation(ctx, conversationID)
+	if err != nil {
+		return Message{}, err
+	}
+	role = strings.ToLower(strings.TrimSpace(role))
+	if role == "" {
+		role = MessageRoleUser
+	}
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return Message{}, fmt.Errorf("message body is required")
+	}
+	now := nowRFC3339()
+	message := Message{ID: ids.New("msg"), ProjectID: conversation.ProjectID, ConversationID: conversation.ID, Role: role, Body: body, CreatedAt: now}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO messages(id, project_id, conversation_id, role, body, created_at) VALUES (?, ?, ?, ?, ?, ?)`, message.ID, message.ProjectID, message.ConversationID, message.Role, message.Body, message.CreatedAt); err != nil {
+		return Message{}, fmt.Errorf("insert message: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE conversations SET updated_at = ? WHERE id = ?`, now, conversation.ID); err != nil {
+		return Message{}, fmt.Errorf("touch conversation: %w", err)
+	}
+	return message, nil
+}
+
+func (s *Store) ListMessagesForConversation(ctx context.Context, conversationID string) ([]Message, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, conversation_id, role, body, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, rowid ASC`, strings.TrimSpace(conversationID))
+	if err != nil {
+		return nil, fmt.Errorf("list messages: %w", err)
+	}
+	defer rows.Close()
+	var messages []Message
+	for rows.Next() {
+		var message Message
+		if err := rows.Scan(&message.ID, &message.ProjectID, &message.ConversationID, &message.Role, &message.Body, &message.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan message: %w", err)
+		}
+		messages = append(messages, message)
+	}
+	return messages, rows.Err()
+}
+
+func (s *Store) ListTasksForConversation(ctx context.Context, conversationID string) ([]Task, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, repository_id, conversation_id, idea, refinement_level, status, created_at, updated_at FROM tasks WHERE conversation_id = ? ORDER BY created_at DESC, id DESC`, strings.TrimSpace(conversationID))
+	if err != nil {
+		return nil, fmt.Errorf("list conversation tasks: %w", err)
+	}
+	return scanTasks(rows)
+}
+
+func (s *Store) GetTask(ctx context.Context, taskID string) (Task, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, project_id, repository_id, conversation_id, idea, refinement_level, status, created_at, updated_at FROM tasks WHERE id = ?`, strings.TrimSpace(taskID))
+	if err != nil {
+		return Task{}, fmt.Errorf("get task %s: %w", taskID, err)
+	}
+	tasks, err := scanTasks(rows)
+	if err != nil {
+		return Task{}, err
+	}
+	if len(tasks) == 0 {
+		return Task{}, fmt.Errorf("get task %s: %w", taskID, sql.ErrNoRows)
+	}
+	return tasks[0], nil
+}
+
+func scanTasks(rows *sql.Rows) ([]Task, error) {
+	defer rows.Close()
+	var tasks []Task
+	for rows.Next() {
+		var task Task
+		var repo, conversation sql.NullString
+		if err := rows.Scan(&task.ID, &task.ProjectID, &repo, &conversation, &task.Idea, &task.RefinementLevel, &task.Status, &task.CreatedAt, &task.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan task: %w", err)
+		}
+		if repo.Valid {
+			task.RepositoryID = repo.String
+		}
+		if conversation.Valid {
+			task.ConversationID = conversation.String
+		}
+		task.RefinementLevel = contract.NormalizeRefinementLevel(task.RefinementLevel)
+		tasks = append(tasks, task)
+	}
+	return tasks, rows.Err()
 }
 
 func (s *Store) ensureWorkflowTemplates(ctx context.Context) error {
@@ -782,6 +961,48 @@ func (s *Store) ensureProjectWorkflowSchema(ctx context.Context) error {
 	return s.rebuildWorkflowTablesForProjects(ctx)
 }
 
+func (s *Store) ensureConversationSchema(ctx context.Context) error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS conversations (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  title TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(project_id, id)
+)`,
+		`CREATE TABLE IF NOT EXISTS messages (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  role TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(project_id, conversation_id) REFERENCES conversations(project_id, id) ON DELETE CASCADE
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_conversations_project_created ON conversations(project_id, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at ASC)`,
+	}
+	for _, stmt := range statements {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("ensure conversation schema: %w", err)
+		}
+	}
+	cols, err := s.tableColumns(ctx, "tasks")
+	if err != nil {
+		return err
+	}
+	if _, ok := cols["conversation_id"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE tasks ADD COLUMN conversation_id TEXT REFERENCES conversations(id)`); err != nil {
+			return fmt.Errorf("add task conversation_id column: %w", err)
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_tasks_conversation_id ON tasks(conversation_id)`); err != nil {
+		return fmt.Errorf("create task conversation index: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) ensureRefinementSchema(ctx context.Context) error {
 	for _, table := range []string{"tasks", "runs"} {
 		cols, err := s.tableColumns(ctx, table)
@@ -947,6 +1168,7 @@ func createWorkflowTablesTx(ctx context.Context, tx *sql.Tx) error {
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),
   repository_id TEXT REFERENCES repositories(id),
+  conversation_id TEXT REFERENCES conversations(id),
   idea TEXT NOT NULL,
   refinement_level TEXT NOT NULL DEFAULT 'standard',
   status TEXT NOT NULL,
@@ -1157,6 +1379,16 @@ func (s *Store) CreateWorkflowRunForProjectInput(ctx context.Context, projectID 
 	if input.WorkflowTemplateID == "" {
 		input.WorkflowTemplateID = workflow.DefaultTemplateID
 	}
+	input.ConversationID = strings.TrimSpace(input.ConversationID)
+	if input.ConversationID != "" {
+		conversation, err := s.GetConversation(ctx, input.ConversationID)
+		if err != nil {
+			return WorkflowRun{}, err
+		}
+		if conversation.ProjectID != project.ID {
+			return WorkflowRun{}, fmt.Errorf("conversation %s does not belong to project %s", input.ConversationID, project.ID)
+		}
+	}
 	template, err := s.GetWorkflowTemplate(ctx, input.WorkflowTemplateID)
 	if err != nil {
 		return WorkflowRun{}, err
@@ -1170,7 +1402,7 @@ func (s *Store) CreateWorkflowRunForProjectInput(ctx context.Context, projectID 
 		Project: project,
 		Run:     Run{ID: ids.New("run"), ProjectID: project.ID, Idea: input.Idea, RefinementLevel: input.RefinementLevel, WorkflowTemplateID: input.WorkflowTemplateID, Status: RunStatusPending, EventLogArtifactID: ids.New("artifact"), CreatedAt: now, UpdatedAt: now},
 	}
-	wr.Task = Task{ID: ids.New("task"), ProjectID: project.ID, RepositoryID: repositoryID, Idea: input.Idea, RefinementLevel: input.RefinementLevel, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
+	wr.Task = Task{ID: ids.New("task"), ProjectID: project.ID, RepositoryID: repositoryID, ConversationID: input.ConversationID, Idea: input.Idea, RefinementLevel: input.RefinementLevel, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
 	wr.Run.TaskID = wr.Task.ID
 	wr.Attempt = Attempt{ID: ids.New("attempt"), ProjectID: project.ID, RunID: wr.Run.ID, TaskID: wr.Task.ID, Status: RunStatusPending, CreatedAt: now, UpdatedAt: now}
 	stages := stagesFromTemplate(project.ID, wr.Run.ID, wr.Task.ID, wr.Attempt.ID, template, now)
@@ -1195,7 +1427,11 @@ func (s *Store) CreateWorkflowRunForProjectInput(ctx context.Context, projectID 
 	if wr.Task.RepositoryID != "" {
 		repoValue = wr.Task.RepositoryID
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO tasks(id, project_id, repository_id, idea, refinement_level, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, wr.Task.ID, wr.Task.ProjectID, repoValue, wr.Task.Idea, wr.Task.RefinementLevel, wr.Task.Status, now, now); err != nil {
+	var conversationValue any
+	if wr.Task.ConversationID != "" {
+		conversationValue = wr.Task.ConversationID
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO tasks(id, project_id, repository_id, conversation_id, idea, refinement_level, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, wr.Task.ID, wr.Task.ProjectID, repoValue, conversationValue, wr.Task.Idea, wr.Task.RefinementLevel, wr.Task.Status, now, now); err != nil {
 		return WorkflowRun{}, fmt.Errorf("insert task: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(id, project_id, task_id, idea, refinement_level, workflow_template_id, status, event_log_artifact_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, wr.Run.ID, wr.Run.ProjectID, wr.Run.TaskID, wr.Run.Idea, wr.Run.RefinementLevel, wr.Run.WorkflowTemplateID, wr.Run.Status, wr.Run.EventLogArtifactID, now, now); err != nil {
@@ -1372,13 +1608,16 @@ func (s *Store) GetWorkflowRun(ctx context.Context, runID string) (WorkflowRun, 
 		return WorkflowRun{}, err
 	}
 	var task Task
-	var repo sql.NullString
-	if err := s.db.QueryRowContext(ctx, `SELECT id, project_id, repository_id, idea, refinement_level, status, created_at, updated_at FROM tasks WHERE id = ? AND project_id = ?`, run.TaskID, run.ProjectID).Scan(&task.ID, &task.ProjectID, &repo, &task.Idea, &task.RefinementLevel, &task.Status, &task.CreatedAt, &task.UpdatedAt); err != nil {
+	var repo, conversation sql.NullString
+	if err := s.db.QueryRowContext(ctx, `SELECT id, project_id, repository_id, conversation_id, idea, refinement_level, status, created_at, updated_at FROM tasks WHERE id = ? AND project_id = ?`, run.TaskID, run.ProjectID).Scan(&task.ID, &task.ProjectID, &repo, &conversation, &task.Idea, &task.RefinementLevel, &task.Status, &task.CreatedAt, &task.UpdatedAt); err != nil {
 		return WorkflowRun{}, fmt.Errorf("get task for run %s: %w", runID, err)
 	}
 	task.RefinementLevel = contract.NormalizeRefinementLevel(task.RefinementLevel)
 	if repo.Valid {
 		task.RepositoryID = repo.String
+	}
+	if conversation.Valid {
+		task.ConversationID = conversation.String
 	}
 	var attempt Attempt
 	if err := s.db.QueryRowContext(ctx, `SELECT id, project_id, run_id, task_id, status, created_at, updated_at FROM attempts WHERE project_id = ? AND run_id = ? AND task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`, run.ProjectID, run.ID, task.ID).Scan(&attempt.ID, &attempt.ProjectID, &attempt.RunID, &attempt.TaskID, &attempt.Status, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {

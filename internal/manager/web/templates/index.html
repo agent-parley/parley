@@ -7,7 +7,7 @@
   <script type="module" src="/assets/datastar.min.js"></script>
   <style>{{template "styles" .}}</style>
 </head>
-<body>
+<body data-on:load="@get('/projects/{{.Project.ID}}/chat/events', {openWhenHidden: true})">
   <main>
     <header><h1>{{.Project.Name}}</h1><p>Project workspace: <code>{{.Project.WorkspacePath}}</code></p></header>
     {{with .Notice}}
@@ -16,6 +16,7 @@
       <p>{{.Message}}</p>
     </section>
     {{end}}
+    {{template "project_chat.html" .Chat}}
     <section class="card">
       <h2>New task run</h2>
       <form method="post" action="/projects/{{.Project.ID}}/runs">

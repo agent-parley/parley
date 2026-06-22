@@ -87,6 +87,74 @@ func TestStageCanReferenceStageBriefArtifact(t *testing.T) {
 	t.Fatal("implementation stage not found")
 }
 
+func TestConversationMessagesPersistAndTasksLink(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	conversation, err := st.EnsureProjectConversation(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	message, err := st.AddMessage(ctx, conversation.ID, MessageRoleUser, "Build chat from project home")
+	if err != nil {
+		t.Fatalf("add message: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: message.Body, RefinementLevel: contract.RefinementLevelDirect, ConversationID: conversation.ID})
+	if err != nil {
+		t.Fatalf("create linked run: %v", err)
+	}
+	if wr.Task.ConversationID != conversation.ID {
+		t.Fatalf("task conversation = %q, want %q", wr.Task.ConversationID, conversation.ID)
+	}
+	standalone, err := st.CreateWorkflowRun(ctx, "standalone task")
+	if err != nil {
+		t.Fatalf("create standalone run: %v", err)
+	}
+	if standalone.Task.ConversationID != "" {
+		t.Fatalf("standalone task conversation = %q, want empty", standalone.Task.ConversationID)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	st, err = Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer st.Close()
+	persistedConversation, err := st.EnsureProjectConversation(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("ensure persisted conversation: %v", err)
+	}
+	if persistedConversation.ID != conversation.ID {
+		t.Fatalf("conversation id = %q, want %q", persistedConversation.ID, conversation.ID)
+	}
+	messages, err := st.ListMessagesForConversation(ctx, conversation.ID)
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	if len(messages) != 1 || messages[0].ID != message.ID || messages[0].Body != message.Body || messages[0].Role != MessageRoleUser {
+		t.Fatalf("messages = %#v, want persisted user message", messages)
+	}
+	linkedTasks, err := st.ListTasksForConversation(ctx, conversation.ID)
+	if err != nil {
+		t.Fatalf("list linked tasks: %v", err)
+	}
+	if len(linkedTasks) != 1 || linkedTasks[0].ID != wr.Task.ID || linkedTasks[0].ConversationID != conversation.ID {
+		t.Fatalf("linked tasks = %#v, want task %s", linkedTasks, wr.Task.ID)
+	}
+	loaded, err := st.GetWorkflowRun(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("get workflow run: %v", err)
+	}
+	if loaded.Task.ConversationID != conversation.ID {
+		t.Fatalf("loaded task conversation = %q, want %q", loaded.Task.ConversationID, conversation.ID)
+	}
+}
+
 func TestRunPersistsRefinementLevelAndStageCanReferenceTaskPlanArtifact(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(ctx, t.TempDir())

@@ -18,8 +18,13 @@ button { background: #2563eb; color: white; border: 0; cursor: pointer; font-wei
 button:hover { background: #1d4ed8; }
 button.danger { background: #b91c1c; }
 button.danger:hover { background: #991b1b; }
-.run-list, .events { padding-left: 20px; }
-.run-list li, .events li, .stages li { margin: 12px 0; }
+.run-list, .events, .messages { padding-left: 20px; }
+.run-list li, .events li, .stages li, .messages li { margin: 12px 0; }
+.chat-thread { background: #111827; border: 1px solid #374151; border-radius: 8px; padding: 12px; margin: 12px 0; }
+.message p { white-space: pre-wrap; margin: 6px 0 0; }
+.message-user strong { color: #bfdbfe; }
+.message-system strong { color: #fde68a; }
+.chat-linked-runs { margin: 12px 0; }
 .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: .85rem; font-weight: 700; margin-left: 8px; }
 .status-completed { background: #065f46; color: #d1fae5; }
 .status-running { background: #1e40af; color: #dbeafe; }

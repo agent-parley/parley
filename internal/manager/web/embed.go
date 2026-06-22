@@ -19,6 +19,7 @@ var Embedded embed.FS
 type Renderer interface {
 	ExecutePage(name string, data any) (string, error)
 	RenderRunFragments(store.RunBundle) (string, error)
+	RenderProjectChat(ProjectChatData) (string, error)
 }
 
 type TemplateRenderer struct {
@@ -31,9 +32,18 @@ type IndexData struct {
 	Runners         []store.Runner
 	RunnerEventPage store.SystemEventPage
 	Queue           QueueView
+	Chat            ProjectChatData
 	Notice          *Notice
 	CSRF            string
 	Title           string
+}
+
+type ProjectChatData struct {
+	Project      store.Project
+	Conversation store.Conversation
+	Messages     []store.Message
+	Tasks        []store.Task
+	CSRF         string
 }
 
 type Notice struct {
@@ -141,6 +151,14 @@ func (r *TemplateRenderer) RenderRunFragments(bundle store.RunBundle) (string, e
 		if err := r.templates.ExecuteTemplate(&buf, name, view); err != nil {
 			return "", fmt.Errorf("execute fragment %s: %w", name, err)
 		}
+	}
+	return compactHTML(buf.String()), nil
+}
+
+func (r *TemplateRenderer) RenderProjectChat(data ProjectChatData) (string, error) {
+	var buf bytes.Buffer
+	if err := r.templates.ExecuteTemplate(&buf, "project_chat.html", data); err != nil {
+		return "", fmt.Errorf("execute project chat fragment: %w", err)
 	}
 	return compactHTML(buf.String()), nil
 }
