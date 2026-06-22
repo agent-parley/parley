@@ -55,10 +55,31 @@
       {{end}}
     </section>
 
-    <section class="review-section safety-note">
-      <h2>Read-only review</h2>
-      <p>The verdict form is intentionally out of scope for this slice.</p>
+    {{with .PendingHumanReview}}
+    <section class="review-section verdict-panel">
+      <h2>Human verdict</h2>
+      <p class="muted">This run is awaiting a human review verdict. The human is the arbiter.</p>
+      {{if .PacketArtifactID}}<p class="artifact-meta">Review packet <code>{{.PacketArtifactID}}</code></p>{{end}}
+      <form method="post" action="/projects/{{$.Project.ID}}/runs/{{$.Run.ID}}/human-stages/{{.StageID}}/verdict" data-on:submit="@post('/projects/{{$.Project.ID}}/runs/{{$.Run.ID}}/human-stages/{{.StageID}}/verdict', {contentType: 'form'})">
+        <input type="hidden" name="_csrf" value="{{$.CSRF}}" data-bind:csrf>
+        <fieldset class="verdict-options">
+          <legend>Verdict</legend>
+          <label><input type="radio" name="verdict" value="pass" required> Pass</label>
+          <label><input type="radio" name="verdict" value="changes_requested" required> Changes requested</label>
+          <label><input type="radio" name="verdict" value="blocked" required> Blocked</label>
+        </fieldset>
+        <label for="human-review-summary">Summary</label>
+        <textarea id="human-review-summary" name="summary" required rows="4" placeholder="Summarize the review decision."></textarea>
+        <label for="human-review-finding-1">Finding</label>
+        <textarea id="human-review-finding-1" name="finding" rows="3" placeholder="Optional accepted finding."></textarea>
+        <label for="human-review-finding-2">Finding</label>
+        <textarea id="human-review-finding-2" name="finding" rows="3" placeholder="Optional accepted finding."></textarea>
+        <label for="human-review-finding-3">Finding</label>
+        <textarea id="human-review-finding-3" name="finding" rows="3" placeholder="Optional accepted finding."></textarea>
+        <button type="submit">Submit verdict</button>
+      </form>
     </section>
+    {{end}}
   </aside>
 
   {{range .ArtifactViews}}

@@ -15,6 +15,15 @@
     <p class="muted">No messages yet. Start with the change you want Parley to make.</p>
     {{end}}
   </div>
+  {{range .TaskRuns}}
+  {{if .ReviewReady}}
+  <article class="chat-review-card">
+    <p><strong>{{.Task.Idea}}</strong></p>
+    <a href="/projects/{{$.Project.ID}}/runs/{{.Run.ID}}?tab=review">ready for review →</a>
+    <span class="muted">Run {{short .Run.ID}} needs a human verdict.</span>
+  </article>
+  {{end}}
+  {{end}}
   {{if .TaskRuns}}
   <details class="chat-linked-runs">
     <summary>Tasks started from this chat</summary>

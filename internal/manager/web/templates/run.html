@@ -7,7 +7,7 @@
   <script type="module" src="/assets/datastar.min.js"></script>
   <style>{{template "styles" .}}</style>
 </head>
-<body class="run-page tab-{{.Tab}}" data-on:load="@get('/projects/{{.View.Project.ID}}/runs/{{.View.Run.ID}}/events', {openWhenHidden: true})">
+<body class="run-page tab-{{.Tab}}" data-signals:csrf="'{{.CSRF}}'" data-on:load="@get('/projects/{{.View.Project.ID}}/runs/{{.View.Run.ID}}/events', {openWhenHidden: true})">
   <main class="run-main">
     <nav class="breadcrumb"><a href="/projects/{{.View.Project.ID}}">← {{.View.Project.Name}}</a></nav>
     {{template "run_summary.html" .View}}

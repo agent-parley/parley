@@ -49,9 +49,10 @@ type ProjectChatData struct {
 }
 
 type TaskRunView struct {
-	Task   store.Task
-	Run    store.Run
-	HasRun bool
+	Task        store.Task
+	Run         store.Run
+	HasRun      bool
+	ReviewReady bool
 }
 
 type Notice struct {
@@ -96,11 +97,13 @@ type RunView struct {
 	DiffPatch            ArtifactView
 	PRReady              PRReadyView
 	PendingIdeaQuestions *IdeaQuestionView
+	PendingHumanReview   *HumanReviewView
 	StageGroups          []StageGroupView
 	TaskPlan             TaskPlanView
 	Outcome              OutcomeView
 	DiffLines            []DiffLineView
 	DiffIsLong           bool
+	CSRF                 string
 }
 
 type StageGroupView struct {
@@ -145,6 +148,12 @@ type IdeaQuestionView struct {
 	Questions []string
 }
 
+type HumanReviewView struct {
+	StageID          string
+	WorkflowStageID  string
+	PacketArtifactID string
+}
+
 type ArtifactView struct {
 	ID           string
 	Kind         string
@@ -173,6 +182,7 @@ func NewTaskRunViews(tasks []store.Task, runs []store.Run) []TaskRunView {
 		if run, ok := latestRunByTask[task.ID]; ok {
 			view.Run = run
 			view.HasRun = true
+			view.ReviewReady = run.Status == store.RunStatusAwaitingHuman
 		}
 		views = append(views, view)
 	}
@@ -180,11 +190,13 @@ func NewTaskRunViews(tasks []store.Task, runs []store.Run) []TaskRunView {
 }
 
 func NewRunData(bundle store.RunBundle, csrf, title, tab string) RunData {
-	return RunData{View: NewRunView(bundle), CSRF: csrf, Title: title, Tab: normalizeRunTab(tab)}
+	view := NewRunView(bundle)
+	view.CSRF = csrf
+	return RunData{View: view, CSRF: csrf, Title: title, Tab: normalizeRunTab(tab)}
 }
 
 func NewRunView(bundle store.RunBundle) RunView {
-	view := RunView{RunBundle: bundle, PRReady: prReadyFromEvents(bundle), PendingIdeaQuestions: pendingIdeaQuestions(bundle)}
+	view := RunView{RunBundle: bundle, PRReady: prReadyFromEvents(bundle), PendingIdeaQuestions: pendingIdeaQuestions(bundle), PendingHumanReview: pendingHumanReview(bundle)}
 	for _, artifact := range bundle.Artifacts {
 		artifactView := newArtifactView(artifact)
 		view.ArtifactViews = append(view.ArtifactViews, artifactView)
@@ -510,6 +522,46 @@ func pendingIdeaQuestions(bundle store.RunBundle) *IdeaQuestionView {
 		return nil
 	}
 	return &IdeaQuestionView{StageID: latest.StageID, Round: latest.Round, MaxRounds: latest.MaxRounds, Questions: latest.Questions}
+}
+
+func pendingHumanReview(bundle store.RunBundle) *HumanReviewView {
+	if bundle.Run.Status != store.RunStatusAwaitingHuman {
+		return nil
+	}
+	var view HumanReviewView
+	for i := len(bundle.Events) - 1; i >= 0; i-- {
+		ev := bundle.Events[i]
+		if ev.Type != "stage.awaiting_human" {
+			continue
+		}
+		packetID := eventString(ev, "human_review_packet_id")
+		if packetID == "" {
+			continue
+		}
+		stageID := eventString(ev, "pending_stage_id")
+		if stageID == "" {
+			stageID = eventString(ev, "stage_id")
+		}
+		if stageID == "" {
+			continue
+		}
+		view = HumanReviewView{StageID: stageID, WorkflowStageID: eventString(ev, "workflow_stage_id"), PacketArtifactID: packetID}
+		break
+	}
+	if view.StageID == "" {
+		return nil
+	}
+	for _, stage := range bundle.Stages {
+		if stage.ID == view.StageID && stage.Status == store.StageStatusRunning && stage.StageType == contract.StageTypeReview {
+			return &view
+		}
+	}
+	return nil
+}
+
+func eventString(ev event.Event, key string) string {
+	value, _ := ev.Data[key].(string)
+	return strings.TrimSpace(value)
 }
 
 func readArtifactJSON(artifact store.Artifact, target any) error {
