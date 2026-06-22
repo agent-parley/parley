@@ -13,6 +13,7 @@ import (
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
+	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/report"
@@ -167,6 +168,26 @@ func TestHandleProjectChatMessagePersistsMessageAndStartsDirectRun(t *testing.T)
 	assertContains(t, body, "/projects/default/chat/events")
 }
 
+func TestProjectChatRendersReadyForReviewCard(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	conversation, err := st.EnsureProjectConversation(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "Review from chat", WorkflowTemplateID: workflow.CarefulReviewID, ConversationID: conversation.ID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	markAwaitingHumanReview(t, st, wr)
+
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	body := getIndexBody(t, srv)
+	assertContains(t, body, "ready for review →")
+	assertContains(t, body, "/projects/default/runs/"+wr.Run.ID+"?tab=review")
+	assertContains(t, body, "Review from chat")
+}
+
 func TestHandleRunDetailRendersStoryReviewDrillIn(t *testing.T) {
 	ctx := context.Background()
 	st := openRouteTestStore(t)
@@ -253,7 +274,35 @@ func TestHandleRunDetailRendersStoryReviewDrillIn(t *testing.T) {
 	assertContains(t, body, "download only")
 	assertContains(t, body, "PR-ready")
 	assertContains(t, body, "agent/run-story")
-	assertContains(t, body, "The verdict form is intentionally out of scope")
+	assertNotContains(t, body, "name=\"verdict\"")
+}
+
+func TestHandleRunDetailRendersAwaitingHumanVerdictForm(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "Review code", WorkflowTemplateID: workflow.CarefulReviewID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stage := markAwaitingHumanReview(t, st, wr)
+
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/projects/default/runs/"+wr.Run.ID+"?tab=review", nil)
+	srv.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET run status = %d want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	assertContains(t, body, "Human verdict")
+	assertContains(t, body, "name=\"verdict\" value=\"pass\"")
+	assertContains(t, body, "name=\"verdict\" value=\"changes_requested\"")
+	assertContains(t, body, "name=\"verdict\" value=\"blocked\"")
+	assertContains(t, body, "name=\"summary\"")
+	assertContains(t, body, "name=\"finding\"")
+	assertContains(t, body, "/projects/default/runs/"+wr.Run.ID+"/human-stages/"+stage.ID+"/verdict")
+	assertContains(t, body, "data-on:submit=\"@post('")
+	assertContains(t, body, "data-signals:csrf")
 }
 
 func TestDirectRunURLRedirectPreservesTab(t *testing.T) {
@@ -313,6 +362,96 @@ func TestHandleDeepIdeaAnswersFormRedirectsToRun(t *testing.T) {
 	}
 	if got := rec.Header().Get("Location"); got != "/projects/default/runs/"+wr.Run.ID {
 		t.Fatalf("Location = %q", got)
+	}
+}
+
+func TestHandleHumanReviewVerdictReturnsHTMLFragment(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "Approve code", WorkflowTemplateID: workflow.CarefulReviewID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stage := markAwaitingHumanReview(t, st, wr)
+	controller := &fakeRunController{state: defaultRouteQueueState()}
+	controller.humanReviewFunc = func(_ context.Context, runID, stageID string, submission orchestrator.HumanReviewSubmission) (report.Report, error) {
+		if runID != wr.Run.ID || stageID != stage.ID {
+			t.Fatalf("SubmitHumanReview run=%s stage=%s", runID, stageID)
+		}
+		if submission.Verdict != string(report.ReviewVerdictPass) || submission.Summary != "Looks good" {
+			t.Fatalf("submission = %#v", submission)
+		}
+		if len(submission.Findings) != 1 || submission.Findings[0].Summary != "Keep the test" {
+			t.Fatalf("findings = %#v", submission.Findings)
+		}
+		if err := st.UpdateRunStatus(ctx, runID, store.RunStatusRunning); err != nil {
+			t.Fatalf("update run: %v", err)
+		}
+		if err := st.UpdateStageStatus(ctx, stageID, report.StatusCompleted); err != nil {
+			t.Fatalf("update stage: %v", err)
+		}
+		verdict := report.ReviewVerdictPass
+		return report.Report{Status: report.StatusCompleted, Verdict: &verdict}, nil
+	}
+
+	srv := newRouteTestServer(t, st, controller)
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/projects/default/runs/"+wr.Run.ID+"/human-stages/"+stage.ID+"/verdict", cookie, url.Values{"verdict": {"pass"}, "summary": {"Looks good"}, "finding": {"Keep the test", ""}, "_csrf": {csrf}})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST verdict status = %d want %d body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "text/html") {
+		t.Fatalf("Content-Type = %q, want html", got)
+	}
+	body := rec.Body.String()
+	assertContains(t, body, "id=\"run-summary\"")
+	assertContains(t, body, "id=\"review-panel\"")
+	assertNotContains(t, body, "application/json")
+	assertNotContains(t, body, "\"run_id\"")
+}
+
+func TestHandleHumanReviewVerdictInvalidVerdictIsBadRequest(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "Reject bad verdict", WorkflowTemplateID: workflow.CarefulReviewID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stage := markAwaitingHumanReview(t, st, wr)
+	controller := &fakeRunController{state: defaultRouteQueueState()}
+	controller.humanReviewFunc = func(_ context.Context, _ string, _ string, submission orchestrator.HumanReviewSubmission) (report.Report, error) {
+		if submission.Verdict != "bogus" {
+			t.Fatalf("verdict = %q", submission.Verdict)
+		}
+		return report.Report{}, orchestrator.ErrInvalidHumanReview
+	}
+
+	srv := newRouteTestServer(t, st, controller)
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/projects/default/runs/"+wr.Run.ID+"/human-stages/"+stage.ID+"/verdict", cookie, url.Values{"verdict": {"bogus"}, "summary": {"bad"}, "_csrf": {csrf}})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST invalid verdict status = %d want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestHandleHumanReviewVerdictDoubleSubmitIsConflict(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "Double submit", WorkflowTemplateID: workflow.CarefulReviewID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stage := markAwaitingHumanReview(t, st, wr)
+	controller := &fakeRunController{state: defaultRouteQueueState()}
+	controller.humanReviewFunc = func(context.Context, string, string, orchestrator.HumanReviewSubmission) (report.Report, error) {
+		return report.Report{}, orchestrator.ErrHumanReviewNotAwaiting
+	}
+
+	srv := newRouteTestServer(t, st, controller)
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/projects/default/runs/"+wr.Run.ID+"/human-stages/"+stage.ID+"/verdict", cookie, url.Values{"verdict": {"pass"}, "summary": {"late"}, "_csrf": {csrf}})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("POST double-submit status = %d want %d body=%s", rec.Code, http.StatusConflict, rec.Body.String())
 	}
 }
 
@@ -417,6 +556,52 @@ func TestHandleIndexRendersQueueStateAndManualStartAffordance(t *testing.T) {
 	assertContains(t, body, "Auto when ready</dt><dd>true")
 	assertNotContains(t, body, "manual start required")
 	assertNotContains(t, body, "Start queued run")
+}
+
+func markAwaitingHumanReview(t *testing.T, st *store.Store, wr store.WorkflowRun) store.Stage {
+	t.Helper()
+	ctx := context.Background()
+	stages, err := st.ListStagesForAttempt(ctx, wr.Run.ID, wr.Attempt.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	var stage store.Stage
+	for _, candidate := range stages {
+		if candidate.WorkflowStageID == "change_review_human" {
+			stage = candidate
+			break
+		}
+	}
+	if stage.ID == "" {
+		t.Fatalf("change_review_human stage not found: %#v", stages)
+	}
+	if err := st.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusAwaitingHuman); err != nil {
+		t.Fatalf("mark run awaiting: %v", err)
+	}
+	if err := st.UpdateStageStatus(ctx, stage.ID, store.StageStatusRunning); err != nil {
+		t.Fatalf("mark stage running: %v", err)
+	}
+	if _, err := st.AppendEvent(ctx, event.Event{
+		SchemaVersion: event.SchemaVersion,
+		ProjectID:     wr.Run.ProjectID,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		Type:          "stage.awaiting_human",
+		Actor:         event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"},
+		Summary:       "human review stage awaiting verdict",
+		Data: map[string]any{
+			"status":                 store.RunStatusAwaitingHuman,
+			"pending_stage_id":       stage.ID,
+			"stage_id":               stage.ID,
+			"stage_type":             contract.StageTypeReview,
+			"workflow_stage_id":      stage.WorkflowStageID,
+			"human_review_packet_id": "artifact_packet",
+		},
+	}); err != nil {
+		t.Fatalf("append awaiting event: %v", err)
+	}
+	return stage
 }
 
 type fakeRunController struct {

@@ -25,6 +25,9 @@ button.danger:hover { background: #991b1b; }
 .message-user strong { color: #bfdbfe; }
 .message-system strong { color: #fde68a; }
 .chat-linked-runs { margin: 12px 0; }
+.chat-review-card { display: grid; gap: 6px; margin: 12px 0; padding: 12px; border: 1px solid #f59e0b; border-radius: 10px; background: #1f2937; }
+.chat-review-card p { margin: 0; }
+.chat-review-card a { font-weight: 800; }
 .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: .85rem; font-weight: 700; margin-left: 8px; }
 .status-completed { background: #065f46; color: #d1fae5; }
 .status-running { background: #1e40af; color: #dbeafe; }
@@ -99,6 +102,10 @@ code { background: #111827; border-radius: 4px; padding: 1px 4px; }
 .artifact-modal-body .artifact-preview { max-height: none; }
 .safety-tag { display: inline-flex; width: fit-content; border-radius: 999px; padding: 3px 8px; color: #e5e7eb; background: #374151; font-size: .74rem; font-weight: 700; }
 .safety-tag.small { padding: 2px 7px; font-size: .68rem; }
+.verdict-options { display: grid; gap: 8px; margin: 12px 0; padding: 0; border: 0; }
+.verdict-options legend { margin-bottom: 4px; font-weight: 700; }
+.verdict-options label { display: flex; gap: 8px; align-items: center; }
+.verdict-options input { width: auto; }
 .pr-ready-panel p, .safety-note p { margin-bottom: 0; }
 @media (max-width: 900px) { .story-layout, .review-layout { grid-template-columns: 1fr; } .section-heading, .event-row { display: grid; } .event-meta { white-space: normal; } }
 {{end}}

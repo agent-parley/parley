@@ -15,7 +15,6 @@ import (
 	"github.com/agent-parley/parley/internal/manager/web"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
-	"github.com/agent-parley/parley/internal/shared/report"
 )
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -419,8 +418,7 @@ func (s *Server) handleHumanReviewVerdict(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	rep, err := s.engine.SubmitHumanReview(r.Context(), runID, stageID, submission)
-	if err != nil {
+	if _, err := s.engine.SubmitHumanReview(r.Context(), runID, stageID, submission); err != nil {
 		if errors.Is(err, orchestrator.ErrHumanReviewNotAwaiting) {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
@@ -432,24 +430,23 @@ func (s *Server) handleHumanReviewVerdict(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
+	bundle, err := s.store.RunBundle(r.Context(), runID)
+	if err != nil || bundle.Run.ProjectID != projectID {
+		http.Error(w, "run not found", http.StatusInternalServerError)
+		return
+	}
+	fragment, err := s.renderer.RenderRunFragments(bundle)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(fragment)))
 	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"run_id":   runID,
-		"stage_id": stageID,
-		"status":   rep.Status,
-		"verdict":  verdictResponse(rep),
-	})
+	_, _ = w.Write([]byte(fragment))
 }
 
 func parseHumanReviewSubmission(r *http.Request) (orchestrator.HumanReviewSubmission, error) {
-	if strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
-		var submission orchestrator.HumanReviewSubmission
-		if err := json.NewDecoder(r.Body).Decode(&submission); err != nil {
-			return orchestrator.HumanReviewSubmission{}, err
-		}
-		return submission, nil
-	}
 	if err := r.ParseForm(); err != nil {
 		return orchestrator.HumanReviewSubmission{}, err
 	}
@@ -545,13 +542,6 @@ func firstNonEmptyFormValue(r *http.Request, keys ...string) string {
 		}
 	}
 	return ""
-}
-
-func verdictResponse(rep report.Report) string {
-	if rep.Verdict == nil {
-		return ""
-	}
-	return string(*rep.Verdict)
 }
 
 func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request, projectID, runID string) {
