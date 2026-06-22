@@ -231,7 +231,11 @@ func (e *Engine) StartProjectRunInput(ctx context.Context, projectID string, inp
 		e.queueMu.Unlock()
 		return "", err
 	}
-	if _, err := e.emit(ctx, runEvent(wr, "run.created", event.Actor{Kind: event.ActorKindUser, ID: "local"}, "run created", map[string]any{"idea": input.Idea, "refinement_level": wr.Run.RefinementLevel, "workflow_template_id": wr.Run.WorkflowTemplateID})); err != nil {
+	data := map[string]any{"idea": input.Idea, "refinement_level": wr.Run.RefinementLevel, "workflow_template_id": wr.Run.WorkflowTemplateID}
+	if wr.Task.ConversationID != "" {
+		data["conversation_id"] = wr.Task.ConversationID
+	}
+	if _, err := e.emit(ctx, runEvent(wr, "run.created", event.Actor{Kind: event.ActorKindUser, ID: "local"}, "run created", data)); err != nil {
 		e.queueMu.Unlock()
 		return "", err
 	}
@@ -1704,6 +1708,7 @@ func (e *Engine) workflowSnapshot(wr store.WorkflowRun, template workflow.Templa
 		"project_id":                 wr.Run.ProjectID,
 		"workspace_path":             wr.Project.WorkspacePath,
 		"repository_id":              wr.Task.RepositoryID,
+		"conversation_id":            wr.Task.ConversationID,
 		"workflow_template_id":       wr.Run.WorkflowTemplateID,
 		"workflow_template_snapshot": template,
 		"workflow_template_frozen":   true,

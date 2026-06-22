@@ -78,6 +78,7 @@ type TaskInput struct {
 	Idea               string `json:"idea"`
 	RefinementLevel    string `json:"refinement_level,omitempty"`
 	WorkflowTemplateID string `json:"workflow_template_id,omitempty"`
+	ConversationID     string `json:"conversation_id,omitempty"`
 }
 
 func NormalizeRefinementLevel(level string) string {

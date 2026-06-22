@@ -119,6 +119,53 @@ func TestHandleRunsPassesExplicitRefinementLevel(t *testing.T) {
 	}
 }
 
+func TestHandleProjectChatMessagePersistsMessageAndStartsDirectRun(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	controller := &fakeRunController{state: defaultRouteQueueState()}
+	var conversationID string
+	controller.startRunInputFunc = func(_ context.Context, projectID string, input contract.TaskInput) (string, error) {
+		if projectID != store.DefaultProjectID {
+			t.Fatalf("StartProjectRun projectID = %q", projectID)
+		}
+		if input.Idea != "Build chat tracer bullet" {
+			t.Fatalf("chat idea = %q", input.Idea)
+		}
+		if input.RefinementLevel != contract.RefinementLevelDirect {
+			t.Fatalf("refinement = %q, want direct", input.RefinementLevel)
+		}
+		if input.ConversationID == "" {
+			t.Fatal("conversation id is empty")
+		}
+		conversationID = input.ConversationID
+		if conversation, err := st.GetConversation(ctx, input.ConversationID); err != nil || conversation.ProjectID != store.DefaultProjectID {
+			t.Fatalf("conversation lookup = %+v err=%v", conversation, err)
+		}
+		return "run_chat", nil
+	}
+
+	srv := newRouteTestServer(t, st, controller)
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/projects/default/chat/messages", cookie, url.Values{"message": {"Build chat tracer bullet"}, "_csrf": {csrf}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST chat status = %d want %d body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
+	}
+	if got := rec.Header().Get("Location"); got != "/projects/default" {
+		t.Fatalf("Location = %q want /projects/default", got)
+	}
+	messages, err := st.ListMessagesForConversation(ctx, conversationID)
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	if len(messages) != 1 || messages[0].Role != store.MessageRoleUser || messages[0].Body != "Build chat tracer bullet" {
+		t.Fatalf("messages = %#v, want persisted chat message", messages)
+	}
+	body := getIndexBody(t, srv)
+	assertContains(t, body, "Project Chat")
+	assertContains(t, body, "Build chat tracer bullet")
+	assertContains(t, body, "/projects/default/chat/events")
+}
+
 func TestHandleRunsRejectsInvalidRefinementLevel(t *testing.T) {
 	st := openRouteTestStore(t)
 	controller := &fakeRunController{state: defaultRouteQueueState()}

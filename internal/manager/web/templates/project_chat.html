@@ -1,0 +1,34 @@
+<section id="project-chat" class="card chat-pane">
+  <h2>Project Chat</h2>
+  <p class="muted">Messages here are persisted project dialogue. Sending an idea starts a Direct task run linked to this chat.</p>
+  <div class="chat-thread" aria-live="polite">
+    {{if .Messages}}
+    <ol class="messages">
+      {{range .Messages}}
+      <li class="message message-{{.Role}}">
+        <div><strong>{{.Role}}</strong> <small>{{.CreatedAt}}</small></div>
+        <p>{{.Body}}</p>
+      </li>
+      {{end}}
+    </ol>
+    {{else}}
+    <p class="muted">No messages yet. Start with the change you want Parley to make.</p>
+    {{end}}
+  </div>
+  {{if .Tasks}}
+  <details class="chat-linked-runs">
+    <summary>Tasks started from this chat</summary>
+    <ul class="run-list">
+      {{range .Tasks}}
+      <li><strong>{{short .ID}}</strong> <span class="pill {{statusClass .Status}}">{{statusLabel .Status}}</span><br><span>{{.Idea}}</span></li>
+      {{end}}
+    </ul>
+  </details>
+  {{end}}
+  <form method="post" action="/projects/{{.Project.ID}}/chat/messages">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}">
+    <label for="chat-message">Idea</label>
+    <textarea id="chat-message" name="message" required rows="4" placeholder="Describe the task you want Parley to run."></textarea>
+    <button type="submit">Send idea</button>
+  </form>
+</section>

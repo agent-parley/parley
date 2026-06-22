@@ -28,6 +28,25 @@ CREATE TABLE IF NOT EXISTS repositories (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS conversations (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  title TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(project_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  role TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(project_id, conversation_id) REFERENCES conversations(project_id, id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS workflow_templates (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -44,6 +63,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),
   repository_id TEXT REFERENCES repositories(id),
+  conversation_id TEXT REFERENCES conversations(id),
   idea TEXT NOT NULL,
   refinement_level TEXT NOT NULL DEFAULT 'standard',
   status TEXT NOT NULL,
@@ -172,12 +192,15 @@ CREATE TABLE IF NOT EXISTS project_memory_entries (
 CREATE INDEX IF NOT EXISTS idx_projects_created_at ON projects(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_workspaces_project_id ON workspaces(project_id);
 CREATE INDEX IF NOT EXISTS idx_repositories_project_id ON repositories(project_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_project_created ON conversations(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_workflow_templates_recommended ON workflow_templates(is_recommended DESC, name ASC);
 CREATE INDEX IF NOT EXISTS idx_runs_project_created ON runs(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_task_id ON runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_runs_workflow_template_id ON runs(workflow_template_id);
 CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_project_created ON tasks(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_conversation_id ON tasks(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_attempts_run_id ON attempts(run_id);
 CREATE INDEX IF NOT EXISTS idx_attempts_task_created ON attempts(project_id, task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_stages_run_id ON stages(run_id);
