@@ -70,7 +70,13 @@ func (e *Engine) reconstructExecutionState(ctx context.Context, wr store.Workflo
 						state.snapshot = mergeWorkerSnapshot(state.snapshot, persisted)
 					}
 					if liveWorktreeMissing {
-						state.snapshotErr = worktreeLostOnResumeError{cause: state.snapshotErr, snapshot: state.snapshot}
+						recovered, recoverErr := e.rematerializeWorktreeFromSnapshot(ctx, wr, state.snapshot)
+						if recoverErr == nil {
+							state.snapshot = recovered
+							state.snapshotErr = nil
+						} else {
+							state.snapshotErr = worktreeLostOnResumeError{cause: fmt.Errorf("%w; re-materialize worktree: %v", state.snapshotErr, recoverErr), snapshot: state.snapshot}
+						}
 					}
 				}
 			}
