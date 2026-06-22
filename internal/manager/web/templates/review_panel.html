@@ -32,16 +32,10 @@
       <ul class="artifact-list">
         {{range .ArtifactViews}}
         <li>
-          <details class="artifact-item">
-            <summary>
-              <span><strong>{{artifactLabel .Kind}}</strong><span class="artifact-kind">{{.MediaType}}</span></span>
-              {{if .DownloadOnly}}<span class="safety-tag small">download only</span>{{end}}
-            </summary>
-            <p class="artifact-meta"><a href="/artifacts/{{.ID}}">Open artifact {{short .ID}}</a></p>
-            {{if .DownloadOnly}}
-            <p class="safety-tag">raw HTML is served as a download and is not rendered inline</p>
-            {{else}}{{if .Preview}}<pre class="artifact-preview">{{.Preview}}</pre>{{end}}{{end}}
-          </details>
+          <a class="artifact-open" href="#artifact-{{.ID}}">
+            <span><strong>{{artifactLabel .Kind}}</strong><span class="artifact-kind">{{.MediaType}}</span></span>
+            {{if .DownloadOnly}}<span class="safety-tag small">download only</span>{{end}}
+          </a>
         </li>
         {{end}}
       </ul>
@@ -66,4 +60,25 @@
       <p>The verdict form is intentionally out of scope for this slice.</p>
     </section>
   </aside>
+
+  {{range .ArtifactViews}}
+  <div id="artifact-{{.ID}}" class="artifact-modal" role="dialog" aria-modal="true" aria-label="{{artifactLabel .Kind}}">
+    <a class="artifact-modal-backdrop" href="#artifacts" aria-label="Close"></a>
+    <div class="artifact-modal-card">
+      <header class="artifact-modal-head">
+        <div>
+          <strong>{{artifactLabel .Kind}}</strong>
+          <span class="artifact-kind">{{.Kind}} · {{.MediaType}}</span>
+        </div>
+        <a class="modal-close" href="#artifacts" aria-label="Close">×</a>
+      </header>
+      <div class="artifact-modal-body">
+        {{if .DownloadOnly}}
+        <p class="safety-tag">raw HTML is served as a download and is not rendered inline</p>
+        {{else}}{{if .Preview}}<pre class="artifact-preview">{{.Preview}}</pre>{{end}}{{end}}
+        <p class="artifact-meta"><a href="/artifacts/{{.ID}}">Open artifact {{short .ID}}</a></p>
+      </div>
+    </div>
+  </div>
+  {{end}}
 </section>
