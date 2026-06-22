@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -88,18 +89,153 @@ func TestAgentEscalationRoutesToWiredHumanReviewAndDoubleSubmitRejected(t *testi
 	waitForRunStatus(t, st, runID, store.RunStatusNeedsInput)
 }
 
-func TestResumeAfterHumanCodeReviewWithLostWorktreeFailsCleanly(t *testing.T) {
+func TestResumeAfterHumanCodeReviewWithLostWorktreeRematerializesAndCommits(t *testing.T) {
 	requireGit(t)
 	ctx := context.Background()
+	fixture := startLostWorktreeResumeFixture(t, ctx)
+
+	diff, err := rworktree.CaptureDiff(ctx, fixture.worktreePath, "")
+	if err != nil {
+		t.Fatalf("capture implementation diff: %v", err)
+	}
+	if _, err := fixture.store.SaveArtifactWithID(ctx, "implementation_diff", fixture.runID, "diff_patch", "text/x-diff", diff, ".patch"); err != nil {
+		t.Fatalf("save implementation diff artifact: %v", err)
+	}
+	if err := os.RemoveAll(fixture.worktreePath); err != nil {
+		t.Fatalf("remove worktree: %v", err)
+	}
+
+	restartedEngine := NewEngineWithOptions(fixture.store, fixture.runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{DataRoot: fixture.dataRoot})
+	changeStage := stageByWorkflowID(t, fixture.store, fixture.runID, "change_review_human")
+	if _, err := restartedEngine.SubmitHumanReview(ctx, fixture.runID, changeStage.ID, HumanReviewSubmission{Verdict: string(report.ReviewVerdictPass), Summary: "code approved"}); err != nil {
+		t.Fatalf("submit code review: %v", err)
+	}
+	waitForRunStatus(t, fixture.store, fixture.runID, store.RunStatusCompleted)
+
+	commitStage := stageByWorkflowID(t, fixture.store, fixture.runID, "commit_feature_branch")
+	commitReport, ok, err := restartedEngine.reportForStage(ctx, fixture.runID, commitStage.ID)
+	if err != nil {
+		t.Fatalf("read commit report: %v", err)
+	}
+	if !ok {
+		t.Fatal("missing commit report")
+	}
+	if commitReport.Status != report.StatusCompleted {
+		t.Fatalf("commit status = %s, want completed; report=%#v", commitReport.Status, commitReport)
+	}
+	commitSHA := payloadString(commitReport.Payload, "commit_sha")
+	if commitSHA == "" {
+		t.Fatalf("commit report missing commit_sha: %#v", commitReport.Payload)
+	}
+	if got := payloadString(commitReport.Payload, "diff_artifact_id"); got != "implementation_diff" {
+		t.Fatalf("commit diff_artifact_id = %s, want implementation_diff", got)
+	}
+	parents := strings.TrimSpace(string(runCommitGitOutput(t, ctx, fixture.sourceRepo, "show", "-s", "--format=%P", commitSHA)))
+	if parents != fixture.baseSHA {
+		t.Fatalf("commit parent = %s, want %s", parents, fixture.baseSHA)
+	}
+	mainGo := string(runCommitGitOutput(t, ctx, fixture.sourceRepo, "show", commitSHA+":main.go"))
+	if mainGo != "package main\n\nfunc main() { println(\"worker\") }\n" {
+		t.Fatalf("committed main.go = %q", mainGo)
+	}
+	binaryAsset := runCommitGitOutput(t, ctx, fixture.sourceRepo, "show", commitSHA+":asset.bin")
+	if !bytes.Equal(binaryAsset, []byte{0x00, 0x01, 0x02, 0xff}) {
+		t.Fatalf("committed asset.bin = %v", binaryAsset)
+	}
+	toolEntry := strings.Fields(string(runCommitGitOutput(t, ctx, fixture.sourceRepo, "ls-tree", commitSHA, "tool.sh")))
+	if len(toolEntry) < 1 || toolEntry[0] != "100755" {
+		t.Fatalf("committed tool.sh entry = %#v, want executable mode", toolEntry)
+	}
+	branch := payloadString(commitReport.Payload, "branch")
+	branchSHA := strings.TrimSpace(string(runCommitGitOutput(t, ctx, fixture.sourceRepo, "rev-parse", "refs/heads/"+branch)))
+	if branchSHA != commitSHA {
+		t.Fatalf("branch ref = %s, want commit %s", branchSHA, commitSHA)
+	}
+}
+
+func TestResumeAfterHumanCodeReviewWithLostWorktreeCorruptDiffFailsCleanly(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	fixture := startLostWorktreeResumeFixture(t, ctx)
+
+	if _, err := fixture.store.SaveArtifactWithID(ctx, "implementation_diff", fixture.runID, "diff_patch", "text/x-diff", []byte("not a faithful git patch\n"), ".patch"); err != nil {
+		t.Fatalf("save corrupt implementation diff artifact: %v", err)
+	}
+	if err := os.RemoveAll(fixture.worktreePath); err != nil {
+		t.Fatalf("remove worktree: %v", err)
+	}
+	restartedEngine := NewEngineWithOptions(fixture.store, fixture.runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{DataRoot: fixture.dataRoot})
+	changeStage := stageByWorkflowID(t, fixture.store, fixture.runID, "change_review_human")
+	if _, err := restartedEngine.SubmitHumanReview(ctx, fixture.runID, changeStage.ID, HumanReviewSubmission{Verdict: string(report.ReviewVerdictPass), Summary: "code approved"}); err != nil {
+		t.Fatalf("submit code review: %v", err)
+	}
+	waitForRunStatus(t, fixture.store, fixture.runID, store.RunStatusFailed)
+
+	commitStage := stageByWorkflowID(t, fixture.store, fixture.runID, "commit_feature_branch")
+	commitReport, ok, err := restartedEngine.reportForStage(ctx, fixture.runID, commitStage.ID)
+	if err != nil {
+		t.Fatalf("read commit report: %v", err)
+	}
+	if !ok {
+		t.Fatal("missing commit report")
+	}
+	if commitReport.Summary != worktreeLostOnResumeSummary {
+		t.Fatalf("commit summary = %q, want %q", commitReport.Summary, worktreeLostOnResumeSummary)
+	}
+	if got := payloadString(commitReport.Payload, "failure_reason"); got != "worktree_lost_on_restart" {
+		t.Fatalf("failure_reason = %s, want worktree_lost_on_restart", got)
+	}
+	if got := payloadString(commitReport.Payload, "base_sha"); got != fixture.baseSHA {
+		t.Fatalf("commit base_sha = %s, want %s", got, fixture.baseSHA)
+	}
+	if got := payloadString(commitReport.Payload, "diff_artifact_id"); got != "implementation_diff" {
+		t.Fatalf("commit diff_artifact_id = %s, want implementation_diff", got)
+	}
+	if got := payloadString(commitReport.Payload, "commit_sha"); got != "" {
+		t.Fatalf("commit_sha = %s, want empty", got)
+	}
+	if len(commitReport.Errors) == 0 || !strings.Contains(commitReport.Errors[0], worktreeLostOnResumeSummary) {
+		t.Fatalf("commit errors = %#v, want worktree lost message", commitReport.Errors)
+	}
+	agentRefs := strings.TrimSpace(string(runCommitGitOutput(
+		t,
+		ctx,
+		fixture.sourceRepo,
+		"for-each-ref",
+		"--format=%(refname)",
+		"refs/heads/agent",
+	)))
+	if agentRefs != "" {
+		t.Fatalf("unexpected agent branch refs after lost worktree commit:\n%s", agentRefs)
+	}
+}
+
+type lostWorktreeResumeFixture struct {
+	store        *store.Store
+	runner       *lostWorktreeResumeRunner
+	dataRoot     string
+	sourceRepo   string
+	runID        string
+	worktreePath string
+	baseSHA      string
+}
+
+func startLostWorktreeResumeFixture(t *testing.T, ctx context.Context) lostWorktreeResumeFixture {
+	t.Helper()
 	st, err := store.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
+	t.Cleanup(func() { _ = st.Close() })
 
 	dataRoot := t.TempDir()
 	source := initCommitSourceRepo(t, ctx, map[string]string{"main.go": "package main\n\nfunc main() {}\n"})
 	baseSHA := strings.TrimSpace(string(runCommitGitOutput(t, ctx, source, "rev-parse", "HEAD")))
+	spec := store.DefaultProjectSpec(st.DataDir())
+	spec.RepositoryPath = source
+	if _, err := st.EnsureProject(ctx, spec); err != nil {
+		t.Fatalf("bind default project repository: %v", err)
+	}
 	runner := &lostWorktreeResumeRunner{dataRoot: dataRoot, sourceRepo: source, worktreePaths: make(chan string, 1)}
 	firstEngine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{DataRoot: dataRoot})
 	runID, err := firstEngine.StartRunInput(ctx, contract.TaskInput{
@@ -153,54 +289,7 @@ func TestResumeAfterHumanCodeReviewWithLostWorktreeFailsCleanly(t *testing.T) {
 	if got := payloadString(packetSnapshot, "base_sha"); got != baseSHA {
 		t.Fatalf("packet base_sha = %s, want %s", got, baseSHA)
 	}
-
-	if err := os.RemoveAll(worktreePath); err != nil {
-		t.Fatalf("remove worktree: %v", err)
-	}
-	restartedEngine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{DataRoot: dataRoot})
-	changeStage := stageByWorkflowID(t, st, runID, "change_review_human")
-	if _, err := restartedEngine.SubmitHumanReview(ctx, runID, changeStage.ID, HumanReviewSubmission{Verdict: string(report.ReviewVerdictPass), Summary: "code approved"}); err != nil {
-		t.Fatalf("submit code review: %v", err)
-	}
-	waitForRunStatus(t, st, runID, store.RunStatusFailed)
-
-	commitStage := stageByWorkflowID(t, st, runID, "commit_feature_branch")
-	commitReport, ok, err := restartedEngine.reportForStage(ctx, runID, commitStage.ID)
-	if err != nil {
-		t.Fatalf("read commit report: %v", err)
-	}
-	if !ok {
-		t.Fatal("missing commit report")
-	}
-	if commitReport.Summary != worktreeLostOnResumeSummary {
-		t.Fatalf("commit summary = %q, want %q", commitReport.Summary, worktreeLostOnResumeSummary)
-	}
-	if got := payloadString(commitReport.Payload, "failure_reason"); got != "worktree_lost_on_restart" {
-		t.Fatalf("failure_reason = %s, want worktree_lost_on_restart", got)
-	}
-	if got := payloadString(commitReport.Payload, "base_sha"); got != baseSHA {
-		t.Fatalf("commit base_sha = %s, want %s", got, baseSHA)
-	}
-	if got := payloadString(commitReport.Payload, "diff_artifact_id"); got != "implementation_diff" {
-		t.Fatalf("commit diff_artifact_id = %s, want implementation_diff", got)
-	}
-	if got := payloadString(commitReport.Payload, "commit_sha"); got != "" {
-		t.Fatalf("commit_sha = %s, want empty", got)
-	}
-	if len(commitReport.Errors) == 0 || !strings.Contains(commitReport.Errors[0], worktreeLostOnResumeSummary) {
-		t.Fatalf("commit errors = %#v, want worktree lost message", commitReport.Errors)
-	}
-	agentRefs := strings.TrimSpace(string(runCommitGitOutput(
-		t,
-		ctx,
-		source,
-		"for-each-ref",
-		"--format=%(refname)",
-		"refs/heads/agent",
-	)))
-	if agentRefs != "" {
-		t.Fatalf("unexpected agent branch refs after lost worktree commit:\n%s", agentRefs)
-	}
+	return lostWorktreeResumeFixture{store: st, runner: runner, dataRoot: dataRoot, sourceRepo: source, runID: runID, worktreePath: worktreePath, baseSHA: baseSHA}
 }
 
 func TestMalformedHumanReviewRejectedWhileAwaiting(t *testing.T) {
@@ -424,6 +513,18 @@ func (r *lostWorktreeResumeRunner) Dispatch(ctx context.Context, disp contract.D
 		if err := os.WriteFile(filepath.Join(wt.Path, "main.go"), []byte("package main\n\nfunc main() { println(\"worker\") }\n"), 0o600); err != nil {
 			rep.Status = report.StatusFailed
 			rep.Summary = "write worktree failed"
+			rep.Errors = []string{err.Error()}
+			return rep, nil
+		}
+		if err := os.WriteFile(filepath.Join(wt.Path, "asset.bin"), []byte{0x00, 0x01, 0x02, 0xff}, 0o600); err != nil {
+			rep.Status = report.StatusFailed
+			rep.Summary = "write binary worktree artifact failed"
+			rep.Errors = []string{err.Error()}
+			return rep, nil
+		}
+		if err := os.WriteFile(filepath.Join(wt.Path, "tool.sh"), []byte("#!/bin/sh\necho worker\n"), 0o755); err != nil {
+			rep.Status = report.StatusFailed
+			rep.Summary = "write executable worktree artifact failed"
 			rep.Errors = []string{err.Error()}
 			return rep, nil
 		}
