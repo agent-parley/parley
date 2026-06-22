@@ -1,14 +1,51 @@
 <section id="project-chat" class="card chat-pane">
   <h2>Project Chat</h2>
-  <p class="muted">Messages here are persisted project dialogue. Sending an idea starts a Direct task run linked to this chat.</p>
+  <p class="muted">Messages here are persisted project dialogue. Sending an idea starts a task run linked to this chat.</p>
   <div class="chat-thread" aria-live="polite">
-    {{if .Messages}}
+    {{if or .Messages .IdeaQuestionMessages}}
     <ol class="messages">
       {{range .Messages}}
       <li class="message message-{{.Role}}">
         <div><strong>{{.Role}}</strong> <small>{{.CreatedAt}}</small></div>
         <p>{{.Body}}</p>
       </li>
+      {{end}}
+      {{range .IdeaQuestionMessages}}
+      <li class="message message-system idea-question-message">
+        <div>
+          <strong>planner</strong>
+          <small>Round {{.Round}} of {{.MaxRounds}} · <a href="/projects/{{$.Project.ID}}/runs/{{.Run.ID}}">{{short .Run.ID}}</a></small>
+        </div>
+        <p>Deep refinement needs answers before the planner continues.</p>
+        <ul class="question-list">
+          {{range .Questions}}<li>{{.}}</li>{{end}}
+        </ul>
+        {{if .Pending}}
+        <form class="chat-answer-form" method="post" action="/projects/{{$.Project.ID}}/runs/{{.Run.ID}}/idea-stages/{{.StageID}}/answers">
+          <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="actor_id" value="operator">
+          <input type="hidden" name="return_to" value="project_chat">
+          <label for="chat-answer-{{.Run.ID}}-{{.Round}}">Answers</label>
+          <textarea id="chat-answer-{{.Run.ID}}-{{.Round}}" name="answer_text" required rows="4" placeholder="Answer the planner's questions. Parley will re-dispatch the planner with this context."></textarea>
+          <button type="submit">Send answers</button>
+        </form>
+        {{else if .Answered}}
+        <p class="muted">Answered. The planner has this context.</p>
+        {{end}}
+      </li>
+      {{if .Answered}}
+      <li class="message message-user idea-answer-message">
+        <div><strong>operator</strong> <small>{{.AnsweredAt}}</small></div>
+        {{if .AnswerText}}<p>{{.AnswerText}}</p>{{end}}
+        {{if .Answers}}
+        <ul class="question-list">
+          {{range .Answers}}
+          <li>{{if .Question}}<strong>{{.Question}}</strong><br>{{end}}{{.Answer}}</li>
+          {{end}}
+        </ul>
+        {{end}}
+      </li>
+      {{end}}
       {{end}}
     </ol>
     {{else}}
@@ -43,6 +80,12 @@
     <input type="hidden" name="_csrf" value="{{.CSRF}}">
     <label for="chat-message">Idea</label>
     <textarea id="chat-message" name="message" required rows="4" placeholder="Describe the task you want Parley to run."></textarea>
+    <label for="chat-refinement-level">Refinement</label>
+    <select id="chat-refinement-level" name="refinement_level">
+      <option value="direct">Direct</option>
+      <option value="standard" selected>Standard</option>
+      <option value="deep">Deep</option>
+    </select>
     <button type="submit">Send idea</button>
   </form>
 </section>

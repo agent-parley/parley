@@ -149,6 +149,16 @@ func (s *Server) handleProjectChatMessage(w http.ResponseWriter, r *http.Request
 		http.Error(w, "message is required", http.StatusBadRequest)
 		return
 	}
+	refinementLevel := strings.TrimSpace(r.Form.Get("refinement_level"))
+	if refinementLevel == "" {
+		refinementLevel = contract.RefinementLevelDirect
+	} else {
+		refinementLevel = contract.NormalizeRefinementLevel(refinementLevel)
+	}
+	if err := contract.ValidateRefinementLevel(refinementLevel); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	project, err := s.store.GetProject(r.Context(), projectID)
 	if err != nil {
 		http.NotFound(w, r)
@@ -163,7 +173,7 @@ func (s *Server) handleProjectChatMessage(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	input := contract.TaskInput{Idea: message, RefinementLevel: contract.RefinementLevelDirect, ConversationID: conversation.ID}
+	input := contract.TaskInput{Idea: message, RefinementLevel: refinementLevel, ConversationID: conversation.ID}
 	if _, err := s.engine.StartProjectRunInput(r.Context(), project.ID, input); err != nil {
 		var backlogErr orchestrator.QueueBacklogFullError
 		if errors.As(err, &backlogErr) {
@@ -214,15 +224,61 @@ func (s *Server) handleProjectChatEvents(w http.ResponseWriter, r *http.Request,
 	}
 	writer.Patch(event.Event{ProjectID: project.ID, Sequence: parseLastEventID(r)}, fragment)
 
-	ch, unsubscribe := s.hub.Subscribe(projectChatTopic(project.ID))
-	defer unsubscribe()
+	type chatPatch struct {
+		event    event.Event
+		fragment string
+		refresh  bool
+	}
+	updates := make(chan chatPatch, len(data.TaskRuns)+1)
+	var unsubscribes []func()
+	subscribe := func(topic string, refresh bool) {
+		ch, unsubscribe := s.hub.Subscribe(topic)
+		unsubscribes = append(unsubscribes, unsubscribe)
+		go func() {
+			for {
+				select {
+				case msg, ok := <-ch:
+					if !ok {
+						return
+					}
+					update := chatPatch{event: msg.Event, fragment: msg.Fragment, refresh: refresh}
+					select {
+					case updates <- update:
+					case <-r.Context().Done():
+						return
+					}
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}()
+	}
+	subscribe(projectChatTopic(project.ID), false)
+	for _, taskRun := range data.TaskRuns {
+		if taskRun.HasRun {
+			subscribe(taskRun.Run.ID, true)
+		}
+	}
+	defer func() {
+		for _, unsubscribe := range unsubscribes {
+			unsubscribe()
+		}
+	}()
 	for {
 		select {
-		case msg, ok := <-ch:
-			if !ok {
-				return
+		case update := <-updates:
+			patch := update.fragment
+			if update.refresh {
+				data, err := s.projectChatData(r, project)
+				if err != nil {
+					continue
+				}
+				patch, err = s.renderer.RenderProjectChat(data)
+				if err != nil {
+					continue
+				}
 			}
-			writer.Patch(msg.Event, msg.Fragment)
+			writer.Patch(update.event, patch)
 		case <-r.Context().Done():
 			return
 		}
@@ -246,7 +302,34 @@ func (s *Server) projectChatData(r *http.Request, project store.Project) (web.Pr
 	if err != nil {
 		return web.ProjectChatData{}, err
 	}
-	return web.ProjectChatData{Project: project, Conversation: conversation, Messages: messages, TaskRuns: web.NewTaskRunViews(tasks, runs), CSRF: csrfFromContext(r.Context())}, nil
+	taskRuns := web.NewTaskRunViews(tasks, runs)
+	bundles, err := s.projectChatRunBundles(r, taskRuns)
+	if err != nil {
+		return web.ProjectChatData{}, err
+	}
+	return web.ProjectChatData{
+		Project:              project,
+		Conversation:         conversation,
+		Messages:             messages,
+		TaskRuns:             taskRuns,
+		IdeaQuestionMessages: web.NewChatIdeaQuestionMessages(bundles),
+		CSRF:                 csrfFromContext(r.Context()),
+	}, nil
+}
+
+func (s *Server) projectChatRunBundles(r *http.Request, taskRuns []web.TaskRunView) ([]store.RunBundle, error) {
+	bundles := make([]store.RunBundle, 0, len(taskRuns))
+	for _, taskRun := range taskRuns {
+		if !taskRun.HasRun {
+			continue
+		}
+		bundle, err := s.store.RunBundle(r.Context(), taskRun.Run.ID)
+		if err != nil {
+			return nil, err
+		}
+		bundles = append(bundles, bundle)
+	}
+	return bundles, nil
 }
 
 func (s *Server) broadcastProjectChat(r *http.Request, project store.Project) {
@@ -492,6 +575,13 @@ func (s *Server) handleDeepIdeaAnswers(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 	if !requestIsJSON(r) {
+		if r.Form.Get("return_to") == "project_chat" {
+			if project, err := s.store.GetProject(r.Context(), projectID); err == nil {
+				s.broadcastProjectChat(r, project)
+			}
+			http.Redirect(w, r, "/projects/"+projectID, http.StatusSeeOther)
+			return
+		}
 		http.Redirect(w, r, projectRunPath(projectID, runID), http.StatusSeeOther)
 		return
 	}
