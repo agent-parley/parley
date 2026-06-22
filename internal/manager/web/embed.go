@@ -11,6 +11,8 @@ import (
 
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/store"
+	"github.com/agent-parley/parley/internal/shared/contract"
+	"github.com/agent-parley/parley/internal/shared/event"
 )
 
 //go:embed templates/*.html assets/*
@@ -42,8 +44,14 @@ type ProjectChatData struct {
 	Project      store.Project
 	Conversation store.Conversation
 	Messages     []store.Message
-	Tasks        []store.Task
+	TaskRuns     []TaskRunView
 	CSRF         string
+}
+
+type TaskRunView struct {
+	Task   store.Task
+	Run    store.Run
+	HasRun bool
 }
 
 type Notice struct {
@@ -79,6 +87,7 @@ type RunData struct {
 	View  RunView
 	CSRF  string
 	Title string
+	Tab   string
 }
 
 type RunView struct {
@@ -87,6 +96,46 @@ type RunView struct {
 	DiffPatch            ArtifactView
 	PRReady              PRReadyView
 	PendingIdeaQuestions *IdeaQuestionView
+	StageGroups          []StageGroupView
+	TaskPlan             TaskPlanView
+	Outcome              OutcomeView
+	DiffLines            []DiffLineView
+	DiffIsLong           bool
+}
+
+type StageGroupView struct {
+	Stage     store.Stage
+	Label     string
+	Performer string
+	Summary   string
+	Expanded  bool
+	Events    []EventView
+}
+
+type EventView struct {
+	Event      event.Event
+	Family     string
+	StageType  string
+	StageLabel string
+}
+
+type DiffLineView struct {
+	Text  string
+	Class string
+}
+
+type TaskPlanView struct {
+	Available  bool
+	Artifact   ArtifactView
+	StageID    string
+	StageLabel string
+	Fallback   string
+}
+
+type OutcomeView struct {
+	Summary       string
+	LastEvent     *EventView
+	TerminalEvent *EventView
 }
 
 type IdeaQuestionView struct {
@@ -111,8 +160,27 @@ type PRReadyView struct {
 	DiffArtifactID string
 }
 
-func NewRunData(bundle store.RunBundle, csrf, title string) RunData {
-	return RunData{View: NewRunView(bundle), CSRF: csrf, Title: title}
+func NewTaskRunViews(tasks []store.Task, runs []store.Run) []TaskRunView {
+	latestRunByTask := map[string]store.Run{}
+	for _, run := range runs {
+		if _, exists := latestRunByTask[run.TaskID]; !exists {
+			latestRunByTask[run.TaskID] = run
+		}
+	}
+	views := make([]TaskRunView, 0, len(tasks))
+	for _, task := range tasks {
+		view := TaskRunView{Task: task}
+		if run, ok := latestRunByTask[task.ID]; ok {
+			view.Run = run
+			view.HasRun = true
+		}
+		views = append(views, view)
+	}
+	return views
+}
+
+func NewRunData(bundle store.RunBundle, csrf, title, tab string) RunData {
+	return RunData{View: NewRunView(bundle), CSRF: csrf, Title: title, Tab: normalizeRunTab(tab)}
 }
 
 func NewRunView(bundle store.RunBundle) RunView {
@@ -124,11 +192,23 @@ func NewRunView(bundle store.RunBundle) RunView {
 			view.DiffPatch = artifactView
 		}
 	}
+	view.StageGroups = stageGroups(bundle.Stages, bundle.Events)
+	view.TaskPlan = taskPlanView(bundle, view.ArtifactViews)
+	view.Outcome = outcomeView(bundle)
+	view.DiffLines = diffLines(view.DiffPatch.Preview)
+	view.DiffIsLong = len(view.DiffLines) > 80
 	return view
 }
 
 func NewRenderer() (*TemplateRenderer, error) {
-	funcs := template.FuncMap{"short": short, "statusClass": statusClass, "statusLabel": statusLabel}
+	funcs := template.FuncMap{
+		"short":         short,
+		"statusClass":   statusClass,
+		"statusLabel":   statusLabel,
+		"stageLabel":    stageLabel,
+		"artifactLabel": artifactLabel,
+		"timeLabel":     timeLabel,
+	}
 	tmpl, err := template.New("").Funcs(funcs).ParseFS(Embedded, "templates/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("parse templates: %w", err)
@@ -147,7 +227,7 @@ func (r *TemplateRenderer) ExecutePage(name string, data any) (string, error) {
 func (r *TemplateRenderer) RenderRunFragments(bundle store.RunBundle) (string, error) {
 	view := NewRunView(bundle)
 	var buf bytes.Buffer
-	for _, name := range []string{"run_summary.html", "stage_statuses.html", "event_log.html", "diff_patch.html", "artifacts.html"} {
+	for _, name := range []string{"run_summary.html", "story_panel.html", "review_panel.html"} {
 		if err := r.templates.ExecuteTemplate(&buf, name, view); err != nil {
 			return "", fmt.Errorf("execute fragment %s: %w", name, err)
 		}
@@ -161,6 +241,201 @@ func (r *TemplateRenderer) RenderProjectChat(data ProjectChatData) (string, erro
 		return "", fmt.Errorf("execute project chat fragment: %w", err)
 	}
 	return compactHTML(buf.String()), nil
+}
+
+func stageGroups(stages []store.Stage, events []event.Event) []StageGroupView {
+	groups := make([]StageGroupView, 0, len(stages))
+	for _, stage := range stages {
+		group := StageGroupView{Stage: stage, Label: stageLabel(stage.StageType), Performer: performer(stage)}
+		for _, ev := range events {
+			if stageTypeFromEvent(ev) == stage.StageType {
+				group.Events = append(group.Events, newEventView(ev))
+			}
+		}
+		group.Summary = stageSummary(stage, group.Events)
+		group.Expanded = stage.Status == store.StageStatusRunning || stage.Status == "awaiting_human" || len(group.Events) == 0
+		groups = append(groups, group)
+	}
+	return groups
+}
+
+func newEventView(ev event.Event) EventView {
+	stageType := stageTypeFromEvent(ev)
+	return EventView{Event: ev, Family: eventFamily(ev.Type), StageType: stageType, StageLabel: stageLabel(stageType)}
+}
+
+func performer(stage store.Stage) string {
+	if stage.Adapter != "" {
+		return "Agent profile " + stage.Adapter
+	}
+	return "Harness"
+}
+
+func stageSummary(stage store.Stage, events []EventView) string {
+	if len(events) > 0 {
+		return events[len(events)-1].Event.Summary
+	}
+	switch stage.Status {
+	case store.StageStatusPending:
+		return "Waiting for the previous stage."
+	case store.StageStatusRunning:
+		return stageLabel(stage.StageType) + " is running."
+	case "awaiting_human":
+		return stageLabel(stage.StageType) + " is waiting for input."
+	case "completed":
+		return stageLabel(stage.StageType) + " completed."
+	case "failed":
+		return stageLabel(stage.StageType) + " failed."
+	default:
+		return stageLabel(stage.StageType) + " is " + stage.Status + "."
+	}
+}
+
+func taskPlanView(bundle store.RunBundle, artifacts []ArtifactView) TaskPlanView {
+	byID := map[string]ArtifactView{}
+	for _, artifact := range artifacts {
+		byID[artifact.ID] = artifact
+	}
+	for i := len(bundle.Stages) - 1; i >= 0; i-- {
+		stage := bundle.Stages[i]
+		if stage.TaskPlanArtifactID == "" {
+			continue
+		}
+		view := TaskPlanView{Available: true, StageID: stage.ID, StageLabel: stageLabel(stage.StageType)}
+		if artifact, ok := byID[stage.TaskPlanArtifactID]; ok {
+			view.Artifact = artifact
+		} else {
+			view.Artifact = ArtifactView{ID: stage.TaskPlanArtifactID, Kind: "task_plan"}
+		}
+		return view
+	}
+	fallback := strings.TrimSpace(bundle.Task.Idea)
+	if fallback == "" {
+		fallback = strings.TrimSpace(bundle.Run.Idea)
+	}
+	return TaskPlanView{Fallback: fallback}
+}
+
+func outcomeView(bundle store.RunBundle) OutcomeView {
+	out := OutcomeView{Summary: "Run is " + statusLabel(bundle.Run.Status) + "."}
+	for _, ev := range bundle.Events {
+		view := newEventView(ev)
+		out.LastEvent = &view
+		if strings.HasPrefix(ev.Type, "run.") && ev.Summary != "" {
+			terminalStatus, _ := ev.Data["terminal_status"].(string)
+			if terminalStatus != "" || ev.Type == "run.completed" || ev.Type == "run.failed" || ev.Type == "run.cancelled" {
+				terminal := view
+				out.TerminalEvent = &terminal
+				out.Summary = ev.Summary
+			}
+		}
+	}
+	if out.TerminalEvent == nil && out.LastEvent != nil && out.LastEvent.Event.Summary != "" {
+		out.Summary = out.LastEvent.Event.Summary
+	}
+	return out
+}
+
+func diffLines(preview string) []DiffLineView {
+	if preview == "" {
+		return nil
+	}
+	rawLines := strings.Split(strings.TrimRight(preview, "\n"), "\n")
+	lines := make([]DiffLineView, 0, len(rawLines))
+	for _, line := range rawLines {
+		lines = append(lines, DiffLineView{Text: line, Class: diffLineClass(line)})
+	}
+	return lines
+}
+
+func diffLineClass(line string) string {
+	switch {
+	case strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++"):
+		return "diff-add"
+	case strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---"):
+		return "diff-del"
+	case strings.HasPrefix(line, "diff "), strings.HasPrefix(line, "index "), strings.HasPrefix(line, "@@"), strings.HasPrefix(line, "---"), strings.HasPrefix(line, "+++"):
+		return "diff-meta"
+	default:
+		return ""
+	}
+}
+
+func stageTypeFromEvent(ev event.Event) string {
+	if ev.Data == nil {
+		return ""
+	}
+	stageType, _ := ev.Data["stage_type"].(string)
+	return stageType
+}
+
+func eventFamily(eventType string) string {
+	if i := strings.Index(eventType, "."); i > 0 {
+		return eventType[:i]
+	}
+	return eventType
+}
+
+func stageLabel(stageType string) string {
+	switch stageType {
+	case contract.StageTypeIdeaIntake:
+		return "Idea intake"
+	case contract.StageTypeIdeaRefinement:
+		return "Idea refinement"
+	case contract.StageTypeReview:
+		return "Review"
+	case contract.StageTypeImplementation:
+		return "Implementation"
+	case contract.StageTypeValidation:
+		return "Validation"
+	case contract.StageTypeCommit:
+		return "Commit"
+	case contract.StageTypePRCreation:
+		return "PR creation"
+	case contract.StageTypePRReady:
+		return "PR-ready"
+	case contract.StageTypeMemoryUpdate:
+		return "Memory update"
+	case contract.StageTypeStopReport:
+		return "Stop report"
+	case "":
+		return "Run lifecycle"
+	default:
+		return strings.ReplaceAll(stageType, "_", " ")
+	}
+}
+
+func artifactLabel(kind string) string {
+	switch kind {
+	case "diff_patch":
+		return "Diff patch"
+	case "task_plan":
+		return "Task plan"
+	case "agent_output":
+		return "Agent output"
+	case "stage_brief":
+		return "Stage brief"
+	case "report":
+		return "Run report"
+	case "event_log":
+		return "Event log"
+	default:
+		return strings.ReplaceAll(kind, "_", " ")
+	}
+}
+
+func timeLabel(value string) string {
+	if len(value) >= 16 && value[10] == 'T' {
+		return value[11:16]
+	}
+	return value
+}
+
+func normalizeRunTab(tab string) string {
+	if tab == "review" {
+		return "review"
+	}
+	return "story"
 }
 
 func newArtifactView(artifact store.Artifact) ArtifactView {

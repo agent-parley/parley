@@ -1,0 +1,84 @@
+<section id="review-panel" class="tab-panel review-layout" aria-label="Review">
+  <section class="review-section diff-section" aria-labelledby="diff-heading">
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">Review</p>
+        <h2 id="diff-heading">Diff</h2>
+      </div>
+      <p class="section-note">Escaped text only; long diffs stay collapsed until opened.</p>
+    </div>
+
+    {{if .DiffPatch.ID}}
+    <p class="artifact-meta"><a href="/artifacts/{{.DiffPatch.ID}}">Artifact {{short .DiffPatch.ID}}</a> · {{len .DiffLines}} lines</p>
+      {{if .DiffIsLong}}
+      <details class="diff-disclosure">
+        <summary>Show full diff</summary>
+        <pre class="diff-pre">{{range .DiffLines}}<span class="diff-line {{.Class}}">{{.Text}}</span>
+{{end}}</pre>
+      </details>
+      {{else}}
+      <pre class="diff-pre">{{range .DiffLines}}<span class="diff-line {{.Class}}">{{.Text}}</span>
+{{end}}</pre>
+      {{end}}
+    {{else}}
+    <p class="empty-state">No diff.patch artifact yet.</p>
+    {{end}}
+  </section>
+
+  <aside class="review-side">
+    <section class="review-section" id="artifacts">
+      <h2>Artifacts</h2>
+      {{if .ArtifactViews}}
+      <ul class="artifact-list">
+        {{range .ArtifactViews}}
+        <li>
+          <a class="artifact-open" href="#artifact-{{.ID}}">
+            <span><strong>{{artifactLabel .Kind}}</strong><span class="artifact-kind">{{.MediaType}}</span></span>
+            {{if .DownloadOnly}}<span class="safety-tag small">download only</span>{{end}}
+          </a>
+        </li>
+        {{end}}
+      </ul>
+      {{else}}
+      <p class="empty-state">No artifacts yet.</p>
+      {{end}}
+    </section>
+
+    <section class="review-section pr-ready-panel">
+      <h2>PR-ready</h2>
+      {{if .PRReady.Ready}}
+      <p>Changes are ready for review on <code>{{.PRReady.Branch}}</code>.</p>
+      {{if .PRReady.CommitSHA}}<p class="muted">Commit <code>{{.PRReady.CommitSHA}}</code></p>{{end}}
+      {{if .PRReady.DiffArtifactID}}<p class="muted">Diff artifact <code>{{.PRReady.DiffArtifactID}}</code></p>{{end}}
+      {{else}}
+      <p class="muted">No PR-ready event has been recorded yet.</p>
+      {{end}}
+    </section>
+
+    <section class="review-section safety-note">
+      <h2>Read-only review</h2>
+      <p>The verdict form is intentionally out of scope for this slice.</p>
+    </section>
+  </aside>
+
+  {{range .ArtifactViews}}
+  <div id="artifact-{{.ID}}" class="artifact-modal" role="dialog" aria-modal="true" aria-label="{{artifactLabel .Kind}}">
+    <a class="artifact-modal-backdrop" href="#artifacts" aria-label="Close"></a>
+    <div class="artifact-modal-card">
+      <header class="artifact-modal-head">
+        <div>
+          <strong>{{artifactLabel .Kind}}</strong>
+          <span class="artifact-kind">{{.Kind}} · {{.MediaType}}</span>
+        </div>
+        <a class="modal-close" href="#artifacts" aria-label="Close">×</a>
+      </header>
+      <div class="artifact-modal-body">
+        {{if .DownloadOnly}}
+        <p class="safety-tag">raw HTML is served as a download and is not rendered inline</p>
+        {{else}}{{if .Preview}}<pre class="artifact-preview">{{.Preview}}</pre>{{end}}{{end}}
+        <p class="artifact-meta"><a href="/artifacts/{{.ID}}">Open artifact {{short .ID}}</a></p>
+      </div>
+    </div>
+  </div>
+  {{end}}
+</section>

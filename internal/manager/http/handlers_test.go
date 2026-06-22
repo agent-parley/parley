@@ -14,6 +14,7 @@ import (
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
 	"github.com/agent-parley/parley/internal/shared/contract"
+	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
 
@@ -164,6 +165,115 @@ func TestHandleProjectChatMessagePersistsMessageAndStartsDirectRun(t *testing.T)
 	assertContains(t, body, "Project Chat")
 	assertContains(t, body, "Build chat tracer bullet")
 	assertContains(t, body, "/projects/default/chat/events")
+}
+
+func TestHandleRunDetailRendersStoryReviewDrillIn(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "Render run story <safely>", RefinementLevel: contract.RefinementLevelDirect})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := st.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusCompleted); err != nil {
+		t.Fatalf("update run: %v", err)
+	}
+	if err := st.UpdateStageStatus(ctx, wr.IdeaIntakeStage.ID, "completed"); err != nil {
+		t.Fatalf("update idea stage: %v", err)
+	}
+	if err := st.UpdateStageStatus(ctx, wr.ImplementationStage.ID, "completed"); err != nil {
+		t.Fatalf("update implementation stage: %v", err)
+	}
+	plan, err := st.SaveArtifact(ctx, wr.Run.ID, "task_plan", "text/markdown", []byte("# Plan\n\nKeep <unsafe> text escaped."), ".md")
+	if err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+	if err := st.UpdateStageTaskPlanArtifactID(ctx, wr.IdeaIntakeStage.ID, plan.ID); err != nil {
+		t.Fatalf("link plan: %v", err)
+	}
+	var diff strings.Builder
+	diff.WriteString("diff --git a/file.txt b/file.txt\n")
+	diff.WriteString("@@ -1 +1 @@\n")
+	diff.WriteString("-old line\n")
+	diff.WriteString("+<script>alert(1)</script>\n")
+	for i := 0; i < 82; i++ {
+		diff.WriteString("+generated line\n")
+	}
+	diffArtifact, err := st.SaveArtifact(ctx, wr.Run.ID, "diff_patch", "text/x-diff", []byte(diff.String()), ".patch")
+	if err != nil {
+		t.Fatalf("save diff: %v", err)
+	}
+	if _, err := st.SaveArtifact(ctx, wr.Run.ID, "agent_output", "text/html", []byte("<h1>raw</h1>"), ".html"); err != nil {
+		t.Fatalf("save html artifact: %v", err)
+	}
+	if _, err := st.AppendEvent(ctx, event.Event{
+		SchemaVersion: event.SchemaVersion,
+		ProjectID:     wr.Run.ProjectID,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		Type:          "stage.completed",
+		Actor:         event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"},
+		Summary:       "implementation completed with <unsafe> output",
+		Data:          map[string]any{"stage_id": wr.ImplementationStage.ID, "stage_type": contract.StageTypeImplementation},
+	}); err != nil {
+		t.Fatalf("append stage event: %v", err)
+	}
+	if _, err := st.AppendEvent(ctx, event.Event{
+		SchemaVersion: event.SchemaVersion,
+		ProjectID:     wr.Run.ProjectID,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		Type:          "run.completed",
+		Actor:         event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"},
+		Summary:       "Run stopped at PR-ready",
+		Data:          map[string]any{"terminal_status": store.RunStatusCompleted, "branch": "agent/run-story", "commit_sha": "abc1234", "diff_artifact_id": diffArtifact.ID},
+	}); err != nil {
+		t.Fatalf("append run event: %v", err)
+	}
+
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/projects/default/runs/"+wr.Run.ID+"?tab=review", nil)
+	srv.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET run status = %d want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	assertContains(t, body, "run-page tab-review")
+	assertContains(t, body, "Stage timeline")
+	assertContains(t, body, "Task plan")
+	assertContains(t, body, "Run outcome")
+	assertContains(t, body, "implementation completed with &lt;unsafe&gt; output")
+	assertContains(t, body, "Keep &lt;unsafe&gt; text escaped.")
+	assertContains(t, body, "Show full diff")
+	assertContains(t, body, "&#43;&lt;script&gt;alert(1)&lt;/script&gt;")
+	assertNotContains(t, body, "<script>alert(1)</script>")
+	assertContains(t, body, "Artifacts")
+	assertContains(t, body, "download only")
+	assertContains(t, body, "PR-ready")
+	assertContains(t, body, "agent/run-story")
+	assertContains(t, body, "The verdict form is intentionally out of scope")
+}
+
+func TestDirectRunURLRedirectPreservesTab(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	wr, err := st.CreateWorkflowRun(ctx, "direct run URL")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/runs/"+wr.Run.ID+"?tab=review", nil)
+	srv.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("GET direct run status = %d want %d body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
+	}
+	want := "/projects/default/runs/" + wr.Run.ID + "?tab=review"
+	if got := rec.Header().Get("Location"); got != want {
+		t.Fatalf("Location = %q want %q", got, want)
+	}
 }
 
 func TestHandleRunsRejectsInvalidRefinementLevel(t *testing.T) {

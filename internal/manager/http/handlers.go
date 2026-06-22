@@ -243,7 +243,11 @@ func (s *Server) projectChatData(r *http.Request, project store.Project) (web.Pr
 	if err != nil {
 		return web.ProjectChatData{}, err
 	}
-	return web.ProjectChatData{Project: project, Conversation: conversation, Messages: messages, Tasks: tasks, CSRF: csrfFromContext(r.Context())}, nil
+	runs, err := s.store.ListRunsForProject(r.Context(), project.ID)
+	if err != nil {
+		return web.ProjectChatData{}, err
+	}
+	return web.ProjectChatData{Project: project, Conversation: conversation, Messages: messages, TaskRuns: web.NewTaskRunViews(tasks, runs), CSRF: csrfFromContext(r.Context())}, nil
 }
 
 func (s *Server) broadcastProjectChat(r *http.Request, project store.Project) {
@@ -340,7 +344,11 @@ func (s *Server) handleRunPath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(parts) == 1 {
-		http.Redirect(w, r, projectRunPath(projectID, runID), http.StatusSeeOther)
+		target := projectRunPath(projectID, runID)
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, target, http.StatusSeeOther)
 		return
 	}
 	http.NotFound(w, r)
@@ -356,7 +364,7 @@ func (s *Server) handleRunDetail(w http.ResponseWriter, r *http.Request, project
 		http.NotFound(w, r)
 		return
 	}
-	s.writePage(w, "run.html", web.NewRunData(bundle, csrfFromContext(r.Context()), "Run "+runID))
+	s.writePage(w, "run.html", web.NewRunData(bundle, csrfFromContext(r.Context()), "Run "+runID, r.URL.Query().Get("tab")))
 }
 
 func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request, projectID, runID string) {
