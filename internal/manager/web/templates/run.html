@@ -7,16 +7,18 @@
   <script type="module" src="/assets/datastar.min.js"></script>
   <style>{{template "styles" .}}</style>
 </head>
-<body data-on:load="@get('/projects/{{.View.Project.ID}}/runs/{{.View.Run.ID}}/events', {openWhenHidden: true})">
-  <main>
-    <nav><a href="/projects/{{.View.Project.ID}}">← {{.View.Project.Name}}</a></nav>
+<body class="run-page tab-{{.Tab}}" data-on:load="@get('/projects/{{.View.Project.ID}}/runs/{{.View.Run.ID}}/events', {openWhenHidden: true})">
+  <main class="run-main">
+    <nav class="breadcrumb"><a href="/projects/{{.View.Project.ID}}">← {{.View.Project.Name}}</a></nav>
     {{template "run_summary.html" .View}}
-    <section class="card">
+
+    <section class="card run-controls" aria-label="Run controls">
       <form method="post" action="/projects/{{.View.Project.ID}}/runs/{{.View.Run.ID}}/cancel">
         <input type="hidden" name="_csrf" value="{{.CSRF}}">
         <button type="submit" class="danger">Cancel run</button>
       </form>
     </section>
+
     {{with .View.PendingIdeaQuestions}}
     <section class="card">
       <h2>Deep refinement questions</h2>
@@ -32,10 +34,14 @@
       </form>
     </section>
     {{end}}
-    {{template "stage_statuses.html" .View}}
-    {{template "event_log.html" .View}}
-    {{template "diff_patch.html" .View}}
-    {{template "artifacts.html" .View}}
+
+    <nav class="run-tabs" aria-label="Run detail tabs">
+      <a class="{{if eq .Tab "story"}}active{{end}}" href="/projects/{{.View.Project.ID}}/runs/{{.View.Run.ID}}">Story</a>
+      <a class="{{if eq .Tab "review"}}active{{end}}" href="/projects/{{.View.Project.ID}}/runs/{{.View.Run.ID}}?tab=review">Review</a>
+    </nav>
+
+    {{template "story_panel.html" .View}}
+    {{template "review_panel.html" .View}}
   </main>
 </body>
 </html>

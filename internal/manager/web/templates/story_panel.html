@@ -1,0 +1,70 @@
+<section id="story-panel" class="tab-panel story-layout" aria-label="Run story">
+  <section class="timeline-section" aria-labelledby="timeline-heading">
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">Story</p>
+        <h2 id="timeline-heading">Stage timeline</h2>
+      </div>
+      <p class="section-note">Open a stage to inspect the events that belong to it.</p>
+    </div>
+
+    {{if .StageGroups}}
+    <ol class="stage-timeline">
+      {{range .StageGroups}}
+      <li>
+        <details class="stage-item {{statusClass .Stage.Status}}"{{if .Expanded}} open{{end}}>
+          <summary>
+            <span class="timeline-marker"><span class="status-dot {{statusClass .Stage.Status}}" aria-hidden="true"></span></span>
+            <span class="stage-copy">
+              <span class="stage-title-line"><strong>{{.Label}}</strong><span class="pill {{statusClass .Stage.Status}}">{{statusLabel .Stage.Status}}</span><small>{{.Performer}}</small></span>
+              <span class="stage-outcome">{{.Summary}}</span>
+            </span>
+            <span class="view-more">events</span>
+          </summary>
+          <div class="stage-events">
+            {{if .Events}}
+            <ol class="event-list">
+              {{range .Events}}
+              <li class="event-row">
+                <span class="event-summary-text"><strong>{{.Event.Type}}</strong> — {{.Event.Summary}}</span>
+                <span class="event-meta">#{{.Event.Sequence}} · {{.Event.Actor.Kind}}/{{.Event.Actor.ID}} · {{timeLabel .Event.Timestamp}}</span>
+              </li>
+              {{end}}
+            </ol>
+            {{else}}
+            <p class="empty-state">No events recorded for this stage yet.</p>
+            {{end}}
+          </div>
+        </details>
+      </li>
+      {{end}}
+    </ol>
+    {{else}}
+    <p class="empty-state">No stages have been created for this run yet.</p>
+    {{end}}
+  </section>
+
+  <aside class="story-side" aria-label="Task plan and outcome">
+    <section class="side-panel">
+      <h3>Task plan</h3>
+      <div class="side-panel-body">
+        {{if .TaskPlan.Available}}
+        <p><a href="/artifacts/{{.TaskPlan.Artifact.ID}}">{{artifactLabel .TaskPlan.Artifact.Kind}}</a> from {{.TaskPlan.StageLabel}}</p>
+        {{if .TaskPlan.Artifact.Preview}}<pre class="artifact-preview compact-preview">{{.TaskPlan.Artifact.Preview}}</pre>{{end}}
+        {{else}}
+        <p class="muted">No task-plan artifact yet.</p>
+        {{if .TaskPlan.Fallback}}<p>{{.TaskPlan.Fallback}}</p>{{end}}
+        {{end}}
+      </div>
+    </section>
+
+    <section class="side-panel">
+      <h3>Run outcome</h3>
+      <div class="side-panel-body">
+        <p>{{.Outcome.Summary}}</p>
+        {{with .Outcome.TerminalEvent}}<p class="muted">Terminal event #{{.Event.Sequence}} · {{.Event.Type}}</p>{{end}}
+        {{with .Outcome.LastEvent}}<p class="muted">Latest event #{{.Event.Sequence}} · {{.Event.Type}}</p>{{end}}
+      </div>
+    </section>
+  </aside>
+</section>
