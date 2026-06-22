@@ -886,12 +886,12 @@ func (e *Engine) runWorkflowStage(ctx context.Context, wr store.WorkflowRun, run
 		return e.dispatchStage(ctx, wr, stage, stage.Adapter, templateStage.Type, e.stageDispatchInput(runtime, templateStage, map[string]any{"idea": wr.Run.Idea}))
 	case workflow.StageTypeReview:
 		if templateStage.Actor == workflow.ActorHuman {
-			return e.runHumanStage(ctx, wr, stage, templateStage)
+			return e.runHumanStage(ctx, wr, stage, templateStage, snapshot, snapshotErr)
 		}
 		return e.runReviewStage(ctx, wr, runtime, runtimeStage, lastReport, lastValidationReport, snapshot, snapshotErr)
 	case workflow.StageTypeMemoryUpdate:
 		if templateStage.Actor == workflow.ActorHuman {
-			return e.runHumanStage(ctx, wr, stage, templateStage)
+			return e.runHumanStage(ctx, wr, stage, templateStage, snapshot, snapshotErr)
 		}
 		return e.runMemoryUpdateStage(ctx, wr, runtime, runtimeStage, lastReport)
 	case workflow.StageTypeCommit:
@@ -1270,7 +1270,7 @@ func (e *Engine) runCommitStage(ctx context.Context, wr store.WorkflowRun, stage
 		return report.Report{}, err
 	}
 	if snapshotErr != nil {
-		rep := commitFailureReport(wr, stage, snapshotErr, snapshot.DiffArtifactID)
+		rep := commitFailureReport(wr, stage, snapshotErr, snapshot)
 		return rep, e.completeStage(context.Background(), wr, stage, rep)
 	}
 	branchPolicy := settingString(templateStage.Settings, "branch_policy")
@@ -1298,7 +1298,7 @@ func (e *Engine) runCommitStage(ctx context.Context, wr store.WorkflowRun, stage
 		TargetBranch:   targetBranch,
 	})
 	if err != nil {
-		rep := commitFailureReport(wr, stage, err, snapshot.DiffArtifactID)
+		rep := commitFailureReport(wr, stage, err, snapshot)
 		return rep, e.completeStage(context.Background(), wr, stage, rep)
 	}
 	rep := report.Report{
@@ -1390,7 +1390,7 @@ func (e *Engine) runPRReadyStage(ctx context.Context, wr store.WorkflowRun, stag
 	return rep, nil
 }
 
-func (e *Engine) runHumanStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, templateStage workflow.StageTemplate) (report.Report, error) {
+func (e *Engine) runHumanStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, templateStage workflow.StageTemplate, snapshot workerSnapshot, snapshotErr error) (report.Report, error) {
 	_, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
 	if err != nil {
 		return report.Report{}, err
@@ -1399,7 +1399,7 @@ func (e *Engine) runHumanStage(ctx context.Context, wr store.WorkflowRun, stage 
 	if err := e.startStage(ctx, wr, stage, stage.StageType+" human stage started"); err != nil {
 		return report.Report{}, err
 	}
-	if err := e.suspendForHumanReview(context.Background(), wr, stage, templateStage, briefArtifact); err != nil {
+	if err := e.suspendForHumanReview(context.Background(), wr, stage, templateStage, briefArtifact, snapshot, snapshotErr); err != nil {
 		return report.Report{}, err
 	}
 	return report.Report{}, errRunAwaitingHuman
@@ -1897,7 +1897,25 @@ func dispatchFailedReport(wr store.WorkflowRun, stage store.Stage, adapterName s
 	}
 }
 
-func commitFailureReport(wr store.WorkflowRun, stage store.Stage, err error, diffArtifactID string) report.Report {
+func commitFailureReport(wr store.WorkflowRun, stage store.Stage, err error, snapshot workerSnapshot) report.Report {
+	summary := "commit failed"
+	payload := map[string]any{
+		"diff_artifact_id": snapshot.DiffArtifactID,
+	}
+	if snapshot.BaseSHA != "" {
+		payload["base_sha"] = snapshot.BaseSHA
+	}
+	if snapshot.BaseTreeSHA != "" {
+		payload["base_tree_sha"] = snapshot.BaseTreeSHA
+	}
+	if snapshot.WorkerTreeSHA != "" {
+		payload["worker_tree_sha"] = snapshot.WorkerTreeSHA
+	}
+	var lost worktreeLostOnResumeError
+	if errors.As(err, &lost) {
+		summary = worktreeLostOnResumeSummary
+		payload["failure_reason"] = "worktree_lost_on_restart"
+	}
 	return report.Report{
 		SchemaVersion: report.SchemaVersion,
 		RunID:         wr.Run.ID,
@@ -1907,10 +1925,8 @@ func commitFailureReport(wr store.WorkflowRun, stage store.Stage, err error, dif
 		StageType:     stage.StageType,
 		Actor:         report.Actor{Kind: report.ActorKindHarness, ID: "commit"},
 		Status:        report.StatusFailed,
-		Summary:       "commit failed",
-		Payload: map[string]any{
-			"diff_artifact_id": diffArtifactID,
-		},
+		Summary:       summary,
+		Payload:       payload,
 		Errors: []string{err.Error()},
 	}
 }

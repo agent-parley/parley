@@ -207,7 +207,7 @@ func routingOutcome(stage workflow.StageTemplate, rep report.Report) string {
 	return rep.Status
 }
 
-func (e *Engine) suspendForHumanReview(ctx context.Context, wr store.WorkflowRun, stage store.Stage, templateStage workflow.StageTemplate, briefArtifact store.Artifact) error {
+func (e *Engine) suspendForHumanReview(ctx context.Context, wr store.WorkflowRun, stage store.Stage, templateStage workflow.StageTemplate, briefArtifact store.Artifact, snapshot workerSnapshot, snapshotErr error) error {
 	packet := map[string]any{
 		"schema_version":           report.SchemaVersion,
 		"run_id":                   wr.Run.ID,
@@ -226,6 +226,9 @@ func (e *Engine) suspendForHumanReview(ctx context.Context, wr store.WorkflowRun
 		"human_fix_loops_counted":  false,
 		"submission_endpoint_hint": fmt.Sprintf("/runs/%s/human-stages/%s/verdict", wr.Run.ID, stage.ID),
 	}
+	if snapshotPayload := workerSnapshotPayload(snapshot, snapshotErr); len(snapshotPayload) > 0 {
+		packet["implementation_snapshot"] = snapshotPayload
+	}
 	content, err := json.MarshalIndent(packet, "", "  ")
 	if err != nil {
 		return err
@@ -241,7 +244,7 @@ func (e *Engine) suspendForHumanReview(ctx context.Context, wr store.WorkflowRun
 	if !changed {
 		return nil
 	}
-	_, err = e.emit(ctx, stageEvent(wr, stage, "stage.awaiting_human", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "human review stage awaiting verdict", map[string]any{
+	eventData := map[string]any{
 		"status":                   store.RunStatusAwaitingHuman,
 		"pending_stage_id":         stage.ID,
 		"workflow_stage_id":        templateStage.ID,
@@ -251,6 +254,10 @@ func (e *Engine) suspendForHumanReview(ctx context.Context, wr store.WorkflowRun
 		"human_fix_loops_counted":  false,
 		"runner_slot_released":     true,
 		"submission_endpoint_hint": fmt.Sprintf("/runs/%s/human-stages/%s/verdict", wr.Run.ID, stage.ID),
-	}))
+	}
+	if snapshotPayload := workerSnapshotPayload(snapshot, snapshotErr); len(snapshotPayload) > 0 {
+		eventData["implementation_snapshot"] = snapshotPayload
+	}
+	_, err = e.emit(ctx, stageEvent(wr, stage, "stage.awaiting_human", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "human review stage awaiting verdict", eventData))
 	return err
 }
