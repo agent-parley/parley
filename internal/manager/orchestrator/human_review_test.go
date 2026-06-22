@@ -2,14 +2,18 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/workflow"
+	rworktree "github.com/agent-parley/parley/internal/runner/worktree"
 	"github.com/agent-parley/parley/internal/shared/contract"
+	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
 
@@ -82,6 +86,121 @@ func TestAgentEscalationRoutesToWiredHumanReviewAndDoubleSubmitRejected(t *testi
 		t.Fatal("double submit succeeded")
 	}
 	waitForRunStatus(t, st, runID, store.RunStatusNeedsInput)
+}
+
+func TestResumeAfterHumanCodeReviewWithLostWorktreeFailsCleanly(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	dataRoot := t.TempDir()
+	source := initCommitSourceRepo(t, ctx, map[string]string{"main.go": "package main\n\nfunc main() {}\n"})
+	baseSHA := strings.TrimSpace(string(runCommitGitOutput(t, ctx, source, "rev-parse", "HEAD")))
+	runner := &lostWorktreeResumeRunner{dataRoot: dataRoot, sourceRepo: source, worktreePaths: make(chan string, 1)}
+	firstEngine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{DataRoot: dataRoot})
+	runID, err := firstEngine.StartRunInput(ctx, contract.TaskInput{
+		Idea:               "exercise lost worktree resume",
+		RefinementLevel:    contract.RefinementLevelDirect,
+		WorkflowTemplateID: workflow.CarefulReviewID,
+	})
+	if err != nil {
+		t.Fatalf("StartRunInput() error = %v", err)
+	}
+	waitForRunStatus(t, st, runID, store.RunStatusAwaitingHuman)
+	planStage := stageByWorkflowID(t, st, runID, "plan_review_human")
+	if _, err := firstEngine.SubmitHumanReview(ctx, runID, planStage.ID, HumanReviewSubmission{Verdict: string(report.ReviewVerdictPass), Summary: "plan approved"}); err != nil {
+		t.Fatalf("submit plan review: %v", err)
+	}
+	waitForWorkflowStageAwaiting(t, st, runID, "change_review_human")
+	var worktreePath string
+	select {
+	case worktreePath = <-runner.worktreePaths:
+	case <-time.After(2 * time.Second):
+		t.Fatal("implementation runner did not create a worktree")
+	}
+
+	awaitingEvent := eventByWorkflowStage(t, st, runID, "stage.awaiting_human", "change_review_human")
+	snapshotPayload, ok := awaitingEvent.Data["implementation_snapshot"].(map[string]any)
+	if !ok {
+		t.Fatalf("stage.awaiting_human event missing implementation_snapshot: %#v", awaitingEvent.Data)
+	}
+	if got := payloadString(snapshotPayload, "base_sha"); got != baseSHA {
+		t.Fatalf("event base_sha = %s, want %s", got, baseSHA)
+	}
+	if got := payloadString(snapshotPayload, "diff_artifact_id"); got != "implementation_diff" {
+		t.Fatalf("event diff_artifact_id = %s, want implementation_diff", got)
+	}
+	packetArtifactID, _ := awaitingEvent.Data["human_review_packet_id"].(string)
+	if packetArtifactID == "" {
+		t.Fatalf("stage.awaiting_human event missing packet id: %#v", awaitingEvent.Data)
+	}
+	_, packetContent, err := st.GetArtifact(ctx, packetArtifactID)
+	if err != nil {
+		t.Fatalf("get human packet artifact: %v", err)
+	}
+	var packet map[string]any
+	if err := json.Unmarshal(packetContent, &packet); err != nil {
+		t.Fatalf("decode human packet: %v", err)
+	}
+	packetSnapshot, ok := packet["implementation_snapshot"].(map[string]any)
+	if !ok {
+		t.Fatalf("human packet missing implementation_snapshot: %#v", packet)
+	}
+	if got := payloadString(packetSnapshot, "base_sha"); got != baseSHA {
+		t.Fatalf("packet base_sha = %s, want %s", got, baseSHA)
+	}
+
+	if err := os.RemoveAll(worktreePath); err != nil {
+		t.Fatalf("remove worktree: %v", err)
+	}
+	restartedEngine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{DataRoot: dataRoot})
+	changeStage := stageByWorkflowID(t, st, runID, "change_review_human")
+	if _, err := restartedEngine.SubmitHumanReview(ctx, runID, changeStage.ID, HumanReviewSubmission{Verdict: string(report.ReviewVerdictPass), Summary: "code approved"}); err != nil {
+		t.Fatalf("submit code review: %v", err)
+	}
+	waitForRunStatus(t, st, runID, store.RunStatusFailed)
+
+	commitStage := stageByWorkflowID(t, st, runID, "commit_feature_branch")
+	commitReport, ok, err := restartedEngine.reportForStage(ctx, runID, commitStage.ID)
+	if err != nil {
+		t.Fatalf("read commit report: %v", err)
+	}
+	if !ok {
+		t.Fatal("missing commit report")
+	}
+	if commitReport.Summary != worktreeLostOnResumeSummary {
+		t.Fatalf("commit summary = %q, want %q", commitReport.Summary, worktreeLostOnResumeSummary)
+	}
+	if got := payloadString(commitReport.Payload, "failure_reason"); got != "worktree_lost_on_restart" {
+		t.Fatalf("failure_reason = %s, want worktree_lost_on_restart", got)
+	}
+	if got := payloadString(commitReport.Payload, "base_sha"); got != baseSHA {
+		t.Fatalf("commit base_sha = %s, want %s", got, baseSHA)
+	}
+	if got := payloadString(commitReport.Payload, "diff_artifact_id"); got != "implementation_diff" {
+		t.Fatalf("commit diff_artifact_id = %s, want implementation_diff", got)
+	}
+	if got := payloadString(commitReport.Payload, "commit_sha"); got != "" {
+		t.Fatalf("commit_sha = %s, want empty", got)
+	}
+	if len(commitReport.Errors) == 0 || !strings.Contains(commitReport.Errors[0], worktreeLostOnResumeSummary) {
+		t.Fatalf("commit errors = %#v, want worktree lost message", commitReport.Errors)
+	}
+	agentRefs := strings.TrimSpace(string(runCommitGitOutput(
+		t,
+		ctx,
+		source,
+		"for-each-ref",
+		"--format=%(refname)",
+		"refs/heads/agent",
+	)))
+	if agentRefs != "" {
+		t.Fatalf("unexpected agent branch refs after lost worktree commit:\n%s", agentRefs)
+	}
 }
 
 func TestMalformedHumanReviewRejectedWhileAwaiting(t *testing.T) {
@@ -238,6 +357,25 @@ func hasArtifactKind(t *testing.T, st *store.Store, runID, kind string) bool {
 	return false
 }
 
+func eventByWorkflowStage(t *testing.T, st *store.Store, runID, typ, workflowStageID string) event.Event {
+	t.Helper()
+	events, err := st.ListEvents(ctxBackground(), runID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		ev := events[i]
+		if ev.Type != typ {
+			continue
+		}
+		if got, _ := ev.Data["workflow_stage_id"].(string); got == workflowStageID {
+			return ev
+		}
+	}
+	t.Fatalf("event %s for workflow stage %s not found", typ, workflowStageID)
+	return event.Event{}
+}
+
 type humanTestReviewRunner struct {
 	capturingRunner
 	verdict report.Verdict
@@ -253,6 +391,68 @@ func (r *humanTestReviewRunner) Dispatch(ctx context.Context, disp contract.Disp
 		rep.Payload["arbitration_decisions"] = []any{map[string]any{"finding_id": "finding-1", "classification": report.ReviewFindingAccepted, "rationale": "real issue"}}
 	}
 	return rep, nil
+}
+
+type lostWorktreeResumeRunner struct {
+	dataRoot      string
+	sourceRepo    string
+	worktreePaths chan string
+}
+
+func (r *lostWorktreeResumeRunner) Dispatch(ctx context.Context, disp contract.Dispatch) (report.Report, error) {
+	rep := validAdapterReport(disp, "completed")
+	switch disp.StageType {
+	case contract.StageTypeImplementation:
+		wt, err := rworktree.Create(ctx, rworktree.CreateOptions{
+			DataRoot:   r.dataRoot,
+			ProjectID:  disp.ProjectID,
+			RunID:      disp.RunID,
+			TaskID:     disp.TaskID,
+			AttemptID:  disp.AttemptID,
+			SourceRepo: r.sourceRepo,
+		})
+		if err != nil {
+			rep.Status = report.StatusFailed
+			rep.Summary = "create worktree failed"
+			rep.Errors = []string{err.Error()}
+			return rep, nil
+		}
+		select {
+		case r.worktreePaths <- wt.Path:
+		default:
+		}
+		if err := os.WriteFile(filepath.Join(wt.Path, "main.go"), []byte("package main\n\nfunc main() { println(\"worker\") }\n"), 0o600); err != nil {
+			rep.Status = report.StatusFailed
+			rep.Summary = "write worktree failed"
+			rep.Errors = []string{err.Error()}
+			return rep, nil
+		}
+		rep.Summary = "implemented change"
+		rep.Payload = map[string]any{"diff_artifact_id": "implementation_diff"}
+	case contract.StageTypeReview:
+		switch disp.Input["review_role"] {
+		case contract.ReviewRoleCritic:
+			rep.Summary = "review critic found no issues"
+			rep.Payload = map[string]any{"raw_findings": []any{}}
+		case contract.ReviewRoleArbiter:
+			verdict := report.ReviewVerdictPass
+			rep.Summary = "review passed"
+			rep.Verdict = &verdict
+			rep.Payload = map[string]any{
+				"raw_findings":          disp.Input["raw_findings"],
+				"arbitration_decisions": []any{},
+				"residual_risk":         "low",
+				"confidence":            "high",
+			}
+		}
+	case contract.StageTypeValidation:
+		rep.Summary = "validation passed"
+	}
+	return rep, nil
+}
+
+func (r *lostWorktreeResumeRunner) CancelAttempt(context.Context, string, string, string) error {
+	return nil
 }
 
 func ctxBackground() context.Context { return context.Background() }
