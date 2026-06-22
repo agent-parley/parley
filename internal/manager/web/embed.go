@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html/template"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
@@ -41,11 +42,12 @@ type IndexData struct {
 }
 
 type ProjectChatData struct {
-	Project      store.Project
-	Conversation store.Conversation
-	Messages     []store.Message
-	TaskRuns     []TaskRunView
-	CSRF         string
+	Project              store.Project
+	Conversation         store.Conversation
+	Messages             []store.Message
+	TaskRuns             []TaskRunView
+	IdeaQuestionMessages []ChatIdeaQuestionMessage
+	CSRF                 string
 }
 
 type TaskRunView struct {
@@ -53,6 +55,22 @@ type TaskRunView struct {
 	Run         store.Run
 	HasRun      bool
 	ReviewReady bool
+}
+
+type ChatIdeaQuestionMessage struct {
+	Task      store.Task
+	Run       store.Run
+	StageID   string
+	Round     int
+	MaxRounds int
+	Questions []string
+	CreatedAt string
+
+	AnswerText string
+	Answers    []orchestrator.DeepIdeaAnswer
+	AnsweredAt string
+	Answered   bool
+	Pending    bool
 }
 
 type Notice struct {
@@ -187,6 +205,88 @@ func NewTaskRunViews(tasks []store.Task, runs []store.Run) []TaskRunView {
 		views = append(views, view)
 	}
 	return views
+}
+
+func NewChatIdeaQuestionMessages(bundles []store.RunBundle) []ChatIdeaQuestionMessage {
+	var messages []ChatIdeaQuestionMessage
+	for _, bundle := range bundles {
+		if contract.NormalizeRefinementLevel(bundle.Run.RefinementLevel) != contract.RefinementLevelDeep {
+			continue
+		}
+		rounds := map[int]*ChatIdeaQuestionMessage{}
+		for _, artifact := range bundle.Artifacts {
+			switch artifact.Kind {
+			case "idea_refinement_questions":
+				var packet chatIdeaQuestionPacket
+				if readArtifactJSON(artifact, &packet) != nil || packet.Round <= 0 || len(packet.Questions) == 0 {
+					continue
+				}
+				round := chatIdeaQuestionRound(rounds, packet.Round, bundle)
+				round.StageID = packet.StageID
+				round.MaxRounds = packet.MaxRounds
+				round.Questions = append([]string{}, packet.Questions...)
+				round.CreatedAt = artifact.CreatedAt
+			case "idea_refinement_answers":
+				var packet chatIdeaAnswerPacket
+				if readArtifactJSON(artifact, &packet) != nil || packet.Round <= 0 {
+					continue
+				}
+				round := chatIdeaQuestionRound(rounds, packet.Round, bundle)
+				round.AnswerText = strings.TrimSpace(packet.AnswerText)
+				round.Answers = append([]orchestrator.DeepIdeaAnswer{}, packet.Answers...)
+				round.AnsweredAt = artifact.CreatedAt
+				round.Answered = true
+			}
+		}
+		for _, round := range rounds {
+			if len(round.Questions) == 0 {
+				continue
+			}
+			round.Pending = bundle.Run.Status == store.RunStatusAwaitingHuman && !round.Answered && round.StageID != ""
+			messages = append(messages, *round)
+		}
+	}
+	sort.SliceStable(messages, func(i, j int) bool {
+		left := chatIdeaQuestionMessageTime(messages[i])
+		right := chatIdeaQuestionMessageTime(messages[j])
+		if left == right {
+			return messages[i].Round < messages[j].Round
+		}
+		return left < right
+	})
+	return messages
+}
+
+type chatIdeaQuestionPacket struct {
+	StageID   string   `json:"stage_id"`
+	Round     int      `json:"round"`
+	MaxRounds int      `json:"max_rounds"`
+	Questions []string `json:"questions"`
+}
+
+type chatIdeaAnswerPacket struct {
+	Round      int                           `json:"round"`
+	AnswerText string                        `json:"answer_text,omitempty"`
+	Answers    []orchestrator.DeepIdeaAnswer `json:"answers,omitempty"`
+}
+
+func chatIdeaQuestionRound(rounds map[int]*ChatIdeaQuestionMessage, round int, bundle store.RunBundle) *ChatIdeaQuestionMessage {
+	view := rounds[round]
+	if view == nil {
+		view = &ChatIdeaQuestionMessage{Task: bundle.Task, Run: bundle.Run, Round: round, CreatedAt: bundle.Run.CreatedAt}
+		rounds[round] = view
+	}
+	return view
+}
+
+func chatIdeaQuestionMessageTime(message ChatIdeaQuestionMessage) string {
+	if message.CreatedAt != "" {
+		return message.CreatedAt
+	}
+	if message.AnsweredAt != "" {
+		return message.AnsweredAt
+	}
+	return message.Run.CreatedAt
 }
 
 func NewRunData(bundle store.RunBundle, csrf, title, tab string) RunData {
