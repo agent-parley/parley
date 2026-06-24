@@ -1,0 +1,55 @@
+<section id="project-tasks-overview" class="card tasks-overview">
+  <div class="tasks-overview-head">
+    <h2>Tasks</h2>
+    {{if .Items}}<span class="muted">{{len .Items}} total</span>{{end}}
+  </div>
+  {{if .Items}}
+  <ul class="task-overview-list">
+    {{range .Items}}
+    <li class="task-overview-row {{if .NeedsYou}}needs-you{{end}}" title="stage: {{.CurrentStage}}&#10;last update: {{.LastUpdate}}&#10;performer: {{.Performer}}&#10;runner: {{.Runner}}">
+      <span class="status-dot {{statusClass .Status}}" aria-hidden="true"></span>
+      {{if .NeedsYou}}<span class="needs-you-badge">⚠ needs you: {{.NeedsReason}}</span>{{end}}
+      <a class="task-row-link" href="{{.Link}}">
+        <span class="task-idea">{{.Idea}}</span>
+        <span class="pill {{statusClass .Status}}">{{statusLabel .Status}}</span>
+        <span aria-hidden="true">→</span>
+      </a>
+      <a class="task-info-link" href="#{{.DetailID}}" aria-label="Details for {{.Idea}}">(i)</a>
+    </li>
+    {{end}}
+  </ul>
+  {{range .Items}}
+  <div id="{{.DetailID}}" class="artifact-modal task-detail-modal" role="dialog" aria-modal="true" aria-label="Task detail">
+    <a class="artifact-modal-backdrop" href="#project-tasks-overview" aria-label="Close"></a>
+    <div class="artifact-modal-card">
+      <header class="artifact-modal-head">
+        <div>
+          <strong>{{.Idea}}</strong>
+          <span class="artifact-kind">{{.CurrentStage}} · {{statusLabel .Status}}</span>
+        </div>
+        <a class="modal-close" href="#project-tasks-overview" aria-label="Close">×</a>
+      </header>
+      <div class="artifact-modal-body">
+        {{if .NeedsYou}}<p><span class="needs-you-badge">⚠ needs you: {{.NeedsReason}}</span></p>{{end}}
+        <dl class="task-detail-grid">
+          <div><dt>Current stage</dt><dd>{{.CurrentStage}}</dd></div>
+          <div><dt>Last update</dt><dd>{{.LastUpdate}}</dd></div>
+          <div><dt>Performer</dt><dd>{{.Performer}}</dd></div>
+          <div><dt>Runner</dt><dd>{{.Runner}}</dd></div>
+        </dl>
+        {{if .StartQueued}}
+        <p class="muted">waiting for a free runner slot · manual start required</p>
+        <form class="inline-form" method="post" action="/projects/{{$.Project.ID}}/runs/{{.Run.ID}}/start">
+          <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+          <button type="submit">Start queued run</button>
+        </form>
+        {{end}}
+        <p class="artifact-meta"><a href="{{.Link}}">Open Run-story →</a></p>
+      </div>
+    </div>
+  </div>
+  {{end}}
+  {{else}}
+  <p class="empty-state">No tasks yet.</p>
+  {{end}}
+</section>

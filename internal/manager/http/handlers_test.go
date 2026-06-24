@@ -168,7 +168,7 @@ func TestHandleProjectChatMessagePersistsMessageAndStartsDirectRun(t *testing.T)
 	assertContains(t, body, "/projects/default/chat/events")
 }
 
-func TestProjectChatRendersReadyForReviewCard(t *testing.T) {
+func TestProjectHomeRendersReadyForReviewInTasksOverview(t *testing.T) {
 	ctx := context.Background()
 	st := openRouteTestStore(t)
 	conversation, err := st.EnsureProjectConversation(ctx, store.DefaultProjectID)
@@ -183,9 +183,77 @@ func TestProjectChatRendersReadyForReviewCard(t *testing.T) {
 
 	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
 	body := getIndexBody(t, srv)
-	assertContains(t, body, "ready for review →")
+	assertContains(t, body, "Tasks")
+	assertContains(t, body, "⚠ needs you: diff ready")
 	assertContains(t, body, "/projects/default/runs/"+wr.Run.ID+"?tab=review")
 	assertContains(t, body, "Review from chat")
+	assertNotContains(t, body, "Tasks started from this chat")
+}
+
+func TestProjectTasksOverviewOrderingNeedsYouBadgeAndProjectsCount(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+
+	completed, err := st.CreateWorkflowRun(ctx, "zzz recent completed")
+	if err != nil {
+		t.Fatalf("create completed run: %v", err)
+	}
+	if err := st.UpdateRunStatus(ctx, completed.Run.ID, store.RunStatusCompleted); err != nil {
+		t.Fatalf("mark completed: %v", err)
+	}
+	running, err := st.CreateWorkflowRun(ctx, "mmm active running")
+	if err != nil {
+		t.Fatalf("create running run: %v", err)
+	}
+	if err := st.UpdateRunStatus(ctx, running.Run.ID, store.RunStatusRunning); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	question, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "aaa question pending", RefinementLevel: contract.RefinementLevelDeep})
+	if err != nil {
+		t.Fatalf("create question run: %v", err)
+	}
+	if err := st.UpdateRunStatus(ctx, question.Run.ID, store.RunStatusAwaitingHuman); err != nil {
+		t.Fatalf("mark question awaiting: %v", err)
+	}
+	if err := st.UpdateStageStatus(ctx, question.IdeaIntakeStage.ID, store.StageStatusRunning); err != nil {
+		t.Fatalf("mark question stage running: %v", err)
+	}
+	questions := `{"stage_id":"` + question.IdeaIntakeStage.ID + `","round":1,"max_rounds":2,"questions":["Which queue should own retries?"]}`
+	if _, err := st.SaveArtifact(ctx, question.Run.ID, "idea_refinement_questions", "application/json", []byte(questions), ".json"); err != nil {
+		t.Fatalf("save question artifact: %v", err)
+	}
+	review, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "bbb diff ready", WorkflowTemplateID: workflow.CarefulReviewID})
+	if err != nil {
+		t.Fatalf("create review run: %v", err)
+	}
+	markAwaitingHumanReview(t, st, review)
+
+	if _, err := st.EnsureProject(ctx, store.ProjectSpec{ID: "other", Name: "Other project", WorkspacePath: t.TempDir(), QueueAutoWhenReady: true, QueueMaxConcurrent: 1, QueueBacklogCap: 10}); err != nil {
+		t.Fatalf("ensure other project: %v", err)
+	}
+	other, err := st.CreateWorkflowRunForProjectInput(ctx, "other", contract.TaskInput{Idea: "other project review", WorkflowTemplateID: workflow.CarefulReviewID})
+	if err != nil {
+		t.Fatalf("create other project run: %v", err)
+	}
+	markAwaitingHumanReview(t, st, other)
+
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	body := getIndexBody(t, srv)
+	assertContains(t, body, "id=\"project-tasks-overview\"")
+	assertContains(t, body, "⚠ needs you: question pending")
+	assertContains(t, body, "⚠ needs you: diff ready")
+	assertContains(t, body, "/projects/default/runs/"+question.Run.ID)
+	assertContains(t, body, "/projects/default/runs/"+review.Run.ID+"?tab=review")
+	assertBefore(t, body, "aaa question pending", "mmm active running")
+	assertBefore(t, body, "bbb diff ready", "mmm active running")
+	assertBefore(t, body, "mmm active running", "zzz recent completed")
+
+	projectsBody := getProjectsBody(t, srv)
+	assertContains(t, projectsBody, "Cross-project needs-you count: <strong>3</strong>")
+	assertContains(t, projectsBody, "Default project")
+	assertContains(t, projectsBody, "⚠ 2 needs you")
+	assertContains(t, projectsBody, "Other project")
+	assertContains(t, projectsBody, "⚠ 1 needs you")
 }
 
 func TestHandleProjectChatMessagePassesRefinementLevel(t *testing.T) {
@@ -827,6 +895,17 @@ func getIndexBody(t *testing.T, srv *Server) string {
 	return rec.Body.String()
 }
 
+func getProjectsBody(t *testing.T, srv *Server) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/projects", nil)
+	srv.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /projects status = %d want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	return rec.Body.String()
+}
+
 func postForm(t *testing.T, srv *Server, path string, cookie *http.Cookie, form url.Values) *httptest.ResponseRecorder {
 	t.Helper()
 	rec := httptest.NewRecorder()
@@ -848,5 +927,14 @@ func assertNotContains(t *testing.T, body, unwanted string) {
 	t.Helper()
 	if strings.Contains(body, unwanted) {
 		t.Fatalf("body unexpectedly contains %q:\n%s", unwanted, body)
+	}
+}
+
+func assertBefore(t *testing.T, body, first, second string) {
+	t.Helper()
+	firstIndex := strings.Index(body, first)
+	secondIndex := strings.Index(body, second)
+	if firstIndex < 0 || secondIndex < 0 || firstIndex >= secondIndex {
+		t.Fatalf("body order want %q before %q (indexes %d, %d):\n%s", first, second, firstIndex, secondIndex, body)
 	}
 }
