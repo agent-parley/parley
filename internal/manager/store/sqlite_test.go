@@ -155,19 +155,19 @@ func TestConversationMessagesPersistAndTasksLink(t *testing.T) {
 	}
 }
 
-func TestRunPersistsRefinementLevelAndStageCanReferenceTaskPlanArtifact(t *testing.T) {
+func TestRunCoercesLegacyRefinementLevelAndStageCanReferenceTaskPlanArtifact(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	defer st.Close()
-	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "build context", RefinementLevel: contract.RefinementLevelDeep})
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "build context", RefinementLevel: "deep"})
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
-	if wr.Run.RefinementLevel != contract.RefinementLevelDeep || wr.Task.RefinementLevel != contract.RefinementLevelDeep {
-		t.Fatalf("refinement not persisted on create: run=%q task=%q", wr.Run.RefinementLevel, wr.Task.RefinementLevel)
+	if wr.Run.RefinementLevel != contract.RefinementLevelStandard || wr.Task.RefinementLevel != contract.RefinementLevelStandard {
+		t.Fatalf("refinement not coerced on create: run=%q task=%q", wr.Run.RefinementLevel, wr.Task.RefinementLevel)
 	}
 	artifact, err := st.SaveArtifact(ctx, wr.Run.ID, "task_plan", "text/markdown", []byte("# Task Plan\n"), ".md")
 	if err != nil {
@@ -180,8 +180,8 @@ func TestRunPersistsRefinementLevelAndStageCanReferenceTaskPlanArtifact(t *testi
 	if err != nil {
 		t.Fatalf("get workflow run: %v", err)
 	}
-	if loaded.Run.RefinementLevel != contract.RefinementLevelDeep || loaded.Task.RefinementLevel != contract.RefinementLevelDeep {
-		t.Fatalf("refinement not loaded: run=%q task=%q", loaded.Run.RefinementLevel, loaded.Task.RefinementLevel)
+	if loaded.Run.RefinementLevel != contract.RefinementLevelStandard || loaded.Task.RefinementLevel != contract.RefinementLevelStandard {
+		t.Fatalf("refinement not loaded as standard: run=%q task=%q", loaded.Run.RefinementLevel, loaded.Task.RefinementLevel)
 	}
 	if loaded.IdeaIntakeStage.TaskPlanArtifactID != artifact.ID {
 		t.Fatalf("task plan ref = %s, want %s", loaded.IdeaIntakeStage.TaskPlanArtifactID, artifact.ID)

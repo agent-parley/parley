@@ -20,22 +20,6 @@
       </form>
     </section>
 
-    {{with .View.PendingIdeaQuestions}}
-    <section class="card">
-      <h2>Deep refinement questions</h2>
-      <p class="muted">Round {{.Round}} of {{.MaxRounds}}</p>
-      <ul>
-        {{range .Questions}}<li>{{.}}</li>{{end}}
-      </ul>
-      <form method="post" action="/projects/{{$.View.Project.ID}}/runs/{{$.View.Run.ID}}/idea-stages/{{.StageID}}/answers">
-        <input type="hidden" name="_csrf" value="{{$.CSRF}}">
-        <label for="answer_text">Answers</label>
-        <textarea id="answer_text" name="answer_text" required rows="5" placeholder="Answer the planner's questions. Parley will re-dispatch the planner with this context."></textarea>
-        <button type="submit">Resume deep refinement</button>
-      </form>
-    </section>
-    {{end}}
-
     <nav class="run-tabs" aria-label="Run detail tabs">
       <a class="{{if eq .Tab "story"}}active{{end}}" href="/projects/{{.View.Project.ID}}/runs/{{.View.Run.ID}}">Story</a>
       <a class="{{if eq .Tab "review"}}active{{end}}" href="/projects/{{.View.Project.ID}}/runs/{{.View.Run.ID}}?tab=review">Review</a>

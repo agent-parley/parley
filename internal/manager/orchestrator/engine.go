@@ -968,8 +968,6 @@ func (e *Engine) runIdeaIntakeStage(ctx context.Context, wr store.WorkflowRun, s
 	switch contract.NormalizeRefinementLevel(wr.Run.RefinementLevel) {
 	case contract.RefinementLevelStandard:
 		return e.runStandardIdeaPlanningStage(ctx, wr, stage, template, contractMarkdown, contractArtifact.ID, briefMarkdown, briefArtifact.ID)
-	case contract.RefinementLevelDeep:
-		return e.runDeepIdeaPlanningStage(ctx, wr, stage, template, contractMarkdown, contractArtifact.ID, briefMarkdown, briefArtifact.ID, true)
 	}
 	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
 		return report.Report{}, err
@@ -1029,91 +1027,6 @@ func (e *Engine) runStandardIdeaPlanningStage(ctx context.Context, wr store.Work
 	return e.completeIdeaIntakeWithPlan(ctx, wr, stage, template, contractArtifactID, normalizePlannerTaskPlan(payloadString(plannerReport.Payload, "task_plan_markdown")), actor, "planner agent refined the idea into a task plan and frozen workflow snapshot")
 }
 
-func (e *Engine) runDeepIdeaPlanningStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, template workflow.Template, contractMarkdown, contractArtifactID, briefMarkdown, briefArtifactID string, emitStageStart bool) (report.Report, error) {
-	if err := e.store.UpdateStageAdapter(ctx, stage.ID, e.planningAdapter); err != nil {
-		return report.Report{}, err
-	}
-	stage.Adapter = e.planningAdapter
-	conversation, err := e.deepIdeaConversation(ctx, wr.Run.ID)
-	if err != nil {
-		return report.Report{}, err
-	}
-	answeredRounds := conversation.answeredRounds()
-	questionsRemaining := defaultDeepIdeaMaxQuestionRounds - answeredRounds
-	if questionsRemaining < 0 {
-		questionsRemaining = 0
-	}
-	forceFinalPlan := questionsRemaining == 0
-	e.setActiveStage(wr.Run.ID, stage)
-	defer e.clearActiveStage(wr.Run.ID, stage.ID)
-	if emitStageStart {
-		if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
-			return report.Report{}, err
-		}
-	}
-	templateStage := plannerTemplateStage(template, stage)
-	input := e.stageDispatchInput(runtimeWorkflow{Template: template}, templateStage, map[string]any{
-		"input_mode":                contract.AdapterInputModePlanning,
-		"idea":                      wr.Run.Idea,
-		"refinement_level":          contract.RefinementLevelDeep,
-		"contract_markdown":         contractMarkdown,
-		"task_contract_artifact_id": contractArtifactID,
-		"question_round":            answeredRounds + 1,
-		"max_question_rounds":       defaultDeepIdeaMaxQuestionRounds,
-		"questions_remaining":       questionsRemaining,
-		"answers_so_far":            conversation.dispatchHistory(),
-		"force_final_plan":          forceFinalPlan,
-	})
-	input = withStageBriefInput(input, briefMarkdown, briefArtifactID)
-	disp := contract.Dispatch{
-		ProjectID:    wr.Run.ProjectID,
-		RepositoryID: wr.Task.RepositoryID,
-		RunID:        wr.Run.ID,
-		TaskID:       wr.Task.ID,
-		AttemptID:    wr.Attempt.ID,
-		StageID:      stage.ID,
-		StageType:    stage.StageType,
-		Adapter:      e.planningAdapter,
-		Input:        input,
-	}
-	plannerReport, err := e.dispatchWithReportRepair(ctx, wr, stage, disp, reportRepairOptions{
-		AdapterName:   e.planningAdapter,
-		StageType:     stage.StageType,
-		EmitLifecycle: e.planningAdapter != "",
-		LifecycleData: map[string]any{"adapter": e.planningAdapter, "input_mode": contract.AdapterInputModePlanning, "refinement_level": contract.RefinementLevelDeep, "question_round": answeredRounds + 1, "questions_remaining": questionsRemaining, "force_final_plan": forceFinalPlan},
-		Validator:     deepPlanningReportValidator(wr, stage, e.planningAdapter, questionsRemaining),
-	})
-	if err != nil {
-		return report.Report{}, err
-	}
-	if plannerReport.Status == report.StatusNeedsInput {
-		questions := deepPlannerQuestions(plannerReport.Payload)
-		if questionsRemaining <= 0 {
-			actor := plannerReport.Actor
-			if actor.Kind == "" {
-				actor = report.Actor{Kind: report.ActorKindAgent, ID: e.planningAdapter}
-			}
-			plan := exhaustedDeepTaskPlan(wr, conversation, questions)
-			return e.completeIdeaIntakeWithPlan(ctx, wr, stage, template, contractArtifactID, plan, actor, "deep planner exhausted question budget; produced task plan with stated assumptions")
-		}
-		if err := e.suspendForDeepIdeaAnswers(context.Background(), wr, stage, templateStage, plannerReport, questions, contractArtifactID, briefArtifactID, answeredRounds+1, defaultDeepIdeaMaxQuestionRounds); err != nil {
-			return report.Report{}, err
-		}
-		return report.Report{}, errRunAwaitingHuman
-	}
-	if plannerReport.Status != report.StatusCompleted {
-		if err := e.completeStage(context.Background(), wr, stage, plannerReport); err != nil {
-			return report.Report{}, err
-		}
-		return plannerReport, nil
-	}
-	actor := plannerReport.Actor
-	if actor.Kind == "" {
-		actor = report.Actor{Kind: report.ActorKindAgent, ID: e.planningAdapter}
-	}
-	return e.completeIdeaIntakeWithPlan(ctx, wr, stage, template, contractArtifactID, normalizePlannerTaskPlan(payloadString(plannerReport.Payload, "task_plan_markdown")), actor, "deep planner refined the idea into a task plan and frozen workflow snapshot")
-}
-
 func plannerTemplateStage(template workflow.Template, stage store.Stage) workflow.StageTemplate {
 	for _, templateStage := range template.Stages {
 		if templateStage.ID == stage.WorkflowStageID {
@@ -1144,29 +1057,6 @@ func planningReportValidator(wr store.WorkflowRun, stage store.Stage, adapterNam
 		plan := payloadString(validated.Payload, "task_plan_markdown")
 		if err := validatePlannerTaskPlan(plan); err != nil {
 			return invalidAdapterReport(wr, stage, adapterName, "planner returned invalid task plan", validated, err), err
-		}
-		return validated, nil
-	}
-}
-
-func deepPlanningReportValidator(wr store.WorkflowRun, stage store.Stage, adapterName string, questionsRemaining int) reportRepairValidator {
-	base := baseReportValidator(wr, stage, stage.StageType, adapterName)
-	return func(rep report.Report) (report.Report, error) {
-		validated, err := base(rep)
-		if err != nil {
-			return validated, err
-		}
-		switch validated.Status {
-		case report.StatusCompleted:
-			plan := payloadString(validated.Payload, "task_plan_markdown")
-			if err := validatePlannerTaskPlan(plan); err != nil {
-				return invalidAdapterReport(wr, stage, adapterName, "planner returned invalid task plan", validated, err), err
-			}
-		case report.StatusNeedsInput:
-			if questionsRemaining > 0 && len(deepPlannerQuestions(validated.Payload)) == 0 {
-				err := fmt.Errorf("payload.questions is required when deep idea intake returns needs_input")
-				return invalidAdapterReport(wr, stage, adapterName, "planner returned invalid clarifying questions", validated, err), err
-			}
 		}
 		return validated, nil
 	}
@@ -1756,9 +1646,6 @@ func notificationClassForEvent(ev event.Event) (string, bool) {
 		if stageType != "" && stageType != contract.StageTypeReview {
 			return "", false
 		}
-		if _, ok := ev.Data["questions_artifact_id"]; ok {
-			return "", false
-		}
 		return store.NotificationClassNeedsYou, true
 	case "run.completed":
 		return store.NotificationClassFinished, true
@@ -1910,23 +1797,6 @@ func taskPlanMarkdown(wr store.WorkflowRun) string {
 		b.WriteString("- Preserve the idea as the implementation prompt.\n")
 		b.WriteString("- Make the smallest coherent code and test changes needed for the request.\n")
 		b.WriteString("- Validate the touched path with the narrowest meaningful build or test command.\n")
-	case contract.RefinementLevelDeep:
-		b.WriteString("## Deep Plan\n\n")
-		b.WriteString("### Scope\n\n")
-		b.WriteString("- Treat the submitted idea as the authoritative task statement.\n")
-		b.WriteString("- Identify affected behavior before editing, then keep changes inside that boundary.\n")
-		b.WriteString("- Preserve existing project conventions unless the task explicitly requires a change.\n\n")
-		b.WriteString("### Implementation Approach\n\n")
-		b.WriteString("- Inspect the current code path and tests that own the requested behavior.\n")
-		b.WriteString("- Make a narrow vertical change that produces observable behavior, not only internal scaffolding.\n")
-		b.WriteString("- Add or update focused tests for the new behavior and any regression-prone edge cases.\n")
-		b.WriteString("- Keep generated artifacts in the project workspace; do not write planning material into the repository unless requested.\n\n")
-		b.WriteString("### Risks And Checks\n\n")
-		b.WriteString("- Watch for hidden coupling with persistence, event payloads, and stage routing.\n")
-		b.WriteString("- Prefer additive schema changes with migration defaults when persisted state is touched.\n")
-		b.WriteString("- Run build, vet, and targeted tests before handoff.\n\n")
-		b.WriteString("### Open Questions\n\n")
-		b.WriteString("- None are blocking for execution; unresolved details should be documented in the handoff or issue tracker.\n")
 	default:
 		b.WriteString("## Standard Plan\n\n")
 		b.WriteString("### Scope\n\n")

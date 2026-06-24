@@ -91,8 +91,8 @@ func TestNotificationDispatcherRespectsTogglesAndExcludesNonSubscribedEvents(t *
 	sink := &capturingNotificationSink{}
 	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{NotificationSinks: []NotificationSink{sink}})
 
-	if _, err := engine.emit(ctx, deepIdeaAwaitingEvent(wr)); err != nil {
-		t.Fatalf("emit deep idea awaiting human: %v", err)
+	if _, err := engine.emit(ctx, nonReviewAwaitingEvent(wr)); err != nil {
+		t.Fatalf("emit non-review awaiting human: %v", err)
 	}
 	if _, err := st.UpdateProjectNotificationPreferences(ctx, wr.Project.ID, store.ProjectNotificationPreferences{OnlyWhenNeeded: false, WhenFinished: true}); err != nil {
 		t.Fatalf("disable needed notifications: %v", err)
@@ -132,8 +132,8 @@ func reviewAwaitingEvent(wr store.WorkflowRun) event.Event {
 	return event.Event{SchemaVersion: event.SchemaVersion, ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, Type: "stage.awaiting_human", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "awaiting verdict", Data: map[string]any{"stage_type": contract.StageTypeReview}}
 }
 
-func deepIdeaAwaitingEvent(wr store.WorkflowRun) event.Event {
-	return event.Event{SchemaVersion: event.SchemaVersion, ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, Type: "stage.awaiting_human", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "deep idea refinement awaiting answers", Data: map[string]any{"stage_type": contract.StageTypeIdeaRefinement, "questions_artifact_id": "art_questions"}}
+func nonReviewAwaitingEvent(wr store.WorkflowRun) event.Event {
+	return event.Event{SchemaVersion: event.SchemaVersion, ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, Type: "stage.awaiting_human", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "non-review stage awaiting human input", Data: map[string]any{"stage_type": contract.StageTypeMemoryUpdate}}
 }
 
 func TestDispatchStagePersistsStageBriefAndPassesItToRunner(t *testing.T) {

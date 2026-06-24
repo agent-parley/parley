@@ -244,7 +244,7 @@ func semanticPlannerTestPlan(wr store.WorkflowRun) string {
 		"## Validation\n\n- Run focused authentication package tests.\n"
 }
 
-func TestTaskPlanMarkdownSupportsThreeRefinementLevels(t *testing.T) {
+func TestTaskPlanMarkdownSupportsDirectAndStandardRefinementLevels(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
 	if err != nil {
@@ -258,7 +258,6 @@ func TestTaskPlanMarkdownSupportsThreeRefinementLevels(t *testing.T) {
 	}{
 		{contract.RefinementLevelDirect, "## Direct Plan"},
 		{contract.RefinementLevelStandard, "## Standard Plan"},
-		{contract.RefinementLevelDeep, "## Deep Plan"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.level, func(t *testing.T) {

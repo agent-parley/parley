@@ -1,6 +1,37 @@
 package contract
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestNormalizeRefinementLevelCoercesLegacyValueToStandard(t *testing.T) {
+	cases := map[string]string{
+		"":         RefinementLevelStandard,
+		"standard": RefinementLevelStandard,
+		"direct":   RefinementLevelDirect,
+		"deep":     RefinementLevelStandard,
+		" DEEP ":   RefinementLevelStandard,
+	}
+	for input, want := range cases {
+		if got := NormalizeRefinementLevel(input); got != want {
+			t.Fatalf("NormalizeRefinementLevel(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestValidateRefinementLevelAllowsOnlyDirectAndStandardVocabulary(t *testing.T) {
+	if err := ValidateRefinementLevel("deep"); err != nil {
+		t.Fatalf("legacy deep should coerce to standard: %v", err)
+	}
+	err := ValidateRefinementLevel("max")
+	if err == nil {
+		t.Fatal("invalid refinement level accepted")
+	}
+	if strings.Contains(err.Error(), "deep") || !strings.Contains(err.Error(), RefinementLevelDirect) || !strings.Contains(err.Error(), RefinementLevelStandard) {
+		t.Fatalf("validation error = %q, want direct/standard only", err.Error())
+	}
+}
 
 func TestReviewProfileDefaultsAreClosedV1Set(t *testing.T) {
 	profiles := ReviewProfileDefaults()
