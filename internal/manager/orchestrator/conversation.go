@@ -63,13 +63,20 @@ func (e *Engine) conversationDispatchInput(ctx context.Context, project store.Pr
 	if err != nil {
 		return nil, err
 	}
+	orchestrationState, orchestrationSummary, orchestrationMarkdown, err := e.conversationOrchestrationEvidence(ctx, project.ID, conversation.ID)
+	if err != nil {
+		return nil, err
+	}
 	input := map[string]any{
-		"input_mode":         contract.AdapterInputModeConversation,
-		"agent_role":         conversationalPlanningAgentRole,
-		"conversation_id":    conversation.ID,
-		"conversation_title": conversation.Title,
-		"trigger_message_id": triggerMessageID,
-		"messages":           history,
+		"input_mode":                   contract.AdapterInputModeConversation,
+		"agent_role":                   conversationalPlanningAgentRole,
+		"conversation_id":              conversation.ID,
+		"conversation_title":           conversation.Title,
+		"trigger_message_id":           triggerMessageID,
+		"messages":                     history,
+		"orchestration_state":          orchestrationState,
+		"orchestration_state_summary":  orchestrationSummary,
+		"orchestration_state_markdown": orchestrationMarkdown,
 		"project": map[string]any{
 			"id":          project.ID,
 			"name":        project.Name,
