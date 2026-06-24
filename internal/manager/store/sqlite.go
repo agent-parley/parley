@@ -47,8 +47,9 @@ const (
 	RunnerOriginSpawned    = "spawned"
 	RunnerOriginRegistered = "registered"
 
-	MessageRoleUser   = "user"
-	MessageRoleSystem = "system"
+	MessageRoleUser      = "user"
+	MessageRoleAssistant = "assistant"
+	MessageRoleSystem    = "system"
 
 	ProjectMemoryKindLesson                 = "lesson"
 	ProjectMemoryKindRepoFact               = "repo_fact"

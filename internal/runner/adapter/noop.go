@@ -17,6 +17,9 @@ type Noop struct{}
 func (Noop) Name() string { return "noop" }
 
 func (Noop) Run(ctx context.Context, disp contract.Dispatch, sink runnerio.Sink) (report.Report, error) {
+	if disp.StageType == contract.StageTypeConversation || (disp.Input != nil && disp.Input["input_mode"] == contract.AdapterInputModeConversation) {
+		return noopConversationReport(disp), nil
+	}
 	if err := sink.Emit(ctx, progressEvent(disp, "noop adapter started", map[string]any{"step": "start"})); err != nil {
 		return report.Report{}, err
 	}
@@ -79,6 +82,24 @@ func (Noop) Run(ctx context.Context, disp contract.Dispatch, sink runnerio.Sink)
 		Payload:       payload,
 		Errors:        []string{},
 	}, nil
+}
+
+func noopConversationReport(disp contract.Dispatch) report.Report {
+	return report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         disp.RunID,
+		TaskID:        disp.TaskID,
+		AttemptID:     disp.AttemptID,
+		StageID:       disp.StageID,
+		StageType:     disp.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: "noop"},
+		Status:        report.StatusCompleted,
+		Summary:       "noop conversational reply",
+		Payload: map[string]any{
+			"reply_markdown": "I received your message. The noop adapter does not inspect repository content; configure the Pi adapter for repo-aware conversation turns.",
+		},
+		Errors: []string{},
+	}
 }
 
 func noopTaskPlanMarkdown(disp contract.Dispatch) string {

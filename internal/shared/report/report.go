@@ -110,7 +110,8 @@ func validStageType(v string) bool {
 		contract.StageTypePRCreation,
 		contract.StageTypePRReady,
 		contract.StageTypeMemoryUpdate,
-		contract.StageTypeStopReport:
+		contract.StageTypeStopReport,
+		contract.StageTypeConversation:
 		return true
 	default:
 		return false

@@ -89,6 +89,7 @@ type Engine struct {
 	gate                  func(context.Context, store.Run) (bool, error)
 	implementationAdapter string
 	planningAdapter       string
+	conversationAdapter   string
 	validationAdapter     string
 	dataRoot              string
 	projectID             string
@@ -101,6 +102,7 @@ type Engine struct {
 type EngineOptions struct {
 	ImplementationAdapter string
 	PlanningAdapter       string
+	ConversationAdapter   string
 	ValidationAdapter     string
 	DataRoot              string
 	ProjectID             string
@@ -149,6 +151,10 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 	if planningAdapter == "" {
 		planningAdapter = implementationAdapter
 	}
+	conversationAdapter := opts.ConversationAdapter
+	if conversationAdapter == "" {
+		conversationAdapter = planningAdapter
+	}
 	validationAdapter := opts.ValidationAdapter
 	if validationAdapter == "" {
 		validationAdapter = "validation"
@@ -192,6 +198,7 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 		runnerSlots:           runnerSlots,
 		implementationAdapter: implementationAdapter,
 		planningAdapter:       planningAdapter,
+		conversationAdapter:   conversationAdapter,
 		validationAdapter:     validationAdapter,
 		dataRoot:              dataRoot,
 		projectID:             projectID,

@@ -1,6 +1,6 @@
 <section id="project-chat" class="card chat-pane">
   <h2>Project Chat</h2>
-  <p class="muted">Messages here are persisted project dialogue. Sending an idea starts a task run linked to this chat.</p>
+  <p class="muted">Messages here are persisted project dialogue. Ask about the project or repository; Parley replies in this chat.</p>
   <div class="chat-thread" aria-live="polite">
     {{if or .Messages .IdeaQuestionMessages}}
     <ol class="messages">
@@ -49,19 +49,13 @@
       {{end}}
     </ol>
     {{else}}
-    <p class="muted">No messages yet. Start with the change you want Parley to make.</p>
+    <p class="muted">No messages yet. Ask about the project or repository.</p>
     {{end}}
   </div>
   <form method="post" action="/projects/{{.Project.ID}}/chat/messages">
     <input type="hidden" name="_csrf" value="{{.CSRF}}">
-    <label for="chat-message">Idea</label>
-    <textarea id="chat-message" name="message" required rows="4" placeholder="Describe the task you want Parley to run."></textarea>
-    <label for="chat-refinement-level">Refinement</label>
-    <select id="chat-refinement-level" name="refinement_level">
-      <option value="direct">Direct</option>
-      <option value="standard" selected>Standard</option>
-      <option value="deep">Deep</option>
-    </select>
-    <button type="submit">Send idea</button>
+    <label for="chat-message">Message</label>
+    <textarea id="chat-message" name="message" required rows="4" placeholder="Ask what the repo does, where something lives, or talk through a design."></textarea>
+    <button type="submit">Send message</button>
   </form>
 </section>

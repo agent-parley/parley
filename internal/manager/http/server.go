@@ -16,6 +16,7 @@ import (
 type RunController interface {
 	StartProjectRun(context.Context, string, string) (string, error)
 	StartProjectRunInput(context.Context, string, contract.TaskInput) (string, error)
+	SubmitConversationMessage(context.Context, string, string) (store.Message, error)
 	StartQueuedRun(context.Context, string) error
 	CancelRun(context.Context, string) error
 	SubmitHumanReview(context.Context, string, string, orchestrator.HumanReviewSubmission) (report.Report, error)
