@@ -47,7 +47,9 @@ func (e *Engine) SubmitConversationMessage(ctx context.Context, projectID, body 
 	if err != nil {
 		return store.Message{}, err
 	}
-	go e.dispatchConversationReply(context.Background(), project.ID, conversation.ID, message.ID, dispatchInput)
+	e.spawn(func() {
+		e.dispatchConversationReply(e.rootCtx, project.ID, conversation.ID, message.ID, dispatchInput)
+	})
 	return message, nil
 }
 

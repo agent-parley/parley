@@ -24,9 +24,8 @@ func TestHumanReviewSuspendsAndRestartResumeAcceptsHumanEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 
-	firstEngine := NewEngineWithOptions(st, &capturingRunner{}, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	firstEngine := newRecordingEngine(t, st, &capturingRunner{}, EngineOptions{})
 	runID, err := firstEngine.StartRunInput(ctx, contract.TaskInput{Idea: "needs plan review", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: workflow.BalancedPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRunInput() error = %v", err)
@@ -44,7 +43,7 @@ func TestHumanReviewSuspendsAndRestartResumeAcceptsHumanEnvelope(t *testing.T) {
 	}
 
 	stage := stageByWorkflowID(t, st, runID, "plan_review_human")
-	restartedEngine := NewEngineWithOptions(st, &capturingRunner{}, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	restartedEngine := newRecordingEngine(t, st, &capturingRunner{}, EngineOptions{})
 	rep, err := restartedEngine.SubmitHumanReview(ctx, runID, stage.ID, HumanReviewSubmission{ActorID: "alice", Verdict: string(report.ReviewVerdictPass), Summary: "plan approved"})
 	if err != nil {
 		t.Fatalf("SubmitHumanReview() error = %v", err)
@@ -65,10 +64,9 @@ func TestAgentEscalationRoutesToWiredHumanReviewAndDoubleSubmitRejected(t *testi
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 
 	runner := &humanTestReviewRunner{verdict: report.ReviewVerdictEscalate}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{})
 	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "escalate review", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: workflow.CarefulReviewID})
 	if err != nil {
 		t.Fatalf("StartRunInput() error = %v", err)
@@ -105,7 +103,7 @@ func TestResumeAfterHumanCodeReviewWithLostWorktreeRematerializesAndCommits(t *t
 		t.Fatalf("remove worktree: %v", err)
 	}
 
-	restartedEngine := NewEngineWithOptions(fixture.store, fixture.runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{DataRoot: fixture.dataRoot})
+	restartedEngine := newRecordingEngine(t, fixture.store, fixture.runner, EngineOptions{DataRoot: fixture.dataRoot})
 	changeStage := stageByWorkflowID(t, fixture.store, fixture.runID, "change_review_human")
 	if _, err := restartedEngine.SubmitHumanReview(ctx, fixture.runID, changeStage.ID, HumanReviewSubmission{Verdict: string(report.ReviewVerdictPass), Summary: "code approved"}); err != nil {
 		t.Fatalf("submit code review: %v", err)
@@ -164,7 +162,7 @@ func TestResumeAfterHumanCodeReviewWithLostWorktreeCorruptDiffFailsCleanly(t *te
 	if err := os.RemoveAll(fixture.worktreePath); err != nil {
 		t.Fatalf("remove worktree: %v", err)
 	}
-	restartedEngine := NewEngineWithOptions(fixture.store, fixture.runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{DataRoot: fixture.dataRoot})
+	restartedEngine := newRecordingEngine(t, fixture.store, fixture.runner, EngineOptions{DataRoot: fixture.dataRoot})
 	changeStage := stageByWorkflowID(t, fixture.store, fixture.runID, "change_review_human")
 	if _, err := restartedEngine.SubmitHumanReview(ctx, fixture.runID, changeStage.ID, HumanReviewSubmission{Verdict: string(report.ReviewVerdictPass), Summary: "code approved"}); err != nil {
 		t.Fatalf("submit code review: %v", err)
@@ -237,7 +235,7 @@ func startLostWorktreeResumeFixture(t *testing.T, ctx context.Context) lostWorkt
 		t.Fatalf("bind default project repository: %v", err)
 	}
 	runner := &lostWorktreeResumeRunner{dataRoot: dataRoot, sourceRepo: source, worktreePaths: make(chan string, 1)}
-	firstEngine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{DataRoot: dataRoot})
+	firstEngine := newRecordingEngine(t, st, runner, EngineOptions{DataRoot: dataRoot})
 	runID, err := firstEngine.StartRunInput(ctx, contract.TaskInput{
 		Idea:               "exercise lost worktree resume",
 		RefinementLevel:    contract.RefinementLevelDirect,
@@ -298,9 +296,8 @@ func TestMalformedHumanReviewRejectedWhileAwaiting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 
-	engine := NewEngineWithOptions(st, &capturingRunner{}, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	engine := newRecordingEngine(t, st, &capturingRunner{}, EngineOptions{})
 	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "bad human form", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: workflow.BalancedPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRunInput() error = %v", err)
@@ -325,9 +322,8 @@ func TestSubmitHumanReviewRollsBackRunStatusOnPostCASFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 
-	engine := NewEngineWithOptions(st, &capturingRunner{}, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	engine := newRecordingEngine(t, st, &capturingRunner{}, EngineOptions{})
 	runID, err := engine.StartRunInput(ctx, contract.TaskInput{
 		Idea:               "rollback failed human resume",
 		RefinementLevel:    contract.RefinementLevelDirect,
@@ -403,33 +399,6 @@ func stageByWorkflowID(t *testing.T, st *store.Store, runID, workflowStageID str
 	}
 	t.Fatalf("workflow stage %s not found", workflowStageID)
 	return store.Stage{}
-}
-
-func waitForWorkflowStageAwaiting(t *testing.T, st *store.Store, runID, workflowStageID string) {
-	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		run, _ := st.GetRun(ctxBackground(), runID)
-		stage := stageByWorkflowID(t, st, runID, workflowStageID)
-		if run.Status == store.RunStatusAwaitingHuman && stage.Status == store.StageStatusRunning {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("workflow stage %s did not become awaiting_human", workflowStageID)
-}
-
-func waitForNotRunStatus(t *testing.T, st *store.Store, runID, status string) {
-	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		run, err := st.GetRun(ctxBackground(), runID)
-		if err == nil && run.Status != status {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("run stayed in status %s", status)
 }
 
 func hasArtifactKind(t *testing.T, st *store.Store, runID, kind string) bool {

@@ -17,10 +17,9 @@ func TestStartRunEnqueuesWhenAutoDisabledAndManualStartDispatches(t *testing.T) 
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	runner := newBlockingRunner()
 	policy := QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &policy})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{QueuePolicy: &policy})
 	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "queued idea", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun() error = %v", err)
@@ -57,10 +56,9 @@ func TestCancelPendingRunDoesNotDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	runner := newBlockingRunner()
 	policy := QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &policy})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{QueuePolicy: &policy})
 	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "cancel queued", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun() error = %v", err)
@@ -81,9 +79,8 @@ func TestBacklogCapRejectsNewEnqueuesAndEmitsSystemEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	policy := QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 1}
-	engine := NewEngineWithOptions(st, newBlockingRunner(), fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &policy})
+	engine := newRecordingEngine(t, st, newBlockingRunner(), EngineOptions{QueuePolicy: &policy})
 	if _, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "first queued", WorkflowTemplateID: workflow.AutonomousPRDeliveryID}); err != nil {
 		t.Fatalf("StartRun(first) error = %v", err)
 	}
@@ -107,10 +104,9 @@ func TestAutoQueueDispatchesOnlyUpToReadyRunnerSlots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	runner := newBlockingRunner()
 	policy := QueuePolicy{AutoWhenReady: true, MaxConcurrent: 2, BacklogCap: 10}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &policy, RunnerSlots: 1})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{QueuePolicy: &policy, RunnerSlots: 1})
 	firstID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "first", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun(first) error = %v", err)
@@ -143,7 +139,6 @@ func TestRecoverAndDispatchFailsInterruptedRunningAndStartsPending(t *testing.T)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	interrupted, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "interrupted", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("create interrupted run: %v", err)
@@ -157,7 +152,7 @@ func TestRecoverAndDispatchFailsInterruptedRunningAndStartsPending(t *testing.T)
 	}
 	runner := newBlockingRunner()
 	policy := QueuePolicy{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 10}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &policy})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{QueuePolicy: &policy})
 	if err := engine.RecoverAndDispatch(ctx); err != nil {
 		t.Fatalf("RecoverAndDispatch() error = %v", err)
 	}
@@ -182,10 +177,9 @@ func TestDispatchSkipsGateHeldRunWithoutBlockingOthers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	runner := newBlockingRunner()
 	policy := QueuePolicy{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 10}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &policy, RunnerSlots: 1})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{QueuePolicy: &policy, RunnerSlots: 1})
 	engine.gate = func(_ context.Context, run store.Run) (bool, error) {
 		return run.Idea != "held", nil
 	}

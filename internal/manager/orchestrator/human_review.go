@@ -90,9 +90,12 @@ func (e *Engine) SubmitHumanReview(ctx context.Context, runID, stageID string, s
 		rollbackResume()
 		return report.Report{}, err
 	}
-	runCtx, cancel := context.WithCancel(context.Background())
+	runCtx, cancel := context.WithCancel(e.rootCtx)
 	e.registerActiveRun(wr.Run.ID, cancel)
-	go e.executeRunAfter(runCtx, wr.Run.ID, runtimeStage.Template.ID)
+	if !e.spawn(func() { e.executeRunAfter(runCtx, wr.Run.ID, runtimeStage.Template.ID) }) {
+		cancel()
+		e.unregisterActiveRun(wr.Run.ID)
+	}
 	return rep, nil
 }
 

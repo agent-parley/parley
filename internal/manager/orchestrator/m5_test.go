@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/workflow"
@@ -19,9 +18,8 @@ func TestCancelMidRunRoutesToCancelled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	runner := newBlockingRunner()
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{})
 	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "cancel me", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun() error = %v", err)
@@ -49,7 +47,6 @@ func TestCancelAfterNaturalTerminalDoesNotOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	wr, err := st.CreateWorkflowRun(ctx, "already done")
 	if err != nil {
 		t.Fatalf("create workflow: %v", err)
@@ -58,7 +55,7 @@ func TestCancelAfterNaturalTerminalDoesNotOverride(t *testing.T) {
 		t.Fatalf("set completed: %v", err)
 	}
 	runner := newBlockingRunner()
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{})
 	if err := engine.CancelRun(ctx, wr.Run.ID); err != nil {
 		t.Fatalf("CancelRun() error = %v", err)
 	}
@@ -80,9 +77,8 @@ func TestRunnerDownDuringCancellationRoutesToCancelled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	runner := newBlockingRunner()
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{})
 	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "cancel then disconnect", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun() error = %v", err)
@@ -116,9 +112,8 @@ func TestRunnerDownFailsInFlightRunStatePreservingly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	runner := newBlockingRunner()
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{})
 	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "runner dies", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun() error = %v", err)
@@ -147,12 +142,11 @@ func TestStageCompletionEmitsPerformerAndStageTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "freeze idea", RefinementLevel: contract.RefinementLevelDirect})
 	if err != nil {
 		t.Fatalf("create workflow: %v", err)
 	}
-	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	engine := newRecordingEngine(t, st, nil, EngineOptions{})
 	if _, err := engine.runIdeaIntake(ctx, wr); err != nil {
 		t.Fatalf("runIdeaIntake() error = %v", err)
 	}
@@ -216,40 +210,6 @@ func (r *blockingRunner) cancelCalled() bool {
 	}
 }
 
-func waitForRunStatus(t *testing.T, st *store.Store, runID, want string) {
-	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		run, err := st.GetRun(context.Background(), runID)
-		if err == nil && run.Status == want {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	run, err := st.GetRun(context.Background(), runID)
-	if err != nil {
-		t.Fatalf("get run: %v", err)
-	}
-	t.Fatalf("run status = %s, want %s", run.Status, want)
-}
-
-func waitForEventType(t *testing.T, st *store.Store, runID, typ string) {
-	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		events, err := st.ListEvents(context.Background(), runID)
-		if err == nil && hasEventType(events, typ) {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	events, err := st.ListEvents(context.Background(), runID)
-	if err != nil {
-		t.Fatalf("list events: %v", err)
-	}
-	t.Fatalf("missing event %s in %#v", typ, eventTypes(events))
-}
-
 func hasEventType(events []event.Event, typ string) bool {
 	for _, ev := range events {
 		if ev.Type == typ {
@@ -278,8 +238,7 @@ func TestDispatchSessionClosedRoutesToRunnerDisconnected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
-	engine := NewEngineWithOptions(st, sessionClosedRunner{}, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	engine := newRecordingEngine(t, st, sessionClosedRunner{}, EngineOptions{})
 	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "runner vanishes mid-dispatch", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun() error = %v", err)

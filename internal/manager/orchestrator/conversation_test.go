@@ -17,7 +17,6 @@ func TestSubmitConversationMessageDispatchesFreshAgentTurnAndPersistsReply(t *te
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	repoPath := t.TempDir()
 	project, err := st.EnsureProject(ctx, store.ProjectSpec{ID: store.DefaultProjectID, Name: "Default project", RepositoryPath: repoPath})
 	if err != nil {
@@ -37,6 +36,7 @@ func TestSubmitConversationMessageDispatchesFreshAgentTurnAndPersistsReply(t *te
 	runner := &conversationTestRunner{dispatches: make(chan contract.Dispatch, 1), reply: "Auth lives under `internal/auth`."}
 	broadcast := &capturingConversationBroadcaster{events: make(chan event.Event, 4)}
 	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, broadcast, EngineOptions{ConversationAdapter: "chat-agent"})
+	registerEngineTeardown(t, engine, st)
 
 	if _, err := engine.SubmitConversationMessage(ctx, project.ID, "Where is auth handled?"); err != nil {
 		t.Fatalf("SubmitConversationMessage() error = %v", err)
@@ -93,9 +93,8 @@ func TestConversationAgentActionsAreRejectedInTracerSlice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	runner := &conversationTestRunner{dispatches: make(chan contract.Dispatch, 1), reply: "", payload: map[string]any{"reply_markdown": "Creating a task.", "actions": []any{map[string]any{"type": "create-Task"}}}}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{ConversationAdapter: "chat-agent"})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{ConversationAdapter: "chat-agent"})
 	conversation, err := st.EnsureProjectConversation(ctx, store.DefaultProjectID)
 	if err != nil {
 		t.Fatalf("ensure conversation: %v", err)
@@ -177,18 +176,28 @@ func receiveDispatch(t *testing.T, ch <-chan contract.Dispatch) contract.Dispatc
 
 func waitForConversationMessages(t *testing.T, st *store.Store, conversationID string, want int) []store.Message {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		messages, err := st.ListMessagesForConversation(context.Background(), conversationID)
+	var messages []store.Message
+	pred := func() bool {
+		var err error
+		messages, err = st.ListMessagesForConversation(context.Background(), conversationID)
 		if err != nil {
 			t.Fatalf("list messages: %v", err)
 		}
-		if len(messages) >= want {
+		return len(messages) >= want
+	}
+	// Event-driven when the engine broadcasts to a recorder; the custom-broadcaster test
+	// has no recorder, so fall back to a generous poll (a safety net, not a tight deadline).
+	if rec, ok := lookupRecorder(st); ok {
+		rec.waitUntil(t, pred)
+		return messages
+	}
+	deadline := time.Now().Add(testWaitTimeout)
+	for time.Now().Before(deadline) {
+		if pred() {
 			return messages
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	messages, _ := st.ListMessagesForConversation(context.Background(), conversationID)
 	t.Fatalf("timed out waiting for %d messages, got %#v", want, messages)
 	return nil
 }

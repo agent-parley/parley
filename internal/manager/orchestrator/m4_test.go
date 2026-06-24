@@ -23,12 +23,11 @@ func TestIdeaIntakeFreezesVerbatimIdeaIntoContractAndSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "add a thing\n<script>alert(1)</script>", RefinementLevel: contract.RefinementLevelDirect})
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
-	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{DataRoot: t.TempDir(), ProjectID: "p1"})
+	engine := newRecordingEngine(t, st, nil, EngineOptions{DataRoot: t.TempDir(), ProjectID: "p1"})
 	rep, err := engine.runIdeaIntake(ctx, wr)
 	if err != nil {
 		t.Fatalf("runIdeaIntake() error = %v", err)
@@ -113,14 +112,13 @@ func TestStandardIdeaIntakeDispatchesPlannerAndPersistsSemanticTaskPlan(t *testi
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "add audit logging to login failures", RefinementLevel: contract.RefinementLevelStandard})
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 	plan := semanticPlannerTestPlan(wr)
 	runner := &planningRunner{plan: plan}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{PlanningAdapter: "planner", DataRoot: t.TempDir(), ProjectID: "p1"})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{PlanningAdapter: "planner", DataRoot: t.TempDir(), ProjectID: "p1"})
 	rep, err := engine.runIdeaIntake(ctx, wr)
 	if err != nil {
 		t.Fatalf("runIdeaIntake() error = %v", err)
@@ -175,13 +173,12 @@ func TestDirectIdeaIntakeDoesNotDispatchPlanner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "fix typo", RefinementLevel: contract.RefinementLevelDirect})
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 	runner := &planningRunner{plan: "should not be used"}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{PlanningAdapter: "planner", DataRoot: t.TempDir(), ProjectID: "p1"})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{PlanningAdapter: "planner", DataRoot: t.TempDir(), ProjectID: "p1"})
 	rep, err := engine.runIdeaIntake(ctx, wr)
 	if err != nil {
 		t.Fatalf("runIdeaIntake() error = %v", err)
@@ -441,7 +438,6 @@ func TestRunCommitUsesImplementationDiffArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	dataRoot := t.TempDir()
 	projectID := "p1"
 	if _, err := st.EnsureProject(ctx, store.ProjectSpec{ID: projectID, Name: "p1", QueueAutoWhenReady: true, QueueMaxConcurrent: 1, QueueBacklogCap: 100}); err != nil {
@@ -466,7 +462,7 @@ func TestRunCommitUsesImplementationDiffArtifact(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt.Path, "main.go"), []byte("package main\n\nfunc main() { println(\"worker\") }\n"), 0o600); err != nil {
 		t.Fatalf("write main.go: %v", err)
 	}
-	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{
+	engine := newRecordingEngine(t, st, nil, EngineOptions{
 		DataRoot:       dataRoot,
 		ProjectID:      projectID,
 		GitAuthorName:  "Harness Bot",
