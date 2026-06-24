@@ -82,6 +82,10 @@ type Engine struct {
 	activeStage map[string]store.Stage
 	cancelling  map[string]bool
 	runnerDown  map[string]string
+	closed      bool
+	rootCtx     context.Context
+	rootCancel  context.CancelFunc
+	wg          sync.WaitGroup
 	queueMu     sync.Mutex
 
 	queuePolicy           QueuePolicy
@@ -183,6 +187,7 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 			},
 		})
 	}
+	rootCtx, rootCancel := context.WithCancel(context.Background())
 	return &Engine{
 		store:                 st,
 		runner:                runner,
@@ -206,6 +211,8 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 		gitAuthorEmail:        opts.GitAuthorEmail,
 		gitExecutable:         opts.GitExecutable,
 		contextAssembler:      contextAssembler,
+		rootCtx:               rootCtx,
+		rootCancel:            rootCancel,
 	}
 }
 
@@ -259,11 +266,11 @@ func (e *Engine) StartProjectRunInput(ctx context.Context, projectID string, inp
 	}
 	e.queueMu.Unlock()
 	if e.queuePolicy.AutoWhenReady {
-		go func() {
-			if err := e.DispatchPending(context.Background()); err != nil {
+		e.spawn(func() {
+			if err := e.DispatchPending(e.rootCtx); err != nil {
 				log.Printf("dispatch pending failed: %v", err)
 			}
-		}()
+		})
 	}
 	return wr.Run.ID, nil
 }
@@ -517,9 +524,12 @@ func (e *Engine) dispatchRunLocked(ctx context.Context, runID, trigger string) e
 		return ErrRunNotPending
 	}
 	e.broadcast.Broadcast("", persisted, "")
-	runCtx, cancel := context.WithCancel(context.Background())
+	runCtx, cancel := context.WithCancel(e.rootCtx)
 	e.registerActiveRun(run.ID, cancel)
-	go e.executeRun(runCtx, run.ID)
+	if !e.spawn(func() { e.executeRun(runCtx, run.ID) }) {
+		cancel()
+		e.unregisterActiveRun(run.ID)
+	}
 	return nil
 }
 
@@ -610,6 +620,51 @@ func (e *Engine) activeCancel(runID string) context.CancelFunc {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.activeRuns[runID]
+}
+
+// spawn runs fn in a goroutine tracked by the engine's WaitGroup. Once Shutdown
+// has begun it is a no-op (returns false), so the auto-dispatch chain cannot keep
+// spawning work past teardown. wg.Add happens under the same mutex that Shutdown
+// uses to set closed, so there is no Add-after-Wait race.
+func (e *Engine) spawn(fn func()) bool {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return false
+	}
+	e.wg.Add(1)
+	e.mu.Unlock()
+	go func() {
+		defer e.wg.Done()
+		fn()
+	}()
+	return true
+}
+
+// Shutdown stops the engine: it suppresses new spawns, cancels the root context
+// (so ctx-aware in-flight work unwinds), and waits for tracked goroutines to drain
+// or for ctx to expire. After it returns nil, no engine goroutine is running, so
+// callers (notably tests) can safely close the store and remove the data dir.
+func (e *Engine) Shutdown(ctx context.Context) error {
+	e.mu.Lock()
+	if !e.closed {
+		e.closed = true
+		e.mu.Unlock()
+		e.rootCancel()
+	} else {
+		e.mu.Unlock()
+	}
+	done := make(chan struct{})
+	go func() {
+		e.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("engine shutdown timed out with goroutines still running: %w", ctx.Err())
+	}
 }
 
 func (e *Engine) markCancelling(runID string) {
@@ -728,11 +783,11 @@ func (e *Engine) executeRunWithCleanup(ctx context.Context, runID string, execut
 	defer func() {
 		e.unregisterActiveRun(runID)
 		if e.queuePolicy.AutoWhenReady {
-			go func() {
-				if err := e.DispatchPending(context.Background()); err != nil {
+			e.spawn(func() {
+				if err := e.DispatchPending(e.rootCtx); err != nil {
 					log.Printf("dispatch pending failed: %v", err)
 				}
-			}()
+			})
 		}
 	}()
 	if err := execute(); err != nil {

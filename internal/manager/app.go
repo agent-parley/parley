@@ -304,6 +304,11 @@ func (a *App) close(ctx context.Context) error {
 	if a.runner != nil {
 		_ = a.runner.Close(ctx)
 	}
+	if a.engine != nil {
+		// Drain engine dispatch/conversation goroutines before closing the store so they
+		// cannot run against a closed database during shutdown.
+		_ = a.engine.Shutdown(ctx)
+	}
 	if a.store != nil {
 		return a.store.Close()
 	}

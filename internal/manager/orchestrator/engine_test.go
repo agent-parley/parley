@@ -47,13 +47,12 @@ func TestNotificationDispatcherPersistsSubscribedEventsAndContinuesOnSinkError(t
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	wr, err := st.CreateWorkflowRun(ctx, "ship notification center")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 	sink := &capturingNotificationSink{err: errors.New("sse down")}
-	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{NotificationSinks: []NotificationSink{sink}})
+	engine := newRecordingEngine(t, st, nil, EngineOptions{NotificationSinks: []NotificationSink{sink}})
 
 	if _, err := engine.emit(ctx, reviewAwaitingEvent(wr)); err != nil {
 		t.Fatalf("emit awaiting human: %v", err)
@@ -83,13 +82,12 @@ func TestNotificationDispatcherRespectsTogglesAndExcludesNonSubscribedEvents(t *
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	wr, err := st.CreateWorkflowRun(ctx, "avoid notification spam")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 	sink := &capturingNotificationSink{}
-	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{NotificationSinks: []NotificationSink{sink}})
+	engine := newRecordingEngine(t, st, nil, EngineOptions{NotificationSinks: []NotificationSink{sink}})
 
 	if _, err := engine.emit(ctx, nonReviewAwaitingEvent(wr)); err != nil {
 		t.Fatalf("emit non-review awaiting human: %v", err)
@@ -142,13 +140,12 @@ func TestDispatchStagePersistsStageBriefAndPassesItToRunner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	wr, err := st.CreateWorkflowRun(ctx, "build a bounded brief")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 	runner := &capturingRunner{}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{})
 	rep, err := engine.dispatchStage(ctx, wr, wr.ImplementationStage, "capture", contract.StageTypeImplementation, implementationInput(wr, report.Report{}))
 	if err != nil {
 		t.Fatalf("dispatchStage() error = %v", err)
@@ -205,13 +202,12 @@ func TestDispatchStageRepairsMalformedReportBeforeCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	wr, err := st.CreateWorkflowRun(ctx, "repair a malformed implementation report")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 	runner := &malformedThenRepairedRunner{}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{})
 	rep, err := engine.dispatchStage(ctx, wr, wr.ImplementationStage, "repairable", contract.StageTypeImplementation, implementationInput(wr, report.Report{}))
 	if err != nil {
 		t.Fatalf("dispatchStage() error = %v", err)
@@ -256,13 +252,12 @@ func TestReviewArbiterMissingVerdictIsRepaired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "review malformed arbiter output", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 	runner := &arbiterRepairRunner{}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
 	runtime, err := engine.loadRuntimeWorkflow(ctx, wr)
 	if err != nil {
 		t.Fatalf("load runtime workflow: %v", err)
@@ -300,9 +295,8 @@ func TestMalformedReportRepairExhaustionRoutesInvalidWithoutCrash(t *testing.T) 
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	runner := &alwaysMalformedRunner{}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{})
 	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "malformed adapter report should not pass or crash", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRun() error = %v", err)
@@ -329,7 +323,6 @@ func TestStageBriefRepoEvidenceUsesConfiguredGitExecutable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	repoPath := t.TempDir()
 	if err := os.WriteFile(filepath.Join(repoPath, "README.md"), []byte("# fake repo\n"), 0o600); err != nil {
 		t.Fatalf("write README: %v", err)
@@ -357,7 +350,7 @@ func TestStageBriefRepoEvidenceUsesConfiguredGitExecutable(t *testing.T) {
 		t.Fatalf("write fake git: %v", err)
 	}
 	runner := &capturingRunner{}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{GitExecutable: fakeGit})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{GitExecutable: fakeGit})
 	if _, err := engine.dispatchStage(ctx, wr, wr.ImplementationStage, "capture", contract.StageTypeImplementation, implementationInput(wr, report.Report{})); err != nil {
 		t.Fatalf("dispatchStage() error = %v", err)
 	}
@@ -429,10 +422,9 @@ func TestAgentStageDispatchReceivesTemplateActorTargetSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	runner := &capturingRunner{}
 	policy := QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &policy})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{QueuePolicy: &policy})
 	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "review my changes", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("StartRunInput() error = %v", err)
@@ -473,13 +465,12 @@ func TestMemoryUpdateStageAppliesCuratedCandidatesWithoutDispatchingWorkflowAgen
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "remember safe lessons", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 	runner := &capturingRunner{}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
 	runtime, err := engine.loadRuntimeWorkflow(ctx, wr)
 	if err != nil {
 		t.Fatalf("load runtime workflow: %v", err)
@@ -533,13 +524,12 @@ func TestReviewChangesRequestedCreatesFixLoopAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "review loop", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 	runner := &reviewVerdictRunner{verdict: report.ReviewVerdictChangesRequested}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
 	runtime, err := engine.loadRuntimeWorkflow(ctx, wr)
 	if err != nil {
 		t.Fatalf("load runtime workflow: %v", err)
@@ -577,13 +567,12 @@ func TestReviewFixLoopExhaustionBlocksThroughNeedsInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "review loop cap", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 	runner := &reviewVerdictRunner{verdict: report.ReviewVerdictChangesRequested}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
+	engine := newRecordingEngine(t, st, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
 	runtime, err := engine.loadRuntimeWorkflow(ctx, wr)
 	if err != nil {
 		t.Fatalf("load runtime workflow: %v", err)
@@ -611,12 +600,11 @@ func TestStartRunFreezesSelectedWorkflowTemplateSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	copied, err := st.CopyWorkflowTemplate(ctx, workflow.BalancedPRDeliveryID, "team_template", "Team Template")
 	if err != nil {
 		t.Fatalf("copy template: %v", err)
 	}
-	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{})
+	engine := newRecordingEngine(t, st, nil, EngineOptions{})
 	runID, err := engine.StartRunInput(ctx, contract.TaskInput{Idea: "use team template", WorkflowTemplateID: copied.ID})
 	if err != nil {
 		t.Fatalf("StartRunInput() error = %v", err)
