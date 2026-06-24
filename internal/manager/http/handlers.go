@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -56,6 +57,10 @@ func (s *Server) handleProjectPath(w http.ResponseWriter, r *http.Request) {
 	}
 	if parts[1] == "chat" {
 		s.handleProjectChatPath(w, r, projectID, parts[2:])
+		return
+	}
+	if parts[1] == "settings" {
+		s.handleProjectSettingsPath(w, r, projectID, parts[2:])
 		return
 	}
 	if parts[1] != "runs" {
@@ -201,6 +206,232 @@ func (s *Server) projectHomeFragmentsData(r *http.Request, project store.Project
 	}
 	chat.CSRF = csrf
 	return web.ProjectHomeFragmentsData{Tasks: tasks, Chat: chat}, nil
+}
+
+func (s *Server) handleProjectSettingsPath(w http.ResponseWriter, r *http.Request, projectID string, parts []string) {
+	if len(parts) == 0 {
+		s.handleProjectSettings(w, r, projectID)
+		return
+	}
+	if len(parts) == 1 && validProjectSettingsKind(parts[0]) {
+		s.handleProjectSettingsSave(w, r, projectID, parts[0])
+		return
+	}
+	if len(parts) == 2 && validProjectSettingsKind(parts[0]) && parts[1] == "candidate" {
+		s.handleProjectSettingsCandidate(w, r, projectID, parts[0])
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request, projectID string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	project, err := s.store.GetProject(r.Context(), projectID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data, err := s.projectSettingsData(r, project)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.writePage(w, "settings.html", data)
+}
+
+func (s *Server) handleProjectSettingsSave(w http.ResponseWriter, r *http.Request, projectID, kind string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	content := r.Form.Get("content")
+	var (
+		project store.Project
+		err     error
+	)
+	switch kind {
+	case "rules":
+		project, err = s.store.UpdateProjectRules(r.Context(), projectID, content)
+	case "preferences":
+		project, err = s.store.UpdateProjectPreferences(r.Context(), projectID, content)
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	section, err := s.projectSettingsSectionData(r, project, kind, content, "", "saved · updated "+project.UpdatedAt)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.writeFragment(w, http.StatusAccepted, section)
+}
+
+func (s *Server) handleProjectSettingsCandidate(w http.ResponseWriter, r *http.Request, projectID, kind string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	project, err := s.store.GetProject(r.Context(), projectID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	repoPath, err := s.projectRepositoryPath(r, projectID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if repoPath == "" {
+		section, err := s.projectSettingsSectionData(r, project, kind, projectSettingsSavedValue(project, kind), "No repository configured; repo candidate loading is unavailable.", "saved · updated "+project.UpdatedAt)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.writeFragment(w, http.StatusOK, section)
+		return
+	}
+	candidate, err := projectSettingsCandidate(repoPath, kind)
+	if err != nil {
+		notice := "Could not load `" + projectSettingsCandidatePath(kind) + "` from the repository."
+		if errors.Is(err, os.ErrNotExist) {
+			notice = "No `" + projectSettingsCandidatePath(kind) + "` in the repository."
+		}
+		section, sectionErr := s.projectSettingsSectionData(r, project, kind, projectSettingsSavedValue(project, kind), notice, "saved · updated "+project.UpdatedAt)
+		if sectionErr != nil {
+			http.Error(w, sectionErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.writeFragment(w, http.StatusOK, section)
+		return
+	}
+	section, err := s.projectSettingsSectionData(r, project, kind, candidate, "", "repo candidate loaded as an unsaved draft · Save to commit")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.writeFragment(w, http.StatusOK, section)
+}
+
+func (s *Server) projectSettingsData(r *http.Request, project store.Project) (web.ProjectSettingsData, error) {
+	csrf := csrfFromContext(r.Context())
+	rules, err := s.projectSettingsSectionData(r, project, "rules", project.ProjectRules, "", "saved · updated "+project.UpdatedAt)
+	if err != nil {
+		return web.ProjectSettingsData{}, err
+	}
+	preferences, err := s.projectSettingsSectionData(r, project, "preferences", project.ProjectPreferences, "", "saved · updated "+project.UpdatedAt)
+	if err != nil {
+		return web.ProjectSettingsData{}, err
+	}
+	return web.ProjectSettingsData{Project: project, Rules: rules, Preferences: preferences, CSRF: csrf, Title: "Parley · " + project.Name + " Settings"}, nil
+}
+
+func (s *Server) projectSettingsSectionData(r *http.Request, project store.Project, kind, textareaValue, notice, status string) (web.ProjectSettingsSectionData, error) {
+	repoPath, err := s.projectRepositoryPath(r, project.ID)
+	if err != nil {
+		return web.ProjectSettingsSectionData{}, err
+	}
+	candidateDiffers := false
+	if repoPath != "" {
+		if candidate, err := projectSettingsCandidate(repoPath, kind); err == nil {
+			candidateDiffers = candidate != projectSettingsSavedValue(project, kind)
+		}
+	}
+	return web.ProjectSettingsSectionData{
+		Project:              project,
+		Kind:                 kind,
+		Label:                projectSettingsLabel(kind),
+		ShortLabel:           projectSettingsShortLabel(kind),
+		Help:                 projectSettingsHelp(kind),
+		TextareaID:           "project-settings-" + kind,
+		TextareaValue:        textareaValue,
+		Placeholder:          projectSettingsPlaceholder(kind),
+		CandidatePath:        projectSettingsCandidatePath(kind),
+		SavePath:             "/projects/" + project.ID + "/settings/" + kind,
+		LoadCandidatePath:    "/projects/" + project.ID + "/settings/" + kind + "/candidate",
+		RepositoryConfigured: repoPath != "",
+		CandidateDiffers:     candidateDiffers,
+		Notice:               notice,
+		Status:               status,
+		CSRF:                 csrfFromContext(r.Context()),
+	}, nil
+}
+
+func (s *Server) projectRepositoryPath(r *http.Request, projectID string) (string, error) {
+	repositoryID, err := s.store.DefaultRepositoryID(r.Context(), projectID)
+	if err != nil {
+		return "", err
+	}
+	if repositoryID == "" {
+		return "", nil
+	}
+	repo, err := s.store.GetRepository(r.Context(), repositoryID)
+	if err != nil {
+		return "", err
+	}
+	if repo.ProjectID != projectID {
+		return "", fmt.Errorf("repository %s does not belong to project %s", repo.ID, projectID)
+	}
+	return repo.Path, nil
+}
+
+func validProjectSettingsKind(kind string) bool {
+	return kind == "rules" || kind == "preferences"
+}
+
+func projectSettingsSavedValue(project store.Project, kind string) string {
+	if kind == "preferences" {
+		return project.ProjectPreferences
+	}
+	return project.ProjectRules
+}
+
+func projectSettingsCandidate(repoPath, kind string) (string, error) {
+	if kind == "preferences" {
+		return store.ReadProjectPreferencesCandidate(repoPath)
+	}
+	return store.ReadProjectRulesCandidate(repoPath)
+}
+
+func projectSettingsCandidatePath(kind string) string {
+	if kind == "preferences" {
+		return store.ProjectPreferencesCandidatePath
+	}
+	return store.ProjectRulesCandidatePath
+}
+
+func projectSettingsLabel(kind string) string {
+	if kind == "preferences" {
+		return "Preferences"
+	}
+	return "Rules"
+}
+
+func projectSettingsShortLabel(kind string) string {
+	if kind == "preferences" {
+		return "preferences"
+	}
+	return "rules"
+}
+
+func projectSettingsHelp(kind string) string {
+	if kind == "preferences" {
+		return "Lower-precedence operator preferences that shape how Parley communicates and finishes work. Empty is valid."
+	}
+	return "Authoritative project rules Parley includes in stage briefs when present. Empty is valid."
+}
+
+func projectSettingsPlaceholder(kind string) string {
+	if kind == "preferences" {
+		return "No project preferences set"
+	}
+	return "No project rules set"
 }
 
 func (s *Server) handleProjectChatPath(w http.ResponseWriter, r *http.Request, projectID string, parts []string) {
@@ -828,6 +1059,18 @@ func backlogFullNotice(backlogErr orchestrator.QueueBacklogFullError, queue web.
 			queue.RunnerSlots,
 		),
 	}
+}
+
+func (s *Server) writeFragment(w http.ResponseWriter, status int, data web.ProjectSettingsSectionData) {
+	fragment, err := s.renderer.RenderProjectSettingsSection(data)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(fragment)))
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(fragment))
 }
 
 func (s *Server) writePage(w http.ResponseWriter, name string, data any) {

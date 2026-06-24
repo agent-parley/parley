@@ -384,6 +384,28 @@ func TestProjectRulesPreferencesCanBeUpdatedAndPromotedFromRepoCandidates(t *tes
 			t.Fatalf("write %s: %v", rel, err)
 		}
 	}
+	rulesCandidate, err := ReadProjectRulesCandidate(repo)
+	if err != nil {
+		t.Fatalf("read project rules candidate: %v", err)
+	}
+	if rulesCandidate != "Never bypass human approval gates.\n" {
+		t.Fatalf("rules candidate = %q", rulesCandidate)
+	}
+	preferencesCandidate, err := ReadProjectPreferencesCandidate(repo)
+	if err != nil {
+		t.Fatalf("read project preferences candidate: %v", err)
+	}
+	if preferencesCandidate != "Prefer concise status updates.\n" {
+		t.Fatalf("preferences candidate = %q", preferencesCandidate)
+	}
+	beforePromote, err := st.GetProject(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get project before promote: %v", err)
+	}
+	if beforePromote.ProjectRules != "Run targeted validation before commit.\n" || beforePromote.ProjectPreferences != "Prefer short reports.\n" {
+		t.Fatalf("read-only candidates changed app state before promote: %+v", beforePromote)
+	}
+
 	promotedRules, err := st.PromoteProjectRulesFromRepository(ctx, DefaultProjectID, repo)
 	if err != nil {
 		t.Fatalf("promote project rules: %v", err)

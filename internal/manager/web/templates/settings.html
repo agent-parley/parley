@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <script type="module" src="/assets/datastar.min.js"></script>
+  <style>{{template "styles" .}}</style>
+</head>
+<body data-signals:csrf="'{{.CSRF}}'">
+  <main>
+    <header class="settings-header">
+      <p class="breadcrumb"><a href="/projects">Projects</a> · <a href="/projects/{{.Project.ID}}">{{.Project.Name}}</a></p>
+      <h1>Project Settings</h1>
+      <p class="muted">Rules and preferences are saved in Parley app state. Repository candidates load into the editor as drafts until you save them.</p>
+    </header>
+    {{template "settings_section.html" .Rules}}
+    {{template "settings_section.html" .Preferences}}
+  </main>
+</body>
+</html>

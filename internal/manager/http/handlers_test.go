@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -188,6 +190,119 @@ func TestProjectHomeRendersReadyForReviewInTasksOverview(t *testing.T) {
 	assertContains(t, body, "/projects/default/runs/"+wr.Run.ID+"?tab=review")
 	assertContains(t, body, "Review from chat")
 	assertNotContains(t, body, "Tasks started from this chat")
+}
+
+func TestProjectSettingsRendersRulesPreferencesAndHomeLink(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	if _, err := st.UpdateProjectRules(ctx, store.DefaultProjectID, "Run focused checks.\n"); err != nil {
+		t.Fatalf("update rules: %v", err)
+	}
+	if _, err := st.UpdateProjectPreferences(ctx, store.DefaultProjectID, "Prefer concise updates.\n"); err != nil {
+		t.Fatalf("update preferences: %v", err)
+	}
+
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	home := getIndexBody(t, srv)
+	assertContains(t, home, "/projects/default/settings")
+	body := getSettingsBody(t, srv, "/projects/default/settings")
+	assertContains(t, body, "Project Settings")
+	assertContains(t, body, "Rules")
+	assertContains(t, body, "Run focused checks.")
+	assertContains(t, body, "Preferences")
+	assertContains(t, body, "Prefer concise updates.")
+	assertContains(t, body, "No repository configured; repo candidate loading is unavailable.")
+	assertNotContains(t, body, "Notifications")
+	assertNotContains(t, body, "title=")
+}
+
+func TestProjectSettingsSaveSwapsSingleSectionAndAllowsEmpty(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	if _, err := st.UpdateProjectPreferences(ctx, store.DefaultProjectID, "Existing preferences\n"); err != nil {
+		t.Fatalf("seed preferences: %v", err)
+	}
+
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/projects/default/settings/preferences", cookie, url.Values{"content": {""}, "_csrf": {csrf}})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST settings preferences status = %d want %d body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	body := rec.Body.String()
+	assertContains(t, body, "id=\"settings-preferences\"")
+	assertContains(t, body, "saved · updated")
+	assertNotContains(t, body, "settings-rules")
+	project, err := st.GetProject(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get project: %v", err)
+	}
+	if project.ProjectPreferences != "" {
+		t.Fatalf("project preferences = %q, want empty", project.ProjectPreferences)
+	}
+}
+
+func TestProjectSettingsLoadFromRepoIsDraftUntilSaved(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	repo := t.TempDir()
+	writeRepoCandidate(t, repo, store.ProjectRulesCandidatePath, "Candidate repo rules\n")
+	spec := store.DefaultProjectSpec(st.DataDir())
+	spec.RepositoryPath = repo
+	if _, err := st.EnsureProject(ctx, spec); err != nil {
+		t.Fatalf("ensure project repo: %v", err)
+	}
+	if _, err := st.UpdateProjectRules(ctx, store.DefaultProjectID, "Saved app rules\n"); err != nil {
+		t.Fatalf("seed rules: %v", err)
+	}
+
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	body := getSettingsBody(t, srv, "/projects/default/settings")
+	assertContains(t, body, "⚠ repo candidate differs")
+	assertContains(t, body, "Load from repo")
+	assertContains(t, body, "Loads <code>.parley/rules.md</code> into this editor as an unsaved draft.")
+
+	candidate := getSettingsBody(t, srv, "/projects/default/settings/rules/candidate")
+	assertContains(t, candidate, "Candidate repo rules")
+	assertContains(t, candidate, "repo candidate loaded as an unsaved draft · Save to commit")
+	project, err := st.GetProject(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get project after draft load: %v", err)
+	}
+	if project.ProjectRules != "Saved app rules\n" {
+		t.Fatalf("candidate load changed app rules = %q", project.ProjectRules)
+	}
+
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/projects/default/settings/rules", cookie, url.Values{"content": {"Candidate repo rules\n"}, "_csrf": {csrf}})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST settings rules status = %d want %d body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	project, err = st.GetProject(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get project after save: %v", err)
+	}
+	if project.ProjectRules != "Candidate repo rules\n" {
+		t.Fatalf("saved project rules = %q", project.ProjectRules)
+	}
+	body = getSettingsBody(t, srv, "/projects/default/settings")
+	assertNotContains(t, body, "⚠ repo candidate differs")
+}
+
+func TestProjectSettingsLoadFromRepoMissingCandidateRendersNotice(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	repo := t.TempDir()
+	spec := store.DefaultProjectSpec(st.DataDir())
+	spec.RepositoryPath = repo
+	if _, err := st.EnsureProject(ctx, spec); err != nil {
+		t.Fatalf("ensure project repo: %v", err)
+	}
+
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	body := getSettingsBody(t, srv, "/projects/default/settings/preferences/candidate")
+	assertContains(t, body, "No `.parley/preferences.md` in the repository.")
+	assertContains(t, body, "id=\"settings-preferences\"")
 }
 
 func TestProjectTasksOverviewOrderingNeedsYouBadgeAndProjectsCount(t *testing.T) {
@@ -904,6 +1019,28 @@ func getProjectsBody(t *testing.T, srv *Server) string {
 		t.Fatalf("GET /projects status = %d want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	return rec.Body.String()
+}
+
+func getSettingsBody(t *testing.T, srv *Server, path string) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080"+path, nil)
+	srv.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s status = %d want %d body=%s", path, rec.Code, http.StatusOK, rec.Body.String())
+	}
+	return rec.Body.String()
+}
+
+func writeRepoCandidate(t *testing.T, repo, rel, content string) {
+	t.Helper()
+	path := filepath.Join(repo, rel)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir candidate dir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write candidate: %v", err)
+	}
 }
 
 func postForm(t *testing.T, srv *Server, path string, cookie *http.Cookie, form url.Values) *httptest.ResponseRecorder {

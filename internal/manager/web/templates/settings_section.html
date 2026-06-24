@@ -1,0 +1,28 @@
+<section id="settings-{{.Kind}}" class="card settings-section">
+  <div class="settings-section-head">
+    <div>
+      <h2>{{.Label}}{{if .CandidateDiffers}} <span class="candidate-badge">⚠ repo candidate differs</span>{{end}}</h2>
+      <p class="muted">{{.Help}}</p>
+    </div>
+  </div>
+  {{if .Notice}}
+  <p class="settings-inline-notice" role="status" aria-live="polite">{{.Notice}}</p>
+  {{end}}
+  <form method="post" action="{{.SavePath}}" data-on:submit="@post('{{.SavePath}}', {contentType: 'form'})">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}" data-bind:csrf>
+    <label for="{{.TextareaID}}">{{.Label}}</label>
+    <textarea id="{{.TextareaID}}" name="content" rows="12" placeholder="{{.Placeholder}}">{{.TextareaValue}}</textarea>
+    <div class="settings-actions">
+      <button type="submit">Save {{.ShortLabel}}</button>
+      {{if .RepositoryConfigured}}
+      <button class="secondary" type="button" data-on:click="@get('{{.LoadCandidatePath}}')">Load from repo</button>
+      <span class="muted">Loads <code>{{.CandidatePath}}</code> into this editor as an unsaved draft.</span>
+      {{else}}
+      <span class="muted">No repository configured; repo candidate loading is unavailable.</span>
+      {{end}}
+    </div>
+    {{if .Status}}
+    <p class="settings-status muted" role="status" aria-live="polite">{{.Status}}</p>
+    {{end}}
+  </form>
+</section>

@@ -24,6 +24,7 @@ type Renderer interface {
 	RenderRunFragments(store.RunBundle) (string, error)
 	RenderProjectChat(ProjectChatData) (string, error)
 	RenderProjectHomeFragments(ProjectHomeFragmentsData) (string, error)
+	RenderProjectSettingsSection(ProjectSettingsSectionData) (string, error)
 }
 
 type TemplateRenderer struct {
@@ -46,6 +47,33 @@ type IndexData struct {
 type ProjectHomeFragmentsData struct {
 	Tasks ProjectTasksData
 	Chat  ProjectChatData
+}
+
+type ProjectSettingsData struct {
+	Project     store.Project
+	Rules       ProjectSettingsSectionData
+	Preferences ProjectSettingsSectionData
+	CSRF        string
+	Title       string
+}
+
+type ProjectSettingsSectionData struct {
+	Project              store.Project
+	Kind                 string
+	Label                string
+	ShortLabel           string
+	Help                 string
+	TextareaID           string
+	TextareaValue        string
+	Placeholder          string
+	CandidatePath        string
+	SavePath             string
+	LoadCandidatePath    string
+	RepositoryConfigured bool
+	CandidateDiffers     bool
+	Notice               string
+	Status               string
+	CSRF                 string
 }
 
 type ProjectTasksData struct {
@@ -524,6 +552,14 @@ func (r *TemplateRenderer) RenderProjectHomeFragments(data ProjectHomeFragmentsD
 		if err := r.templates.ExecuteTemplate(&buf, name, fragmentData); err != nil {
 			return "", fmt.Errorf("execute project home fragment %s: %w", name, err)
 		}
+	}
+	return compactHTML(buf.String()), nil
+}
+
+func (r *TemplateRenderer) RenderProjectSettingsSection(data ProjectSettingsSectionData) (string, error) {
+	var buf bytes.Buffer
+	if err := r.templates.ExecuteTemplate(&buf, "settings_section.html", data); err != nil {
+		return "", fmt.Errorf("execute project settings section: %w", err)
 	}
 	return compactHTML(buf.String()), nil
 }
