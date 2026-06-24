@@ -6,11 +6,12 @@
   {{if .Items}}
   <ul class="task-overview-list">
     {{range .Items}}
-    <li class="task-overview-row {{if .NeedsYou}}needs-you{{end}}" title="stage: {{.CurrentStage}}&#10;last update: {{.LastUpdate}}&#10;performer: {{.Performer}}&#10;runner: {{.Runner}}">
+    <li class="task-overview-row {{if .NeedsYou}}needs-you{{end}}">
       <span class="status-dot {{statusClass .Status}}" aria-hidden="true"></span>
       {{if .NeedsYou}}<span class="needs-you-badge">⚠ needs you: {{.NeedsReason}}</span>{{end}}
       <a class="task-row-link" href="{{.Link}}">
         <span class="task-idea">{{.Idea}}</span>
+        <span class="task-stage-hint muted">· {{.CurrentStage}}</span>
         <span class="pill {{statusClass .Status}}">{{statusLabel .Status}}</span>
         <span aria-hidden="true">→</span>
       </a>
