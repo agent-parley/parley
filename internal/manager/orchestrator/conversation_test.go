@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,6 +88,171 @@ func TestSubmitConversationMessageDispatchesFreshAgentTurnAndPersistsReply(t *te
 	}
 }
 
+func TestConversationDispatchInputIncludesReadOnlyOrchestrationState(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	repoPath := t.TempDir()
+	project, err := st.EnsureProject(ctx, store.ProjectSpec{ID: store.DefaultProjectID, Name: "Default project", RepositoryPath: repoPath})
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	conversation, err := st.EnsureProjectConversation(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "fix flaky review gate", RefinementLevel: contract.RefinementLevelStandard, ConversationID: conversation.ID})
+	if err != nil {
+		t.Fatalf("create linked workflow run: %v", err)
+	}
+	stages, err := st.ListStages(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	reviewStage := firstStageByType(t, stages, contract.StageTypeReview)
+	verdict := report.ReviewVerdictChangesRequested
+	reviewReport := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		StageID:       reviewStage.ID,
+		StageType:     contract.StageTypeReview,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: "reviewer"},
+		Status:        report.StatusChangesRequested,
+		Verdict:       &verdict,
+		Summary:       "review rejected stale cache handling",
+		Payload: map[string]any{
+			"arbitration_decisions": []any{map[string]any{"finding_id": "finding-1", "classification": report.ReviewFindingAccepted, "rationale": "cache invalidation was missing"}},
+			"residual_risk":         "retry behavior still needs coverage",
+		},
+		Errors: []string{},
+	}
+	if _, err := st.SaveReportArtifact(ctx, reviewReport); err != nil {
+		t.Fatalf("save review report: %v", err)
+	}
+	if err := st.UpdateStageStatus(ctx, reviewStage.ID, report.StatusChangesRequested); err != nil {
+		t.Fatalf("update review stage status: %v", err)
+	}
+	if err := st.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusFailed); err != nil {
+		t.Fatalf("update run status: %v", err)
+	}
+	trigger, err := st.AddMessage(ctx, conversation.ID, store.MessageRoleUser, "Why did review reject the last run?")
+	if err != nil {
+		t.Fatalf("add trigger message: %v", err)
+	}
+
+	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{ConversationAdapter: "chat-agent"})
+	input, err := engine.conversationDispatchInput(ctx, project, conversation, trigger.ID)
+	if err != nil {
+		t.Fatalf("conversationDispatchInput() error = %v", err)
+	}
+	if actions, ok := input["allowed_actions"].([]string); !ok || len(actions) != 0 {
+		t.Fatalf("allowed_actions = %#v, want empty allow-list", input["allowed_actions"])
+	}
+	state, ok := input["orchestration_state"].(conversationOrchestrationState)
+	if !ok {
+		t.Fatalf("orchestration_state = %#v, want structured state", input["orchestration_state"])
+	}
+	if len(state.ConversationTasks) != 1 || state.ConversationTasks[0].ID != wr.Task.ID || state.ConversationTasks[0].ConversationID != conversation.ID {
+		t.Fatalf("conversation tasks = %#v, want linked task %s", state.ConversationTasks, wr.Task.ID)
+	}
+	if len(state.Runs) != 1 || state.Runs[0].ID != wr.Run.ID || state.Runs[0].TaskConversationID != conversation.ID {
+		t.Fatalf("runs = %#v, want linked run %s", state.Runs, wr.Run.ID)
+	}
+	var foundReview bool
+	for _, stage := range state.Runs[0].Stages {
+		if stage.ID != reviewStage.ID {
+			continue
+		}
+		foundReview = true
+		if stage.Status != report.StatusChangesRequested || stage.Verdict != string(report.ReviewVerdictChangesRequested) || len(stage.Reports) != 1 {
+			t.Fatalf("review stage state = %#v, want rejected verdict and one report", stage)
+		}
+		if stage.Reports[0].Summary != "review rejected stale cache handling" || stage.Reports[0].Payload["residual_risk"] != "retry behavior still needs coverage" {
+			t.Fatalf("review report state = %#v, want report summary/payload", stage.Reports[0])
+		}
+	}
+	if !foundReview {
+		t.Fatalf("review stage %s not found in state: %#v", reviewStage.ID, state.Runs[0].Stages)
+	}
+	summary, _ := input["orchestration_state_summary"].(string)
+	if !strings.Contains(summary, wr.Run.ID) || !strings.Contains(summary, "changes_requested") || !strings.Contains(summary, "review rejected stale cache handling") {
+		t.Fatalf("summary missing run verdict/report: %q", summary)
+	}
+	markdown, _ := input["orchestration_state_markdown"].(string)
+	for _, want := range []string{wr.Run.ID, reviewStage.ID, "review rejected stale cache handling", "cache invalidation was missing"} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("orchestration markdown missing %q:\n%s", want, markdown)
+		}
+	}
+}
+
+func TestConversationReadOrchestrationDoesNotCreateWorkOrEmitActions(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	repoPath := t.TempDir()
+	project, err := st.EnsureProject(ctx, store.ProjectSpec{ID: store.DefaultProjectID, Name: "Default project", RepositoryPath: repoPath})
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	conversation, err := st.EnsureProjectConversation(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "finished work", ConversationID: conversation.ID})
+	if err != nil {
+		t.Fatalf("create linked workflow run: %v", err)
+	}
+	beforeRuns, err := st.ListRunsForProject(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list runs before: %v", err)
+	}
+	beforeTasks, err := st.ListTasksForConversation(ctx, conversation.ID)
+	if err != nil {
+		t.Fatalf("list tasks before: %v", err)
+	}
+	runner := &conversationTestRunner{dispatches: make(chan contract.Dispatch, 1), reply: "Run `" + wr.Run.ID + "` is visible from orchestration state."}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{ConversationAdapter: "chat-agent"})
+
+	if _, err := engine.SubmitConversationMessage(ctx, project.ID, "How did the last run go?"); err != nil {
+		t.Fatalf("SubmitConversationMessage() error = %v", err)
+	}
+	disp := receiveDispatch(t, runner.dispatches)
+	if actions, ok := disp.Input["allowed_actions"].([]string); !ok || len(actions) != 0 {
+		t.Fatalf("allowed_actions = %#v, want empty allow-list", disp.Input["allowed_actions"])
+	}
+	if _, ok := disp.Input["orchestration_state"].(conversationOrchestrationState); !ok {
+		t.Fatalf("orchestration_state = %#v, want structured state", disp.Input["orchestration_state"])
+	}
+	messages := waitForConversationMessages(t, st, conversation.ID, 2)
+	last := messages[len(messages)-1]
+	if last.Role != store.MessageRoleAssistant || !strings.Contains(last.Body, wr.Run.ID) {
+		t.Fatalf("last message = %#v, want orchestration answer", last)
+	}
+	afterRuns, err := st.ListRunsForProject(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("list runs after: %v", err)
+	}
+	if len(afterRuns) != len(beforeRuns) {
+		t.Fatalf("runs after = %#v, want same count as before %#v", afterRuns, beforeRuns)
+	}
+	afterTasks, err := st.ListTasksForConversation(ctx, conversation.ID)
+	if err != nil {
+		t.Fatalf("list tasks after: %v", err)
+	}
+	if len(afterTasks) != len(beforeTasks) {
+		t.Fatalf("conversation tasks after = %#v, want same count as before %#v", afterTasks, beforeTasks)
+	}
+}
+
 func TestConversationAgentActionsAreRejectedInTracerSlice(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
@@ -162,6 +328,17 @@ func (b *capturingConversationBroadcaster) Broadcast(_ string, ev event.Event, _
 	case b.events <- ev:
 	default:
 	}
+}
+
+func firstStageByType(t *testing.T, stages []store.Stage, stageType string) store.Stage {
+	t.Helper()
+	for _, stage := range stages {
+		if stage.StageType == stageType {
+			return stage
+		}
+	}
+	t.Fatalf("stage type %s not found in %#v", stageType, stages)
+	return store.Stage{}
 }
 
 func receiveDispatch(t *testing.T, ch <-chan contract.Dispatch) contract.Dispatch {

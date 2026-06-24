@@ -275,6 +275,14 @@ func (a Pi) Prepare(ctx context.Context, disp contract.Dispatch) (PiPreparedRun,
 
 	workerInputPath := filepath.Join(artifactDir, "worker-input.md")
 	reportPath := filepath.Join(artifactDir, "report.json")
+	if isConversationDispatch(disp) {
+		if stateMarkdown := inputString(disp.Input, "orchestration_state_markdown"); strings.TrimSpace(stateMarkdown) != "" {
+			statePath := filepath.Join(artifactDir, "orchestration-state.md")
+			if err := os.WriteFile(statePath, []byte(strings.TrimSpace(stateMarkdown)+"\n"), 0o600); err != nil {
+				return PiPreparedRun{}, fmt.Errorf("write orchestration-state.md: %w", err)
+			}
+		}
+	}
 	if err := os.WriteFile(workerInputPath, []byte(workerInputMarkdown(disp, containerReportPath)), 0o600); err != nil {
 		return PiPreparedRun{}, fmt.Errorf("write worker-input.md: %w", err)
 	}
@@ -631,7 +639,7 @@ func capturePiDiff(ctx context.Context, prepared PiPreparedRun, sink runnerio.Si
 
 func initialPrompt(disp contract.Dispatch, workerInputPath, reportPath string) string {
 	if isConversationDispatch(disp) {
-		return "Read " + workerInputPath + ", inspect /project/repo only through read/list/grep-style read-only evidence, answer the latest user message, and write " + reportPath + " with payload.reply_markdown when finished."
+		return "Read " + workerInputPath + ", inspect /project/repo only through read/list/grep-style read-only evidence, read the mounted orchestration-state snapshot when project/run status matters, answer the latest user message, and write " + reportPath + " with payload.reply_markdown when finished."
 	}
 	if isPlanningDispatch(disp) {
 		return "Read " + workerInputPath + ", inspect /project/repo as read-only evidence, produce the single-shot task plan requested there in payload.task_plan_markdown, and write " + reportPath + " when finished."
@@ -663,7 +671,7 @@ func workerInputMarkdown(disp contract.Dispatch, reportPath string) string {
 	fmt.Fprintf(&b, "- Stage ID: `%s`\n", disp.StageID)
 	fmt.Fprintf(&b, "- Stage Type: `%s`\n\n", disp.StageType)
 	if isConversationDispatch(disp) {
-		appendConversationWorkerContract(&b, disp)
+		appendConversationWorkerContract(&b, disp, reportPath)
 	} else if isPlanningDispatch(disp) {
 		appendPlanningWorkerContract(&b, disp)
 	} else {
@@ -713,7 +721,7 @@ func workerInputMarkdown(disp contract.Dispatch, reportPath string) string {
 	return b.String()
 }
 
-func appendConversationWorkerContract(b *strings.Builder, disp contract.Dispatch) {
+func appendConversationWorkerContract(b *strings.Builder, disp contract.Dispatch, reportPath string) {
 	b.WriteString("## Conversational Planning Agent Contract\n\n")
 	b.WriteString("You are Parley's Conversational Planning Agent for Chat. This is one fresh per-message turn; there is no resident session. Rehydrate from the persisted Message history below, answer the latest user message, then stop.\n\n")
 	b.WriteString("### Authority boundary\n\n")
@@ -724,7 +732,9 @@ func appendConversationWorkerContract(b *strings.Builder, disp contract.Dispatch
 	b.WriteString("### Tool policy\n\n")
 	b.WriteString("- Repository tools: read, list, grep only over `/project/repo`.\n")
 	b.WriteString("- Workspace tools: read and write under `/project/workspace`.\n")
+	b.WriteString("- Orchestration state is provided as mounted read-only evidence in this turn; read the snapshot file instead of calling or inventing an API.\n")
 	b.WriteString("- Do not use a JSON API or invent an API response; Parley will persist your reply as a Message and stream hypermedia over SSE.\n\n")
+	appendConversationOrchestrationContract(b, disp, reportPath)
 	b.WriteString("### Conversation history\n\n```json\n")
 	b.WriteString(inputJSON(disp.Input, "messages", []any{}))
 	b.WriteString("\n```\n\n")
@@ -736,6 +746,21 @@ func appendConversationWorkerContract(b *strings.Builder, disp contract.Dispatch
 	if projectPreferences := inputString(disp.Input, "project_preferences"); projectPreferences != "" {
 		b.WriteString("### Project preferences\n\n")
 		b.WriteString(projectPreferences)
+		b.WriteString("\n\n")
+	}
+}
+
+func appendConversationOrchestrationContract(b *strings.Builder, disp contract.Dispatch, reportPath string) {
+	summary := inputString(disp.Input, "orchestration_state_summary")
+	if strings.TrimSpace(summary) == "" && disp.Input["orchestration_state"] == nil && strings.TrimSpace(inputString(disp.Input, "orchestration_state_markdown")) == "" {
+		return
+	}
+	statePath := filepath.ToSlash(filepath.Join(filepath.Dir(reportPath), "orchestration-state.md"))
+	b.WriteString("### Orchestration state\n\n")
+	fmt.Fprintf(b, "A fuller read-only orchestration snapshot for this turn is mounted at `%s`. Read it when answering questions about Tasks, Runs, Stages, verdicts, report summaries, review rejection reasons, or open work. Cite the relevant run/stage/report IDs or verdicts when they support your answer.\n\n", statePath)
+	if strings.TrimSpace(summary) != "" {
+		b.WriteString("Compact summary:\n\n")
+		b.WriteString(summary)
 		b.WriteString("\n\n")
 	}
 }
