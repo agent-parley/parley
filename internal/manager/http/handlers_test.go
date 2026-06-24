@@ -401,6 +401,31 @@ func TestProjectSettingsLoadFromRepoIsDraftUntilSaved(t *testing.T) {
 	assertNotContains(t, body, "⚠ repo candidate differs")
 }
 
+func TestProjectSettingsDiffBadgeIgnoresTrailingWhitespace(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	repo := t.TempDir()
+	writeRepoCandidate(t, repo, store.ProjectRulesCandidatePath, "Shared project rules\n\t ")
+	spec := store.DefaultProjectSpec(st.DataDir())
+	spec.RepositoryPath = repo
+	if _, err := st.EnsureProject(ctx, spec); err != nil {
+		t.Fatalf("ensure project repo: %v", err)
+	}
+	if _, err := st.UpdateProjectRules(ctx, store.DefaultProjectID, "Shared project rules"); err != nil {
+		t.Fatalf("seed matching rules: %v", err)
+	}
+
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	body := getSettingsBody(t, srv, "/projects/default/settings")
+	assertNotContains(t, body, "⚠ repo candidate differs")
+
+	if _, err := st.UpdateProjectRules(ctx, store.DefaultProjectID, "Different project rules"); err != nil {
+		t.Fatalf("seed differing rules: %v", err)
+	}
+	body = getSettingsBody(t, srv, "/projects/default/settings")
+	assertContains(t, body, "⚠ repo candidate differs")
+}
+
 func TestProjectSettingsLoadFromRepoMissingCandidateRendersNotice(t *testing.T) {
 	ctx := context.Background()
 	st := openRouteTestStore(t)
