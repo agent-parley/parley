@@ -158,10 +158,14 @@ func piAdapter() adapter.AgentAdapter {
 	}
 	agentStateRoot := cleanPath(getenv("PARLEY_AGENT_STATE_ROOT", filepath.Join(dataRoot, "agent-state")))
 	authPath := cleanPath(getenv("PARLEY_PI_AUTH_JSON", filepath.Join(agentStateRoot, "auth.json")))
+	workspaceRoot := cleanOptionalPath(os.Getenv("PARLEY_WORKSPACE_ROOT"))
 
 	artifactRoots := []string{dataRoot}
 	if artifactDir != "" {
 		artifactRoots = append(artifactRoots, artifactDir)
+	}
+	if workspaceRoot != "" {
+		artifactRoots = append(artifactRoots, workspaceRoot)
 	}
 	referenceRoots := []string{}
 	if referenceRoot != "" {
@@ -188,6 +192,7 @@ func piAdapter() adapter.AgentAdapter {
 		ProjectID:          getenv("PARLEY_PROJECT_ID", "default"),
 		SourceRepo:         sourceRepo,
 		ArtifactDir:        artifactDir,
+		WorkspaceRoot:      workspaceRoot,
 		ReferenceRoot:      referenceRoot,
 		AgentStateRoot:     agentStateRoot,
 		Image:              image,

@@ -108,6 +108,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	engine := orchestrator.NewEngineWithOptions(st, runner, renderer, hub, orchestrator.EngineOptions{
 		ImplementationAdapter: cfg.Adapter,
 		PlanningAdapter:       cfg.Adapter,
+		ConversationAdapter:   cfg.Adapter,
 		ValidationAdapter:     "validation",
 		DataRoot:              cfg.DataDir,
 		ProjectID:             project.ID,
@@ -125,6 +126,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 			"PARLEY_DATA_DIR=" + cfg.DataDir,
 			"PARLEY_PROJECT_ID=" + project.ID,
 			"PARLEY_SOURCE_REPO=" + sourceRepo,
+			"PARLEY_WORKSPACE_ROOT=" + project.WorkspacePath,
 		},
 	}
 	if err := app.startRunnerChild(ctx, false); err != nil {

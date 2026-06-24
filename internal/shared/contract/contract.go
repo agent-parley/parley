@@ -19,6 +19,7 @@ const (
 	StageTypePRReady        = "pr_ready"
 	StageTypeMemoryUpdate   = "memory_update"
 	StageTypeStopReport     = "stop_report"
+	StageTypeConversation   = "conversation"
 )
 
 const (
@@ -30,6 +31,7 @@ const (
 const (
 	AdapterInputModeImplementation = "implementation"
 	AdapterInputModePlanning       = "planning"
+	AdapterInputModeConversation   = "conversation"
 )
 
 const (

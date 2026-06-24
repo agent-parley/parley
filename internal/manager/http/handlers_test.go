@@ -124,29 +124,17 @@ func TestHandleRunsPassesExplicitRefinementLevel(t *testing.T) {
 	}
 }
 
-func TestHandleProjectChatMessagePersistsMessageAndStartsDirectRun(t *testing.T) {
-	ctx := context.Background()
+func TestHandleProjectChatMessageSubmitsConversationTurn(t *testing.T) {
 	st := openRouteTestStore(t)
 	controller := &fakeRunController{state: defaultRouteQueueState()}
-	var conversationID string
-	controller.startRunInputFunc = func(_ context.Context, projectID string, input contract.TaskInput) (string, error) {
+	controller.submitConversationMessageFunc = func(_ context.Context, projectID, body string) (store.Message, error) {
 		if projectID != store.DefaultProjectID {
-			t.Fatalf("StartProjectRun projectID = %q", projectID)
+			t.Fatalf("SubmitConversationMessage projectID = %q", projectID)
 		}
-		if input.Idea != "Build chat tracer bullet" {
-			t.Fatalf("chat idea = %q", input.Idea)
+		if body != "Build chat tracer bullet" {
+			t.Fatalf("chat body = %q", body)
 		}
-		if input.RefinementLevel != contract.RefinementLevelDirect {
-			t.Fatalf("refinement = %q, want direct", input.RefinementLevel)
-		}
-		if input.ConversationID == "" {
-			t.Fatal("conversation id is empty")
-		}
-		conversationID = input.ConversationID
-		if conversation, err := st.GetConversation(ctx, input.ConversationID); err != nil || conversation.ProjectID != store.DefaultProjectID {
-			t.Fatalf("conversation lookup = %+v err=%v", conversation, err)
-		}
-		return "run_chat", nil
+		return store.Message{ID: "msg_chat", ProjectID: projectID, Role: store.MessageRoleUser, Body: body}, nil
 	}
 
 	srv := newRouteTestServer(t, st, controller)
@@ -158,16 +146,8 @@ func TestHandleProjectChatMessagePersistsMessageAndStartsDirectRun(t *testing.T)
 	if got := rec.Header().Get("Location"); got != "/projects/default" {
 		t.Fatalf("Location = %q want /projects/default", got)
 	}
-	messages, err := st.ListMessagesForConversation(ctx, conversationID)
-	if err != nil {
-		t.Fatalf("list messages: %v", err)
-	}
-	if len(messages) != 1 || messages[0].Role != store.MessageRoleUser || messages[0].Body != "Build chat tracer bullet" {
-		t.Fatalf("messages = %#v, want persisted chat message", messages)
-	}
 	body := getIndexBody(t, srv)
 	assertContains(t, body, "Project Chat")
-	assertContains(t, body, "Build chat tracer bullet")
 	assertContains(t, body, "/projects/default/chat/events")
 }
 
@@ -508,23 +488,17 @@ func TestProjectTasksOverviewOrderingNeedsYouBadgeAndProjectsCount(t *testing.T)
 	assertContains(t, projectsBody, "⚠ 1 needs you")
 }
 
-func TestHandleProjectChatMessagePassesRefinementLevel(t *testing.T) {
+func TestHandleProjectChatMessageIgnoresRefinementLevelInTracerSlice(t *testing.T) {
 	st := openRouteTestStore(t)
 	controller := &fakeRunController{state: defaultRouteQueueState()}
-	controller.startRunInputFunc = func(_ context.Context, projectID string, input contract.TaskInput) (string, error) {
+	controller.submitConversationMessageFunc = func(_ context.Context, projectID, body string) (store.Message, error) {
 		if projectID != store.DefaultProjectID {
-			t.Fatalf("StartProjectRun projectID = %q", projectID)
+			t.Fatalf("SubmitConversationMessage projectID = %q", projectID)
 		}
-		if input.Idea != "Deeply refine this" {
-			t.Fatalf("chat idea = %q", input.Idea)
+		if body != "Deeply refine this" {
+			t.Fatalf("chat body = %q", body)
 		}
-		if input.RefinementLevel != contract.RefinementLevelDeep {
-			t.Fatalf("refinement = %q, want deep", input.RefinementLevel)
-		}
-		if input.ConversationID == "" {
-			t.Fatal("conversation id is empty")
-		}
-		return "run_chat_deep", nil
+		return store.Message{ID: "msg_chat", ProjectID: projectID, Role: store.MessageRoleUser, Body: body}, nil
 	}
 
 	srv := newRouteTestServer(t, st, controller)
@@ -1021,14 +995,15 @@ func markAwaitingHumanReview(t *testing.T, st *store.Store, wr store.WorkflowRun
 }
 
 type fakeRunController struct {
-	state              orchestrator.QueueState
-	queueStateFunc     func(context.Context) (orchestrator.QueueState, error)
-	startRunFunc       func(context.Context, string, string) (string, error)
-	startRunInputFunc  func(context.Context, string, contract.TaskInput) (string, error)
-	startQueuedRunFunc func(context.Context, string) error
-	cancelRunFunc      func(context.Context, string) error
-	humanReviewFunc    func(context.Context, string, string, orchestrator.HumanReviewSubmission) (report.Report, error)
-	deepIdeaFunc       func(context.Context, string, string, orchestrator.DeepIdeaAnswersSubmission) (orchestrator.DeepIdeaAnswerReceipt, error)
+	state                         orchestrator.QueueState
+	queueStateFunc                func(context.Context) (orchestrator.QueueState, error)
+	startRunFunc                  func(context.Context, string, string) (string, error)
+	startRunInputFunc             func(context.Context, string, contract.TaskInput) (string, error)
+	submitConversationMessageFunc func(context.Context, string, string) (store.Message, error)
+	startQueuedRunFunc            func(context.Context, string) error
+	cancelRunFunc                 func(context.Context, string) error
+	humanReviewFunc               func(context.Context, string, string, orchestrator.HumanReviewSubmission) (report.Report, error)
+	deepIdeaFunc                  func(context.Context, string, string, orchestrator.DeepIdeaAnswersSubmission) (orchestrator.DeepIdeaAnswerReceipt, error)
 }
 
 func (f *fakeRunController) StartProjectRun(ctx context.Context, projectID, idea string) (string, error) {
@@ -1046,6 +1021,13 @@ func (f *fakeRunController) StartProjectRunInput(ctx context.Context, projectID 
 		return f.startRunFunc(ctx, projectID, input.Idea)
 	}
 	return "", errors.New("unexpected StartProjectRunInput call")
+}
+
+func (f *fakeRunController) SubmitConversationMessage(ctx context.Context, projectID, body string) (store.Message, error) {
+	if f.submitConversationMessageFunc != nil {
+		return f.submitConversationMessageFunc(ctx, projectID, body)
+	}
+	return store.Message{}, errors.New("unexpected SubmitConversationMessage call")
 }
 
 func (f *fakeRunController) StartQueuedRun(ctx context.Context, runID string) error {

@@ -523,47 +523,15 @@ func (s *Server) handleProjectChatMessage(w http.ResponseWriter, r *http.Request
 		http.Error(w, "message is required", http.StatusBadRequest)
 		return
 	}
-	refinementLevel := strings.TrimSpace(r.Form.Get("refinement_level"))
-	if refinementLevel == "" {
-		refinementLevel = contract.RefinementLevelDirect
-	} else {
-		refinementLevel = contract.NormalizeRefinementLevel(refinementLevel)
-	}
-	if err := contract.ValidateRefinementLevel(refinementLevel); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
 	project, err := s.store.GetProject(r.Context(), projectID)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	conversation, err := s.store.EnsureProjectConversation(r.Context(), project.ID)
-	if err != nil {
+	if _, err := s.engine.SubmitConversationMessage(r.Context(), project.ID, message); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if _, err := s.store.AddMessage(r.Context(), conversation.ID, store.MessageRoleUser, message); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	input := contract.TaskInput{Idea: message, RefinementLevel: refinementLevel, ConversationID: conversation.ID}
-	if _, err := s.engine.StartProjectRunInput(r.Context(), project.ID, input); err != nil {
-		var backlogErr orchestrator.QueueBacklogFullError
-		if errors.As(err, &backlogErr) {
-			data, pageErr := s.indexData(r, project.ID)
-			if pageErr != nil {
-				http.Error(w, pageErr.Error(), http.StatusInternalServerError)
-				return
-			}
-			data.Notice = backlogFullNotice(backlogErr, data.Queue)
-			s.writePageStatus(w, "index.html", data, http.StatusTooManyRequests)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	s.broadcastProjectChat(r, project)
 	http.Redirect(w, r, "/projects/"+project.ID, http.StatusSeeOther)
 }
 

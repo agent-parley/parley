@@ -176,6 +176,112 @@ func TestPiPreparePlanningUsesReadOnlyRepoAndPlanningPrompt(t *testing.T) {
 	}
 }
 
+func TestPiPrepareConversationUsesReadOnlyCommittedSnapshotAndWorkspace(t *testing.T) {
+	ctx := context.Background()
+	fake := &scriptedPiProvider{}
+	source := initAdapterSourceRepo(t, ctx)
+	if err := os.WriteFile(filepath.Join(source, "uncommitted.txt"), []byte("not canonical\n"), 0o600); err != nil {
+		t.Fatalf("write uncommitted file: %v", err)
+	}
+	dataRoot := t.TempDir()
+	workspaceRoot := mkdirAdapterDir(t, dataRoot, "projects", "p1", "workspace")
+	agentState := mkdirAdapterDir(t, t.TempDir(), "agent-state")
+	authPath := writeTestAuth(t, t.TempDir())
+	adapter := NewPi(PiOptions{
+		Provider:           fake,
+		CredentialStrategy: AuthJSONCredentialStrategy{SourcePath: authPath},
+		DataRoot:           dataRoot,
+		ProjectID:          "p1",
+		SourceRepo:         source,
+		WorkspaceRoot:      workspaceRoot,
+		AgentStateRoot:     agentState,
+	})
+	disp := piTestDispatch()
+	disp.StageType = contract.StageTypeConversation
+	disp.Input = map[string]any{
+		"input_mode":         contract.AdapterInputModeConversation,
+		"conversation_id":    "conv_123",
+		"trigger_message_id": "msg_123",
+		"messages": []map[string]any{{
+			"role": "user",
+			"body": "Where is auth handled?",
+		}},
+	}
+	prepared, err := adapter.Prepare(ctx, disp)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if prepared.WorktreePath != "" {
+		t.Fatalf("conversation worktree path = %q, want no worktree", prepared.WorktreePath)
+	}
+	repoMount := mountHost(prepared.Invocation, containerRepoPath)
+	if repoMount == source || !strings.HasPrefix(repoMount, filepath.Join(dataRoot, "projects", "p1", "repo-snapshots")) {
+		t.Fatalf("repo mount host = %q, want committed snapshot under data root", repoMount)
+	}
+	if _, err := os.Stat(filepath.Join(repoMount, ".git")); !os.IsNotExist(err) {
+		t.Fatalf("snapshot .git stat err = %v, want no git worktree metadata", err)
+	}
+	if got := readTestFile(t, filepath.Join(repoMount, "README.md")); got != "hello\n" {
+		t.Fatalf("snapshot README = %q, want committed content", got)
+	}
+	if _, err := os.Stat(filepath.Join(repoMount, "uncommitted.txt")); !os.IsNotExist(err) {
+		t.Fatalf("snapshot uncommitted stat err = %v, want absent", err)
+	}
+	if mode := mountMode(prepared.Invocation, containerRepoPath); mode != "ro" {
+		t.Fatalf("repo mount mode = %q, want ro", mode)
+	}
+	if got := mountHost(prepared.Invocation, containerWorkspacePath); got != workspaceRoot {
+		t.Fatalf("workspace mount host = %q, want project workspace %q", got, workspaceRoot)
+	}
+	if prepared.Invocation.Role != "conversation" || prepared.Invocation.Profile != "conversation" {
+		t.Fatalf("invocation role/profile = %q/%q, want conversation", prepared.Invocation.Role, prepared.Invocation.Profile)
+	}
+	if !strings.HasPrefix(prepared.WorkerInputPath, filepath.Join(workspaceRoot, ".parley", "conversation-turns")) {
+		t.Fatalf("worker input path = %q, want under project workspace conversation turns", prepared.WorkerInputPath)
+	}
+	workerInput := readTestFile(t, prepared.WorkerInputPath)
+	for _, want := range []string{"Conversational Planning Agent", "no resident session", "Repository tools: read, list, grep", "payload.reply_markdown", "Do not include `action` or `actions`"} {
+		if !strings.Contains(workerInput, want) {
+			t.Fatalf("conversation worker input missing %q:\n%s", want, workerInput)
+		}
+	}
+	prompt := prepared.Invocation.Command[len(prepared.Invocation.Command)-1]
+	if !strings.Contains(prompt, prepared.ContainerWorkerInputPath) || !strings.Contains(prompt, prepared.ContainerReportPath) || !strings.Contains(prompt, "payload.reply_markdown") {
+		t.Fatalf("conversation prompt missing input/report paths or reply contract: %#v", prepared.Invocation.Command)
+	}
+}
+
+func TestPiRunConversationReadsReplyWithoutDiffArtifact(t *testing.T) {
+	ctx := context.Background()
+	fake := &scriptedPiProvider{
+		runs: []func(provider.PreparedInvocation) error{
+			func(inv provider.PreparedInvocation) error {
+				workspace, _ := piMountedDirs(inv)
+				reportPath := filepath.Join(workspace, ".parley", "conversation-turns", "conv_123", "msg_123", "report.json")
+				return os.WriteFile(reportPath, []byte(`{"status":"completed","summary":"answered","payload":{"reply_markdown":"Auth is in internal/auth."},"errors":[]}`), 0o600)
+			},
+		},
+	}
+	adapter := newTestPiAdapter(t, ctx, fake)
+	disp := piTestDispatch()
+	disp.StageType = contract.StageTypeConversation
+	disp.Input = map[string]any{"input_mode": contract.AdapterInputModeConversation, "conversation_id": "conv_123", "trigger_message_id": "msg_123"}
+	sink := &recordingSink{}
+	rep, err := adapter.Run(ctx, disp, sink)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if rep.Status != report.StatusCompleted || rep.Payload["reply_markdown"] != "Auth is in internal/auth." {
+		t.Fatalf("report = %#v, want conversation reply", rep)
+	}
+	if len(sink.artifacts) != 0 {
+		t.Fatalf("artifacts = %#v, want no diff/artifact for conversation", sink.artifacts)
+	}
+	if len(sink.events) != 0 {
+		t.Fatalf("events = %#v, want no run-scoped events for conversation", sink.events)
+	}
+}
+
 func TestPiRunRepairsInvalidReportOnce(t *testing.T) {
 	ctx := context.Background()
 	fake := &scriptedPiProvider{
@@ -413,6 +519,15 @@ func readTestFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(content)
+}
+
+func mountMode(inv provider.PreparedInvocation, containerPath string) string {
+	for _, mount := range inv.Mounts {
+		if mount.Container == containerPath {
+			return mount.Mode
+		}
+	}
+	return ""
 }
 
 func piMountedDirs(inv provider.PreparedInvocation) (workspace, repo string) {
