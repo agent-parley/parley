@@ -1,7 +1,6 @@
 package managerhttp
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -91,10 +90,6 @@ func (s *Server) handleProjectPath(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 6 && parts[3] == "human-stages" && parts[5] == "verdict" {
 		s.handleHumanReviewVerdict(w, r, projectID, runID, parts[4])
-		return
-	}
-	if len(parts) == 6 && parts[3] == "idea-stages" && parts[5] == "answers" {
-		s.handleDeepIdeaAnswers(w, r, projectID, runID, parts[4])
 		return
 	}
 	if len(parts) == 3 {
@@ -640,33 +635,13 @@ func (s *Server) projectChatData(r *http.Request, project store.Project) (web.Pr
 		return web.ProjectChatData{}, err
 	}
 	taskRuns := web.NewTaskRunViews(tasks, runs)
-	bundles, err := s.projectChatRunBundles(r, taskRuns)
-	if err != nil {
-		return web.ProjectChatData{}, err
-	}
 	return web.ProjectChatData{
-		Project:              project,
-		Conversation:         conversation,
-		Messages:             messages,
-		TaskRuns:             taskRuns,
-		IdeaQuestionMessages: web.NewChatIdeaQuestionMessages(bundles),
-		CSRF:                 csrfFromContext(r.Context()),
+		Project:      project,
+		Conversation: conversation,
+		Messages:     messages,
+		TaskRuns:     taskRuns,
+		CSRF:         csrfFromContext(r.Context()),
 	}, nil
-}
-
-func (s *Server) projectChatRunBundles(r *http.Request, taskRuns []web.TaskRunView) ([]store.RunBundle, error) {
-	bundles := make([]store.RunBundle, 0, len(taskRuns))
-	for _, taskRun := range taskRuns {
-		if !taskRun.HasRun {
-			continue
-		}
-		bundle, err := s.store.RunBundle(r.Context(), taskRun.Run.ID)
-		if err != nil {
-			return nil, err
-		}
-		bundles = append(bundles, bundle)
-	}
-	return bundles, nil
 }
 
 func (s *Server) broadcastProjectChat(r *http.Request, project store.Project) {
@@ -756,10 +731,6 @@ func (s *Server) handleRunPath(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 4 && parts[1] == "human-stages" && parts[3] == "verdict" {
 		s.handleHumanReviewVerdict(w, r, projectID, runID, parts[2])
-		return
-	}
-	if len(parts) == 4 && parts[1] == "idea-stages" && parts[3] == "answers" {
-		s.handleDeepIdeaAnswers(w, r, projectID, runID, parts[2])
 		return
 	}
 	if len(parts) == 1 {
@@ -890,93 +861,6 @@ func parseHumanReviewSubmission(r *http.Request) (orchestrator.HumanReviewSubmis
 		}
 	}
 	return submission, nil
-}
-
-func (s *Server) handleDeepIdeaAnswers(w http.ResponseWriter, r *http.Request, projectID, runID, stageID string) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method", http.StatusMethodNotAllowed)
-		return
-	}
-	if !s.runBelongsToProject(r, projectID, runID) {
-		http.NotFound(w, r)
-		return
-	}
-	submission, err := parseDeepIdeaAnswersSubmission(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	receipt, err := s.engine.SubmitDeepIdeaAnswers(r.Context(), runID, stageID, submission)
-	if err != nil {
-		if errors.Is(err, orchestrator.ErrDeepIdeaNotAwaiting) {
-			http.Error(w, err.Error(), http.StatusConflict)
-			return
-		}
-		if errors.Is(err, orchestrator.ErrInvalidDeepIdeaAnswer) {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if !requestIsJSON(r) {
-		if r.Form.Get("return_to") == "project_chat" {
-			if project, err := s.store.GetProject(r.Context(), projectID); err == nil {
-				s.broadcastProjectChat(r, project)
-			}
-			http.Redirect(w, r, "/projects/"+projectID, http.StatusSeeOther)
-			return
-		}
-		http.Redirect(w, r, projectRunPath(projectID, runID), http.StatusSeeOther)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(receipt)
-}
-
-func parseDeepIdeaAnswersSubmission(r *http.Request) (orchestrator.DeepIdeaAnswersSubmission, error) {
-	if requestIsJSON(r) {
-		var submission orchestrator.DeepIdeaAnswersSubmission
-		if err := json.NewDecoder(r.Body).Decode(&submission); err != nil {
-			return orchestrator.DeepIdeaAnswersSubmission{}, err
-		}
-		return submission, nil
-	}
-	if err := r.ParseForm(); err != nil {
-		return orchestrator.DeepIdeaAnswersSubmission{}, err
-	}
-	submission := orchestrator.DeepIdeaAnswersSubmission{
-		ActorID:    r.Form.Get("actor_id"),
-		AnswerText: firstNonEmptyFormValue(r, "answer_text", "answer", "answers"),
-	}
-	questions := r.Form["question"]
-	answers := r.Form["answer"]
-	for i, answer := range answers {
-		answer = strings.TrimSpace(answer)
-		if answer == "" {
-			continue
-		}
-		item := orchestrator.DeepIdeaAnswer{Answer: answer}
-		if i < len(questions) {
-			item.Question = strings.TrimSpace(questions[i])
-		}
-		submission.Answers = append(submission.Answers, item)
-	}
-	return submission, nil
-}
-
-func requestIsJSON(r *http.Request) bool {
-	return strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json")
-}
-
-func firstNonEmptyFormValue(r *http.Request, keys ...string) string {
-	for _, key := range keys {
-		if value := strings.TrimSpace(r.Form.Get(key)); value != "" {
-			return value
-		}
-	}
-	return ""
 }
 
 func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request, projectID, runID string) {

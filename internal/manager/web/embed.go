@@ -3,7 +3,6 @@ package web
 import (
 	"bytes"
 	"embed"
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"os"
@@ -147,12 +146,11 @@ type ProjectNeedsYouView struct {
 }
 
 type ProjectChatData struct {
-	Project              store.Project
-	Conversation         store.Conversation
-	Messages             []store.Message
-	TaskRuns             []TaskRunView
-	IdeaQuestionMessages []ChatIdeaQuestionMessage
-	CSRF                 string
+	Project      store.Project
+	Conversation store.Conversation
+	Messages     []store.Message
+	TaskRuns     []TaskRunView
+	CSRF         string
 }
 
 type TaskRunView struct {
@@ -160,22 +158,6 @@ type TaskRunView struct {
 	Run         store.Run
 	HasRun      bool
 	ReviewReady bool
-}
-
-type ChatIdeaQuestionMessage struct {
-	Task      store.Task
-	Run       store.Run
-	StageID   string
-	Round     int
-	MaxRounds int
-	Questions []string
-	CreatedAt string
-
-	AnswerText string
-	Answers    []orchestrator.DeepIdeaAnswer
-	AnsweredAt string
-	Answered   bool
-	Pending    bool
 }
 
 type Notice struct {
@@ -239,17 +221,16 @@ type RunData struct {
 
 type RunView struct {
 	store.RunBundle
-	ArtifactViews        []ArtifactView
-	DiffPatch            ArtifactView
-	PRReady              PRReadyView
-	PendingIdeaQuestions *IdeaQuestionView
-	PendingHumanReview   *HumanReviewView
-	StageGroups          []StageGroupView
-	TaskPlan             TaskPlanView
-	Outcome              OutcomeView
-	DiffLines            []DiffLineView
-	DiffIsLong           bool
-	CSRF                 string
+	ArtifactViews      []ArtifactView
+	DiffPatch          ArtifactView
+	PRReady            PRReadyView
+	PendingHumanReview *HumanReviewView
+	StageGroups        []StageGroupView
+	TaskPlan           TaskPlanView
+	Outcome            OutcomeView
+	DiffLines          []DiffLineView
+	DiffIsLong         bool
+	CSRF               string
 }
 
 type StageGroupView struct {
@@ -285,13 +266,6 @@ type OutcomeView struct {
 	Summary       string
 	LastEvent     *EventView
 	TerminalEvent *EventView
-}
-
-type IdeaQuestionView struct {
-	StageID   string
-	Round     int
-	MaxRounds int
-	Questions []string
 }
 
 type HumanReviewView struct {
@@ -358,11 +332,11 @@ func newTaskOverviewItem(projectID string, bundle store.RunBundle, autoWhenReady
 	}
 	if bundle.Run.Status == store.RunStatusAwaitingHuman {
 		item.NeedsYou = true
-		if pendingIdeaQuestions(bundle) != nil {
-			item.NeedsReason = "question pending"
-		} else {
+		if pendingHumanReview(bundle) != nil {
 			item.NeedsReason = "diff ready"
 			item.Link += "?tab=review"
+		} else {
+			item.NeedsReason = "human input needed"
 		}
 	}
 	return item
@@ -452,88 +426,6 @@ func NewTaskRunViews(tasks []store.Task, runs []store.Run) []TaskRunView {
 	return views
 }
 
-func NewChatIdeaQuestionMessages(bundles []store.RunBundle) []ChatIdeaQuestionMessage {
-	var messages []ChatIdeaQuestionMessage
-	for _, bundle := range bundles {
-		if contract.NormalizeRefinementLevel(bundle.Run.RefinementLevel) != contract.RefinementLevelDeep {
-			continue
-		}
-		rounds := map[int]*ChatIdeaQuestionMessage{}
-		for _, artifact := range bundle.Artifacts {
-			switch artifact.Kind {
-			case "idea_refinement_questions":
-				var packet chatIdeaQuestionPacket
-				if readArtifactJSON(artifact, &packet) != nil || packet.Round <= 0 || len(packet.Questions) == 0 {
-					continue
-				}
-				round := chatIdeaQuestionRound(rounds, packet.Round, bundle)
-				round.StageID = packet.StageID
-				round.MaxRounds = packet.MaxRounds
-				round.Questions = append([]string{}, packet.Questions...)
-				round.CreatedAt = artifact.CreatedAt
-			case "idea_refinement_answers":
-				var packet chatIdeaAnswerPacket
-				if readArtifactJSON(artifact, &packet) != nil || packet.Round <= 0 {
-					continue
-				}
-				round := chatIdeaQuestionRound(rounds, packet.Round, bundle)
-				round.AnswerText = strings.TrimSpace(packet.AnswerText)
-				round.Answers = append([]orchestrator.DeepIdeaAnswer{}, packet.Answers...)
-				round.AnsweredAt = artifact.CreatedAt
-				round.Answered = true
-			}
-		}
-		for _, round := range rounds {
-			if len(round.Questions) == 0 {
-				continue
-			}
-			round.Pending = bundle.Run.Status == store.RunStatusAwaitingHuman && !round.Answered && round.StageID != ""
-			messages = append(messages, *round)
-		}
-	}
-	sort.SliceStable(messages, func(i, j int) bool {
-		left := chatIdeaQuestionMessageTime(messages[i])
-		right := chatIdeaQuestionMessageTime(messages[j])
-		if left == right {
-			return messages[i].Round < messages[j].Round
-		}
-		return left < right
-	})
-	return messages
-}
-
-type chatIdeaQuestionPacket struct {
-	StageID   string   `json:"stage_id"`
-	Round     int      `json:"round"`
-	MaxRounds int      `json:"max_rounds"`
-	Questions []string `json:"questions"`
-}
-
-type chatIdeaAnswerPacket struct {
-	Round      int                           `json:"round"`
-	AnswerText string                        `json:"answer_text,omitempty"`
-	Answers    []orchestrator.DeepIdeaAnswer `json:"answers,omitempty"`
-}
-
-func chatIdeaQuestionRound(rounds map[int]*ChatIdeaQuestionMessage, round int, bundle store.RunBundle) *ChatIdeaQuestionMessage {
-	view := rounds[round]
-	if view == nil {
-		view = &ChatIdeaQuestionMessage{Task: bundle.Task, Run: bundle.Run, Round: round, CreatedAt: bundle.Run.CreatedAt}
-		rounds[round] = view
-	}
-	return view
-}
-
-func chatIdeaQuestionMessageTime(message ChatIdeaQuestionMessage) string {
-	if message.CreatedAt != "" {
-		return message.CreatedAt
-	}
-	if message.AnsweredAt != "" {
-		return message.AnsweredAt
-	}
-	return message.Run.CreatedAt
-}
-
 func NewRunData(bundle store.RunBundle, csrf, title, tab string) RunData {
 	view := NewRunView(bundle)
 	view.CSRF = csrf
@@ -541,7 +433,7 @@ func NewRunData(bundle store.RunBundle, csrf, title, tab string) RunData {
 }
 
 func NewRunView(bundle store.RunBundle) RunView {
-	view := RunView{RunBundle: bundle, PRReady: prReadyFromEvents(bundle), PendingIdeaQuestions: pendingIdeaQuestions(bundle), PendingHumanReview: pendingHumanReview(bundle)}
+	view := RunView{RunBundle: bundle, PRReady: prReadyFromEvents(bundle), PendingHumanReview: pendingHumanReview(bundle)}
 	for _, artifact := range bundle.Artifacts {
 		artifactView := newArtifactView(artifact)
 		view.ArtifactViews = append(view.ArtifactViews, artifactView)
@@ -897,41 +789,6 @@ func isHTMLMediaType(mediaType string) bool {
 	return strings.HasPrefix(mediaType, "text/html") || strings.Contains(mediaType, "html")
 }
 
-func pendingIdeaQuestions(bundle store.RunBundle) *IdeaQuestionView {
-	if bundle.Run.Status != store.RunStatusAwaitingHuman {
-		return nil
-	}
-	type questionPacket struct {
-		StageID   string   `json:"stage_id"`
-		Round     int      `json:"round"`
-		MaxRounds int      `json:"max_rounds"`
-		Questions []string `json:"questions"`
-	}
-	type answerPacket struct {
-		Round int `json:"round"`
-	}
-	answered := map[int]bool{}
-	var latest questionPacket
-	for _, artifact := range bundle.Artifacts {
-		switch artifact.Kind {
-		case "idea_refinement_answers":
-			var packet answerPacket
-			if readArtifactJSON(artifact, &packet) == nil && packet.Round > 0 {
-				answered[packet.Round] = true
-			}
-		case "idea_refinement_questions":
-			var packet questionPacket
-			if readArtifactJSON(artifact, &packet) == nil && packet.Round > latest.Round {
-				latest = packet
-			}
-		}
-	}
-	if latest.StageID == "" || latest.Round == 0 || answered[latest.Round] || len(latest.Questions) == 0 {
-		return nil
-	}
-	return &IdeaQuestionView{StageID: latest.StageID, Round: latest.Round, MaxRounds: latest.MaxRounds, Questions: latest.Questions}
-}
-
 func pendingHumanReview(bundle store.RunBundle) *HumanReviewView {
 	if bundle.Run.Status != store.RunStatusAwaitingHuman {
 		return nil
@@ -970,14 +827,6 @@ func pendingHumanReview(bundle store.RunBundle) *HumanReviewView {
 func eventString(ev event.Event, key string) string {
 	value, _ := ev.Data[key].(string)
 	return strings.TrimSpace(value)
-}
-
-func readArtifactJSON(artifact store.Artifact, target any) error {
-	content, err := os.ReadFile(artifact.Path)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(content, target)
 }
 
 func prReadyFromEvents(bundle store.RunBundle) PRReadyView {

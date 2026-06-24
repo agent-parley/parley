@@ -25,7 +25,6 @@ const (
 const (
 	RefinementLevelDirect   = "direct"
 	RefinementLevelStandard = "standard"
-	RefinementLevelDeep     = "deep"
 )
 
 const (
@@ -85,7 +84,9 @@ type TaskInput struct {
 
 func NormalizeRefinementLevel(level string) string {
 	level = strings.ToLower(strings.TrimSpace(level))
-	if level == "" {
+	// Legacy persisted/submitted "deep" values degrade to the non-interactive
+	// Standard planner now that interactive refinement lives in Conversation.
+	if level == "" || level == "deep" {
 		return RefinementLevelStandard
 	}
 	return level
@@ -93,10 +94,10 @@ func NormalizeRefinementLevel(level string) string {
 
 func ValidateRefinementLevel(level string) error {
 	switch NormalizeRefinementLevel(level) {
-	case RefinementLevelDirect, RefinementLevelStandard, RefinementLevelDeep:
+	case RefinementLevelDirect, RefinementLevelStandard:
 		return nil
 	default:
-		return fmt.Errorf("refinement_level must be one of %q, %q, or %q", RefinementLevelDirect, RefinementLevelStandard, RefinementLevelDeep)
+		return fmt.Errorf("refinement_level must be one of %q or %q", RefinementLevelDirect, RefinementLevelStandard)
 	}
 }
 

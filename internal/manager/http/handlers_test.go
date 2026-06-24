@@ -97,7 +97,7 @@ func TestHandleRunsHappyPathRedirectsToRun(t *testing.T) {
 	}
 }
 
-func TestHandleRunsPassesExplicitRefinementLevel(t *testing.T) {
+func TestHandleRunsCoercesLegacyRefinementLevel(t *testing.T) {
 	st := openRouteTestStore(t)
 	controller := &fakeRunController{state: defaultRouteQueueState()}
 	controller.startRunInputFunc = func(_ context.Context, projectID string, input contract.TaskInput) (string, error) {
@@ -107,13 +107,13 @@ func TestHandleRunsPassesExplicitRefinementLevel(t *testing.T) {
 		if input.Idea != "build the thing" {
 			t.Fatalf("StartRun idea = %q", input.Idea)
 		}
-		if input.RefinementLevel != contract.RefinementLevelDeep {
-			t.Fatalf("refinement level = %q, want deep", input.RefinementLevel)
+		if input.RefinementLevel != contract.RefinementLevelStandard {
+			t.Fatalf("refinement level = %q, want standard", input.RefinementLevel)
 		}
 		if input.WorkflowTemplateID != "team_template" {
 			t.Fatalf("workflow template id = %q, want team_template", input.WorkflowTemplateID)
 		}
-		return "run_deep", nil
+		return "run_legacy", nil
 	}
 
 	srv := newRouteTestServer(t, st, controller)
@@ -440,20 +440,11 @@ func TestProjectTasksOverviewOrderingNeedsYouBadgeAndProjectsCount(t *testing.T)
 	if err := st.UpdateRunStatus(ctx, running.Run.ID, store.RunStatusRunning); err != nil {
 		t.Fatalf("mark running: %v", err)
 	}
-	question, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "aaa question pending", RefinementLevel: contract.RefinementLevelDeep})
+	firstReview, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "aaa diff ready", WorkflowTemplateID: workflow.CarefulReviewID})
 	if err != nil {
-		t.Fatalf("create question run: %v", err)
+		t.Fatalf("create first review run: %v", err)
 	}
-	if err := st.UpdateRunStatus(ctx, question.Run.ID, store.RunStatusAwaitingHuman); err != nil {
-		t.Fatalf("mark question awaiting: %v", err)
-	}
-	if err := st.UpdateStageStatus(ctx, question.IdeaIntakeStage.ID, store.StageStatusRunning); err != nil {
-		t.Fatalf("mark question stage running: %v", err)
-	}
-	questions := `{"stage_id":"` + question.IdeaIntakeStage.ID + `","round":1,"max_rounds":2,"questions":["Which queue should own retries?"]}`
-	if _, err := st.SaveArtifact(ctx, question.Run.ID, "idea_refinement_questions", "application/json", []byte(questions), ".json"); err != nil {
-		t.Fatalf("save question artifact: %v", err)
-	}
+	markAwaitingHumanReview(t, st, firstReview)
 	review, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "bbb diff ready", WorkflowTemplateID: workflow.CarefulReviewID})
 	if err != nil {
 		t.Fatalf("create review run: %v", err)
@@ -472,11 +463,10 @@ func TestProjectTasksOverviewOrderingNeedsYouBadgeAndProjectsCount(t *testing.T)
 	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
 	body := getIndexBody(t, srv)
 	assertContains(t, body, "id=\"project-tasks-overview\"")
-	assertContains(t, body, "⚠ needs you: question pending")
 	assertContains(t, body, "⚠ needs you: diff ready")
-	assertContains(t, body, "/projects/default/runs/"+question.Run.ID)
+	assertContains(t, body, "/projects/default/runs/"+firstReview.Run.ID+"?tab=review")
 	assertContains(t, body, "/projects/default/runs/"+review.Run.ID+"?tab=review")
-	assertBefore(t, body, "aaa question pending", "mmm active running")
+	assertBefore(t, body, "aaa diff ready", "mmm active running")
 	assertBefore(t, body, "bbb diff ready", "mmm active running")
 	assertBefore(t, body, "mmm active running", "zzz recent completed")
 
@@ -495,7 +485,7 @@ func TestHandleProjectChatMessageIgnoresRefinementLevelInTracerSlice(t *testing.
 		if projectID != store.DefaultProjectID {
 			t.Fatalf("SubmitConversationMessage projectID = %q", projectID)
 		}
-		if body != "Deeply refine this" {
+		if body != "Refine this conversationally" {
 			t.Fatalf("chat body = %q", body)
 		}
 		return store.Message{ID: "msg_chat", ProjectID: projectID, Role: store.MessageRoleUser, Body: body}, nil
@@ -503,78 +493,9 @@ func TestHandleProjectChatMessageIgnoresRefinementLevelInTracerSlice(t *testing.
 
 	srv := newRouteTestServer(t, st, controller)
 	cookie, csrf := getCSRFToken(t, srv)
-	rec := postForm(t, srv, "/projects/default/chat/messages", cookie, url.Values{"message": {"Deeply refine this"}, "refinement_level": {"deep"}, "_csrf": {csrf}})
+	rec := postForm(t, srv, "/projects/default/chat/messages", cookie, url.Values{"message": {"Refine this conversationally"}, "refinement_level": {"standard"}, "_csrf": {csrf}})
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("POST chat status = %d want %d body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
-	}
-}
-
-func TestProjectChatRendersDeepIdeaQuestionsAndAcceptsAnswers(t *testing.T) {
-	ctx := context.Background()
-	st := openRouteTestStore(t)
-	conversation, err := st.EnsureProjectConversation(ctx, store.DefaultProjectID)
-	if err != nil {
-		t.Fatalf("ensure conversation: %v", err)
-	}
-	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "clarify audit logging", RefinementLevel: contract.RefinementLevelDeep, ConversationID: conversation.ID})
-	if err != nil {
-		t.Fatalf("create run: %v", err)
-	}
-	if _, err := st.AddMessage(ctx, conversation.ID, store.MessageRoleUser, wr.Task.Idea); err != nil {
-		t.Fatalf("add message: %v", err)
-	}
-	if err := st.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusAwaitingHuman); err != nil {
-		t.Fatalf("mark awaiting: %v", err)
-	}
-	if err := st.UpdateStageStatus(ctx, wr.IdeaIntakeStage.ID, store.StageStatusRunning); err != nil {
-		t.Fatalf("mark idea running: %v", err)
-	}
-	round1Questions := `{"stage_id":"` + wr.IdeaIntakeStage.ID + `","round":1,"max_rounds":3,"questions":["Which audit sink should receive events?"]}`
-	if _, err := st.SaveArtifact(ctx, wr.Run.ID, "idea_refinement_questions", "application/json", []byte(round1Questions), ".json"); err != nil {
-		t.Fatalf("save round 1 questions: %v", err)
-	}
-	round1Answers := `{"stage_id":"` + wr.IdeaIntakeStage.ID + `","round":1,"answer_text":"Use the Postgres audit table."}`
-	if _, err := st.SaveArtifact(ctx, wr.Run.ID, "idea_refinement_answers", "application/json", []byte(round1Answers), ".json"); err != nil {
-		t.Fatalf("save round 1 answers: %v", err)
-	}
-	round2Questions := `{"stage_id":"` + wr.IdeaIntakeStage.ID + `","round":2,"max_rounds":3,"questions":["Any retention limit?","Should admin exports be included?"]}`
-	if _, err := st.SaveArtifact(ctx, wr.Run.ID, "idea_refinement_questions", "application/json", []byte(round2Questions), ".json"); err != nil {
-		t.Fatalf("save round 2 questions: %v", err)
-	}
-
-	controller := &fakeRunController{state: defaultRouteQueueState()}
-	controller.deepIdeaFunc = func(_ context.Context, runID, stageID string, submission orchestrator.DeepIdeaAnswersSubmission) (orchestrator.DeepIdeaAnswerReceipt, error) {
-		if runID != wr.Run.ID || stageID != wr.IdeaIntakeStage.ID {
-			t.Fatalf("SubmitDeepIdeaAnswers run=%s stage=%s", runID, stageID)
-		}
-		if submission.ActorID != "operator" || submission.AnswerText != "Keep 90 days and include admin exports." {
-			t.Fatalf("submission = %#v", submission)
-		}
-		return orchestrator.DeepIdeaAnswerReceipt{RunID: runID, StageID: stageID, ArtifactID: "artifact_answers", Round: 2}, nil
-	}
-	srv := newRouteTestServer(t, st, controller)
-
-	body := getIndexBody(t, srv)
-	assertContains(t, body, "Deep refinement needs answers before the planner continues.")
-	assertContains(t, body, "Which audit sink should receive events?")
-	assertContains(t, body, "Use the Postgres audit table.")
-	assertContains(t, body, "Round 2 of 3")
-	assertContains(t, body, "Any retention limit?")
-	assertContains(t, body, "/projects/default/runs/"+wr.Run.ID+"/idea-stages/"+wr.IdeaIntakeStage.ID+"/answers")
-	assertContains(t, body, `name="return_to" value="project_chat"`)
-
-	cookie, csrf := getCSRFToken(t, srv)
-	rec := postForm(t, srv, "/projects/default/runs/"+wr.Run.ID+"/idea-stages/"+wr.IdeaIntakeStage.ID+"/answers", cookie, url.Values{
-		"actor_id":    {"operator"},
-		"answer_text": {"Keep 90 days and include admin exports."},
-		"return_to":   {"project_chat"},
-		"_csrf":       {csrf},
-	})
-	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("POST chat answers status = %d want %d body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
-	}
-	if got := rec.Header().Get("Location"); got != "/projects/default" {
-		t.Fatalf("Location = %q want /projects/default", got)
 	}
 }
 
@@ -725,34 +646,7 @@ func TestHandleRunsRejectsInvalidRefinementLevel(t *testing.T) {
 		t.Fatalf("POST /runs status = %d want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
 	}
 	assertContains(t, rec.Body.String(), "refinement_level must be one of")
-}
-
-func TestHandleDeepIdeaAnswersFormRedirectsToRun(t *testing.T) {
-	ctx := context.Background()
-	st := openRouteTestStore(t)
-	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "deep clarify", RefinementLevel: contract.RefinementLevelDeep})
-	if err != nil {
-		t.Fatalf("create run: %v", err)
-	}
-	controller := &fakeRunController{state: defaultRouteQueueState()}
-	controller.deepIdeaFunc = func(_ context.Context, runID, stageID string, submission orchestrator.DeepIdeaAnswersSubmission) (orchestrator.DeepIdeaAnswerReceipt, error) {
-		if runID != wr.Run.ID || stageID != "stage_idea" {
-			t.Fatalf("SubmitDeepIdeaAnswers run=%s stage=%s", runID, stageID)
-		}
-		if submission.ActorID != "alice" || submission.AnswerText != "Use the audit sink." {
-			t.Fatalf("submission = %#v", submission)
-		}
-		return orchestrator.DeepIdeaAnswerReceipt{RunID: runID, StageID: stageID, ArtifactID: "artifact_answers", Round: 1}, nil
-	}
-	srv := newRouteTestServer(t, st, controller)
-	cookie, csrf := getCSRFToken(t, srv)
-	rec := postForm(t, srv, "/projects/default/runs/"+wr.Run.ID+"/idea-stages/stage_idea/answers", cookie, url.Values{"actor_id": {"alice"}, "answer_text": {"Use the audit sink."}, "_csrf": {csrf}})
-	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("POST answers status = %d want %d body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
-	}
-	if got := rec.Header().Get("Location"); got != "/projects/default/runs/"+wr.Run.ID {
-		t.Fatalf("Location = %q", got)
-	}
+	assertNotContains(t, rec.Body.String(), "deep")
 }
 
 func TestHandleHumanReviewVerdictReturnsHTMLFragment(t *testing.T) {
@@ -1003,7 +897,6 @@ type fakeRunController struct {
 	startQueuedRunFunc            func(context.Context, string) error
 	cancelRunFunc                 func(context.Context, string) error
 	humanReviewFunc               func(context.Context, string, string, orchestrator.HumanReviewSubmission) (report.Report, error)
-	deepIdeaFunc                  func(context.Context, string, string, orchestrator.DeepIdeaAnswersSubmission) (orchestrator.DeepIdeaAnswerReceipt, error)
 }
 
 func (f *fakeRunController) StartProjectRun(ctx context.Context, projectID, idea string) (string, error) {
@@ -1049,13 +942,6 @@ func (f *fakeRunController) SubmitHumanReview(ctx context.Context, runID, stageI
 		return f.humanReviewFunc(ctx, runID, stageID, submission)
 	}
 	return report.Report{}, errors.New("unexpected SubmitHumanReview call")
-}
-
-func (f *fakeRunController) SubmitDeepIdeaAnswers(ctx context.Context, runID, stageID string, submission orchestrator.DeepIdeaAnswersSubmission) (orchestrator.DeepIdeaAnswerReceipt, error) {
-	if f.deepIdeaFunc != nil {
-		return f.deepIdeaFunc(ctx, runID, stageID, submission)
-	}
-	return orchestrator.DeepIdeaAnswerReceipt{}, errors.New("unexpected SubmitDeepIdeaAnswers call")
 }
 
 func (f *fakeRunController) QueueState(ctx context.Context) (orchestrator.QueueState, error) {
