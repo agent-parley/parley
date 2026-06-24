@@ -7,7 +7,8 @@
   <script type="module" src="/assets/datastar.min.js"></script>
   <style>{{template "styles" .}}</style>
 </head>
-<body data-on:load="@get('/projects/{{.Project.ID}}/chat/events', {openWhenHidden: true})">
+<body data-signals:csrf="'{{.CSRF}}'" data-on:load="@get('/notifications/events', {openWhenHidden: true}); @get('/projects/{{.Project.ID}}/chat/events', {openWhenHidden: true})">
+  {{template "notifications_center.html" .Notifications}}
   <main>
     <header><h1>{{.Project.Name}}</h1><p><a href="/projects">Projects</a> · <a href="/projects/{{.Project.ID}}/settings">Settings</a> · Project workspace: <code>{{.Project.WorkspacePath}}</code></p></header>
     {{with .Notice}}

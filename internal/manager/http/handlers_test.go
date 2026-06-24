@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/store"
@@ -211,8 +212,10 @@ func TestProjectSettingsRendersRulesPreferencesAndHomeLink(t *testing.T) {
 	assertContains(t, body, "Run focused checks.")
 	assertContains(t, body, "Preferences")
 	assertContains(t, body, "Prefer concise updates.")
+	assertContains(t, body, "Notifications")
+	assertContains(t, body, "Only when")
+	assertContains(t, body, "When anything finishes")
 	assertContains(t, body, "No repository configured; repo candidate loading is unavailable.")
-	assertNotContains(t, body, "Notifications")
 	assertNotContains(t, body, "title=")
 }
 
@@ -239,6 +242,115 @@ func TestProjectSettingsSaveSwapsSingleSectionAndAllowsEmpty(t *testing.T) {
 	}
 	if project.ProjectPreferences != "" {
 		t.Fatalf("project preferences = %q, want empty", project.ProjectPreferences)
+	}
+}
+
+func TestProjectNotificationSettingsSaveSwapsSection(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	cookie, csrf := getCSRFToken(t, srv)
+
+	rec := postForm(t, srv, "/projects/default/settings/notifications", cookie, url.Values{"when_finished": {"1"}, "_csrf": {csrf}})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST settings notifications status = %d want %d body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	body := rec.Body.String()
+	assertContains(t, body, "id=\"settings-notifications\"")
+	assertContains(t, body, "saved · updated")
+	assertNotContains(t, body, "settings-rules")
+	prefs, err := st.GetProjectNotificationPreferences(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get notification prefs: %v", err)
+	}
+	if prefs.OnlyWhenNeeded || !prefs.WhenFinished {
+		t.Fatalf("notification prefs = %+v, want only when_finished", prefs)
+	}
+}
+
+func TestNotificationAckRedirectsToRunAndMarkAllSwapsCenter(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	wr, err := st.CreateWorkflowRun(ctx, "notify from a run")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	first, err := st.InsertNotification(ctx, store.NotificationInput{ProjectID: wr.Project.ID, RunID: wr.Run.ID, Class: store.NotificationClassNeedsYou, Title: "Review needed: notify from a run"})
+	if err != nil {
+		t.Fatalf("insert notification: %v", err)
+	}
+	if _, err := st.InsertNotification(ctx, store.NotificationInput{ProjectID: wr.Project.ID, RunID: wr.Run.ID, Class: store.NotificationClassFinished, Title: "Run completed: notify from a run"}); err != nil {
+		t.Fatalf("insert second notification: %v", err)
+	}
+
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/notifications/"+first.ID+"/ack", cookie, url.Values{"redirect": {"/projects/default/runs/" + wr.Run.ID}, "_csrf": {csrf}})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST notification ack status = %d want %d body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
+	}
+	if got := rec.Header().Get("Location"); got != "/projects/default/runs/"+wr.Run.ID {
+		t.Fatalf("ack redirect Location = %q", got)
+	}
+	acked, err := st.GetNotification(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("get acked notification: %v", err)
+	}
+	if acked.AcknowledgedAt == "" {
+		t.Fatalf("notification not acknowledged: %+v", acked)
+	}
+
+	rec = postForm(t, srv, "/notifications/ack-all", cookie, url.Values{"_csrf": {csrf}})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST notifications ack-all status = %d want %d body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	body := rec.Body.String()
+	assertContains(t, body, "id=\"notification-center\"")
+	assertNotContains(t, body, "notification-badge")
+	unread, err := st.CountUnreadNotifications(ctx)
+	if err != nil {
+		t.Fatalf("count unread: %v", err)
+	}
+	if unread != 0 {
+		t.Fatalf("unread after mark all = %d, want 0", unread)
+	}
+}
+
+func TestInAppNotificationSinkBroadcastsGlobalNotificationFragment(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	wr, err := st.CreateWorkflowRun(ctx, "broadcast notification")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	notification, err := st.InsertNotification(ctx, store.NotificationInput{ProjectID: wr.Project.ID, RunID: wr.Run.ID, Class: store.NotificationClassFinished, Title: "Run completed: broadcast notification"})
+	if err != nil {
+		t.Fatalf("insert notification: %v", err)
+	}
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	ch, unsubscribe := srv.hub.Subscribe(NotificationsTopic)
+	defer unsubscribe()
+	projectCh, unsubscribeProject := srv.hub.Subscribe(projectChatTopic(wr.Project.ID))
+	defer unsubscribeProject()
+	sink := NewInAppNotificationSink(st, srv.hub, srv.renderer)
+	if err := sink.Notify(ctx, notification); err != nil {
+		t.Fatalf("notify sink: %v", err)
+	}
+	select {
+	case msg := <-ch:
+		if msg.Event.Type != "notification.created" {
+			t.Fatalf("event type = %q", msg.Event.Type)
+		}
+		assertContains(t, msg.Fragment, "id=\"notification-center\"")
+		assertContains(t, msg.Fragment, "Run completed: broadcast notification")
+		assertContains(t, msg.Fragment, "notification-badge")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for notification broadcast")
+	}
+	select {
+	case msg := <-projectCh:
+		t.Fatalf("notification broadcast leaked onto project chat topic: %+v", msg.Event)
+	default:
 	}
 }
 

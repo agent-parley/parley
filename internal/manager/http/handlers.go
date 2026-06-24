@@ -148,7 +148,11 @@ func (s *Server) indexData(r *http.Request, projectID string) (web.IndexData, er
 		return web.IndexData{}, err
 	}
 	chat.CSRF = csrf
-	return web.IndexData{Project: project, Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, Queue: queue, Tasks: tasks, Chat: chat, CSRF: csrf, Title: "Parley · " + project.Name}, nil
+	notifications, err := s.notificationCenterData(r.Context(), csrf)
+	if err != nil {
+		return web.IndexData{}, err
+	}
+	return web.IndexData{Project: project, Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, Queue: queue, Tasks: tasks, Chat: chat, Notifications: notifications, CSRF: csrf, Title: "Parley · " + project.Name}, nil
 }
 
 func (s *Server) projectsIndexData(r *http.Request) (web.ProjectsIndexData, error) {
@@ -166,7 +170,12 @@ func (s *Server) projectsIndexData(r *http.Request) (web.ProjectsIndexData, erro
 		total += count
 		views = append(views, web.ProjectNeedsYouView{Project: project, NeedsYouCount: count})
 	}
-	return web.ProjectsIndexData{Projects: views, TotalNeedsYou: total, Title: "Parley · Projects"}, nil
+	csrf := csrfFromContext(r.Context())
+	notifications, err := s.notificationCenterData(r.Context(), csrf)
+	if err != nil {
+		return web.ProjectsIndexData{}, err
+	}
+	return web.ProjectsIndexData{Projects: views, TotalNeedsYou: total, Notifications: notifications, CSRF: csrf, Title: "Parley · Projects"}, nil
 }
 
 func (s *Server) projectTasksData(r *http.Request, project store.Project, queue web.QueueView, csrf string) (web.ProjectTasksData, error) {
@@ -211,6 +220,10 @@ func (s *Server) projectHomeFragmentsData(r *http.Request, project store.Project
 func (s *Server) handleProjectSettingsPath(w http.ResponseWriter, r *http.Request, projectID string, parts []string) {
 	if len(parts) == 0 {
 		s.handleProjectSettings(w, r, projectID)
+		return
+	}
+	if len(parts) == 1 && parts[0] == "notifications" {
+		s.handleProjectNotificationSettingsSave(w, r, projectID)
 		return
 	}
 	if len(parts) == 1 && validProjectSettingsKind(parts[0]) {
@@ -273,6 +286,31 @@ func (s *Server) handleProjectSettingsSave(w http.ResponseWriter, r *http.Reques
 	s.writeFragment(w, http.StatusAccepted, section)
 }
 
+func (s *Server) handleProjectNotificationSettingsSave(w http.ResponseWriter, r *http.Request, projectID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	prefs := store.ProjectNotificationPreferences{
+		OnlyWhenNeeded: r.Form.Get("only_when_needed") != "",
+		WhenFinished:   r.Form.Get("when_finished") != "",
+	}
+	project, err := s.store.UpdateProjectNotificationPreferences(r.Context(), projectID, prefs)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data := s.projectNotificationSettingsData(r, project, "", "saved · updated "+project.UpdatedAt)
+	fragment, err := s.renderer.ExecutePage("notification_settings.html", data)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte(fragment))
+}
+
 func (s *Server) handleProjectSettingsCandidate(w http.ResponseWriter, r *http.Request, projectID, kind string) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -329,7 +367,24 @@ func (s *Server) projectSettingsData(r *http.Request, project store.Project) (we
 	if err != nil {
 		return web.ProjectSettingsData{}, err
 	}
-	return web.ProjectSettingsData{Project: project, Rules: rules, Preferences: preferences, CSRF: csrf, Title: "Parley · " + project.Name + " Settings"}, nil
+	notificationSettings := s.projectNotificationSettingsData(r, project, "", "saved · updated "+project.UpdatedAt)
+	center, err := s.notificationCenterData(r.Context(), csrf)
+	if err != nil {
+		return web.ProjectSettingsData{}, err
+	}
+	return web.ProjectSettingsData{Project: project, Rules: rules, Preferences: preferences, Notifications: notificationSettings, Center: center, CSRF: csrf, Title: "Parley · " + project.Name + " Settings"}, nil
+}
+
+func (s *Server) projectNotificationSettingsData(r *http.Request, project store.Project, notice, status string) web.NotificationSettingsData {
+	return web.NotificationSettingsData{
+		Project:        project,
+		OnlyWhenNeeded: project.NotificationOnlyWhenNeeded,
+		WhenFinished:   project.NotificationWhenFinished,
+		SavePath:       "/projects/" + project.ID + "/settings/notifications",
+		Notice:         notice,
+		Status:         status,
+		CSRF:           csrfFromContext(r.Context()),
+	}
 }
 
 func (s *Server) projectSettingsSectionData(r *http.Request, project store.Project, kind, textareaValue, notice, status string) (web.ProjectSettingsSectionData, error) {
@@ -751,7 +806,15 @@ func (s *Server) handleRunDetail(w http.ResponseWriter, r *http.Request, project
 		http.NotFound(w, r)
 		return
 	}
-	s.writePage(w, "run.html", web.NewRunData(bundle, csrfFromContext(r.Context()), "Run "+runID, r.URL.Query().Get("tab")))
+	csrf := csrfFromContext(r.Context())
+	data := web.NewRunData(bundle, csrf, "Run "+runID, r.URL.Query().Get("tab"))
+	notifications, err := s.notificationCenterData(r.Context(), csrf)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data.Notifications = notifications
+	s.writePage(w, "run.html", data)
 }
 
 func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request, projectID, runID string) {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/store"
@@ -25,6 +26,7 @@ type Renderer interface {
 	RenderProjectChat(ProjectChatData) (string, error)
 	RenderProjectHomeFragments(ProjectHomeFragmentsData) (string, error)
 	RenderProjectSettingsSection(ProjectSettingsSectionData) (string, error)
+	RenderNotificationCenter(NotificationCenterData) (string, error)
 }
 
 type TemplateRenderer struct {
@@ -40,6 +42,7 @@ type IndexData struct {
 	Tasks           ProjectTasksData
 	Chat            ProjectChatData
 	Notice          *Notice
+	Notifications   NotificationCenterData
 	CSRF            string
 	Title           string
 }
@@ -50,11 +53,23 @@ type ProjectHomeFragmentsData struct {
 }
 
 type ProjectSettingsData struct {
-	Project     store.Project
-	Rules       ProjectSettingsSectionData
-	Preferences ProjectSettingsSectionData
-	CSRF        string
-	Title       string
+	Project       store.Project
+	Rules         ProjectSettingsSectionData
+	Preferences   ProjectSettingsSectionData
+	Notifications NotificationSettingsData
+	Center        NotificationCenterData
+	CSRF          string
+	Title         string
+}
+
+type NotificationSettingsData struct {
+	Project        store.Project
+	OnlyWhenNeeded bool
+	WhenFinished   bool
+	SavePath       string
+	Notice         string
+	Status         string
+	CSRF           string
 }
 
 type ProjectSettingsSectionData struct {
@@ -74,6 +89,24 @@ type ProjectSettingsSectionData struct {
 	Notice               string
 	Status               string
 	CSRF                 string
+}
+
+type NotificationCenterData struct {
+	UnreadCount int
+	Items       []NotificationItemData
+	CSRF        string
+}
+
+type NotificationItemData struct {
+	ID           string
+	ProjectID    string
+	RunID        string
+	Class        string
+	Title        string
+	CreatedAt    string
+	RelativeTime string
+	Link         string
+	Acknowledged bool
 }
 
 type ProjectTasksData struct {
@@ -103,6 +136,8 @@ type TaskOverviewItem struct {
 type ProjectsIndexData struct {
 	Projects      []ProjectNeedsYouView
 	TotalNeedsYou int
+	Notifications NotificationCenterData
+	CSRF          string
 	Title         string
 }
 
@@ -148,6 +183,28 @@ type Notice struct {
 	Message string
 }
 
+func NewNotificationCenterData(notifications []store.Notification, unreadCount int, csrf string) NotificationCenterData {
+	items := make([]NotificationItemData, 0, len(notifications))
+	for _, notification := range notifications {
+		link := "/projects/" + notification.ProjectID
+		if notification.RunID != "" {
+			link += "/runs/" + notification.RunID
+		}
+		items = append(items, NotificationItemData{
+			ID:           notification.ID,
+			ProjectID:    notification.ProjectID,
+			RunID:        notification.RunID,
+			Class:        notification.Class,
+			Title:        notification.Title,
+			CreatedAt:    notification.CreatedAt,
+			RelativeTime: relativeTime(notification.CreatedAt),
+			Link:         link,
+			Acknowledged: notification.AcknowledgedAt != "",
+		})
+	}
+	return NotificationCenterData{UnreadCount: unreadCount, Items: items, CSRF: csrf}
+}
+
 type QueueView struct {
 	Pending                int
 	Running                int
@@ -173,10 +230,11 @@ func NewQueueView(state orchestrator.QueueState) QueueView {
 }
 
 type RunData struct {
-	View  RunView
-	CSRF  string
-	Title string
-	Tab   string
+	View          RunView
+	Notifications NotificationCenterData
+	CSRF          string
+	Title         string
+	Tab           string
 }
 
 type RunView struct {
@@ -564,6 +622,14 @@ func (r *TemplateRenderer) RenderProjectSettingsSection(data ProjectSettingsSect
 	return compactHTML(buf.String()), nil
 }
 
+func (r *TemplateRenderer) RenderNotificationCenter(data NotificationCenterData) (string, error) {
+	var buf bytes.Buffer
+	if err := r.templates.ExecuteTemplate(&buf, "notifications_center.html", data); err != nil {
+		return "", fmt.Errorf("execute notification center: %w", err)
+	}
+	return compactHTML(buf.String()), nil
+}
+
 func stageGroups(stages []store.Stage, events []event.Event) []StageGroupView {
 	groups := make([]StageGroupView, 0, len(stages))
 	for _, stage := range stages {
@@ -750,6 +816,39 @@ func timeLabel(value string) string {
 		return value[11:16]
 	}
 	return value
+}
+
+func relativeTime(value string) string {
+	createdAt, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return timeLabel(value)
+	}
+	d := time.Since(createdAt)
+	if d < time.Minute {
+		return "just now"
+	}
+	if d < time.Hour {
+		minutes := int(d / time.Minute)
+		if minutes == 1 {
+			return "1m ago"
+		}
+		return fmt.Sprintf("%dm ago", minutes)
+	}
+	if d < 24*time.Hour {
+		hours := int(d / time.Hour)
+		if hours == 1 {
+			return "1h ago"
+		}
+		return fmt.Sprintf("%dh ago", hours)
+	}
+	days := int(d / (24 * time.Hour))
+	if days == 1 {
+		return "1d ago"
+	}
+	if days < 7 {
+		return fmt.Sprintf("%dd ago", days)
+	}
+	return value[:10]
 }
 
 func normalizeRunTab(tab string) string {

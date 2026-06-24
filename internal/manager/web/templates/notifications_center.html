@@ -1,0 +1,37 @@
+<div id="notification-center" class="notification-center" aria-label="Notifications">
+  <details class="notification-menu">
+    <summary class="notification-bell" aria-label="Notifications">
+      <span aria-hidden="true">🔔</span>
+      {{if .UnreadCount}}<span class="notification-badge">{{.UnreadCount}}</span>{{end}}
+    </summary>
+    <div class="notification-panel">
+      <div class="notification-panel-head">
+        <h2>Notifications</h2>
+        {{if .UnreadCount}}
+        <form method="post" action="/notifications/ack-all" data-on:submit="@post('/notifications/ack-all', {contentType: 'form'})">
+          <input type="hidden" name="_csrf" value="{{.CSRF}}" data-bind:csrf>
+          <button type="submit" class="text-button">Mark all read</button>
+        </form>
+        {{end}}
+      </div>
+      {{if .Items}}
+      <ol class="notification-list">
+        {{range .Items}}
+        <li class="notification-row {{if not .Acknowledged}}notification-unread{{end}}">
+          <form method="post" action="/notifications/{{.ID}}/ack">
+            <input type="hidden" name="_csrf" value="{{$.CSRF}}" data-bind:csrf>
+            <input type="hidden" name="redirect" value="{{.Link}}">
+            <button type="submit" class="notification-item">
+              <span class="notification-title">{{.Title}}</span>
+              <span class="notification-time">{{.RelativeTime}}</span>
+            </button>
+          </form>
+        </li>
+        {{end}}
+      </ol>
+      {{else}}
+      <p class="empty-state">No notifications yet.</p>
+      {{end}}
+    </div>
+  </details>
+</div>

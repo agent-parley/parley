@@ -104,6 +104,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		MaxConcurrent: project.QueueMaxConcurrent,
 		BacklogCap:    project.QueueBacklogCap,
 	}
+	notificationSink := managerhttp.NewInAppNotificationSink(st, hub, renderer)
 	engine := orchestrator.NewEngineWithOptions(st, runner, renderer, hub, orchestrator.EngineOptions{
 		ImplementationAdapter: cfg.Adapter,
 		PlanningAdapter:       cfg.Adapter,
@@ -112,6 +113,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		ProjectID:             project.ID,
 		QueuePolicy:           &queuePolicy,
 		RunnerSlots:           1,
+		NotificationSinks:     []orchestrator.NotificationSink{notificationSink},
 	})
 	app := &App{
 		cfg:    cfg,

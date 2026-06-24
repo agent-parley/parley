@@ -33,6 +33,10 @@ type Broadcaster interface {
 	Broadcast(runID string, ev event.Event, fragment string)
 }
 
+type NotificationSink interface {
+	Notify(context.Context, store.Notification) error
+}
+
 type QueuePolicy struct {
 	AutoWhenReady bool
 	MaxConcurrent int
@@ -66,11 +70,12 @@ var (
 const taskContractArtifactKind = "task_contract"
 
 type Engine struct {
-	store     *store.Store
-	runner    Runner
-	renderer  FragmentRenderer
-	broadcast Broadcaster
-	graph     Graph
+	store             *store.Store
+	runner            Runner
+	renderer          FragmentRenderer
+	broadcast         Broadcaster
+	notificationSinks []NotificationSink
+	graph             Graph
 
 	mu          sync.Mutex
 	activeRuns  map[string]context.CancelFunc
@@ -105,6 +110,7 @@ type EngineOptions struct {
 	QueuePolicy           *QueuePolicy
 	RunnerSlots           int
 	ContextAssembler      *contextpack.Assembler
+	NotificationSinks     []NotificationSink
 }
 
 type workerSnapshot struct {
@@ -176,6 +182,7 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 		runner:                runner,
 		renderer:              renderer,
 		broadcast:             broadcast,
+		notificationSinks:     opts.NotificationSinks,
 		graph:                 NewGraph(),
 		activeRuns:            map[string]context.CancelFunc{},
 		activeStage:           map[string]store.Stage{},
@@ -1695,7 +1702,90 @@ func (e *Engine) emit(ctx context.Context, ev event.Event) (event.Event, error) 
 		return event.Event{}, fmt.Errorf("render run fragments: %w", err)
 	}
 	e.broadcast.Broadcast(persisted.RunID, persisted, fragment)
+	e.dispatchNotification(ctx, persisted, bundle)
 	return persisted, nil
+}
+
+func (e *Engine) dispatchNotification(ctx context.Context, ev event.Event, bundle store.RunBundle) {
+	class, ok := notificationClassForEvent(ev)
+	if !ok {
+		return
+	}
+	prefs, err := e.store.GetProjectNotificationPreferences(ctx, ev.ProjectID)
+	if err != nil {
+		log.Printf("notification prefs unavailable for project %s: %v", ev.ProjectID, err)
+		return
+	}
+	if class == store.NotificationClassNeedsYou && !prefs.OnlyWhenNeeded {
+		return
+	}
+	if class == store.NotificationClassFinished && !prefs.WhenFinished {
+		return
+	}
+	notification, err := e.store.InsertNotification(ctx, store.NotificationInput{
+		ProjectID: ev.ProjectID,
+		RunID:     ev.RunID,
+		Class:     class,
+		Title:     notificationTitle(ev, bundle),
+	})
+	if err != nil {
+		log.Printf("notification insert failed for event %s: %v", ev.ID, err)
+		return
+	}
+	for _, sink := range e.notificationSinks {
+		if sink == nil {
+			continue
+		}
+		if err := sink.Notify(ctx, notification); err != nil {
+			log.Printf("notification sink failed for %s: %v", notification.ID, err)
+		}
+	}
+}
+
+func notificationClassForEvent(ev event.Event) (string, bool) {
+	switch ev.Type {
+	case "stage.awaiting_human":
+		stageType, _ := ev.Data["stage_type"].(string)
+		if stageType != "" && stageType != contract.StageTypeReview {
+			return "", false
+		}
+		if _, ok := ev.Data["questions_artifact_id"]; ok {
+			return "", false
+		}
+		return store.NotificationClassNeedsYou, true
+	case "run.completed":
+		return store.NotificationClassFinished, true
+	case "run.failed":
+		if terminal, _ := ev.Data["terminal_status"].(string); terminal == store.RunStatusCancelled || terminal == store.RunStatusNeedsInput {
+			return "", false
+		}
+		return store.NotificationClassFinished, true
+	default:
+		return "", false
+	}
+}
+
+func notificationTitle(ev event.Event, bundle store.RunBundle) string {
+	idea := strings.TrimSpace(bundle.Run.Idea)
+	if idea == "" {
+		idea = ev.RunID
+	}
+	if runes := []rune(idea); len(runes) > 96 {
+		idea = strings.TrimSpace(string(runes[:96])) + "…"
+	}
+	switch ev.Type {
+	case "stage.awaiting_human":
+		return "Review needed: " + idea
+	case "run.completed":
+		return "Run completed: " + idea
+	case "run.failed":
+		if terminal, _ := ev.Data["terminal_status"].(string); terminal == store.RunStatusInvalid {
+			return "Run invalid: " + idea
+		}
+		return "Run failed: " + idea
+	default:
+		return ev.Summary
+	}
 }
 
 func (e *Engine) workflowSnapshot(wr store.WorkflowRun, template workflow.Template, taskContractArtifactID, taskPlanArtifactID string, frozen bool) map[string]any {
@@ -1932,7 +2022,7 @@ func commitFailureReport(wr store.WorkflowRun, stage store.Stage, err error, sna
 		Status:        report.StatusFailed,
 		Summary:       summary,
 		Payload:       payload,
-		Errors: []string{err.Error()},
+		Errors:        []string{err.Error()},
 	}
 }
 

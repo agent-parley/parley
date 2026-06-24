@@ -323,12 +323,112 @@ func TestProjectRulesPreferencesMigrationAddsColumnsToExistingProjects(t *testin
 	if project.ProjectRules != "" || project.ProjectPreferences != "" {
 		t.Fatalf("migrated project rules/preferences = %q/%q, want empty defaults", project.ProjectRules, project.ProjectPreferences)
 	}
+	if !project.NotificationOnlyWhenNeeded || !project.NotificationWhenFinished {
+		t.Fatalf("migrated notification prefs = %+v, want default on", project)
+	}
 	updated, err := st.UpdateProjectRules(ctx, DefaultProjectID, "Migrated DB accepts rules.\n")
 	if err != nil {
 		t.Fatalf("update migrated project rules: %v", err)
 	}
 	if updated.ProjectRules != "Migrated DB accepts rules.\n" {
 		t.Fatalf("updated migrated project rules = %q", updated.ProjectRules)
+	}
+}
+
+func TestProjectNotificationPreferencesDefaultOnAndAppState(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	prefs, err := st.GetProjectNotificationPreferences(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get notification prefs: %v", err)
+	}
+	if !prefs.OnlyWhenNeeded || !prefs.WhenFinished {
+		t.Fatalf("default notification prefs = %+v, want both on", prefs)
+	}
+
+	updated, err := st.UpdateProjectNotificationPreferences(ctx, DefaultProjectID, ProjectNotificationPreferences{OnlyWhenNeeded: false, WhenFinished: true})
+	if err != nil {
+		t.Fatalf("update notification prefs: %v", err)
+	}
+	if updated.NotificationOnlyWhenNeeded || !updated.NotificationWhenFinished {
+		t.Fatalf("updated project notification prefs = %+v", updated)
+	}
+
+	if _, err := st.EnsureProject(ctx, DefaultProjectSpec(dataDir)); err != nil {
+		t.Fatalf("ensure project after notification prefs update: %v", err)
+	}
+	persisted, err := st.GetProjectNotificationPreferences(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get persisted notification prefs: %v", err)
+	}
+	if persisted.OnlyWhenNeeded || !persisted.WhenFinished {
+		t.Fatalf("ensure project erased notification prefs: %+v", persisted)
+	}
+}
+
+func TestNotificationsPersistListAndAcknowledge(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRun(ctx, "ship notifications")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	first, err := st.InsertNotification(ctx, NotificationInput{ProjectID: wr.Project.ID, RunID: wr.Run.ID, Class: NotificationClassNeedsYou, Title: "Review needed: ship notifications"})
+	if err != nil {
+		t.Fatalf("insert first notification: %v", err)
+	}
+	if _, err := st.InsertNotification(ctx, NotificationInput{ProjectID: wr.Project.ID, RunID: wr.Run.ID, Class: NotificationClassFinished, Title: "Run completed: ship notifications"}); err != nil {
+		t.Fatalf("insert second notification: %v", err)
+	}
+	unread, err := st.CountUnreadNotifications(ctx)
+	if err != nil {
+		t.Fatalf("count unread: %v", err)
+	}
+	if unread != 2 {
+		t.Fatalf("unread = %d, want 2", unread)
+	}
+	items, err := st.ListNotifications(ctx, 10)
+	if err != nil {
+		t.Fatalf("list notifications: %v", err)
+	}
+	if len(items) != 2 || items[0].Title == "" || items[0].RunID != wr.Run.ID {
+		t.Fatalf("listed notifications = %+v", items)
+	}
+
+	acked, err := st.AcknowledgeNotification(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("ack notification: %v", err)
+	}
+	if acked.AcknowledgedAt == "" {
+		t.Fatalf("acked notification missing acknowledged_at: %+v", acked)
+	}
+	unread, err = st.CountUnreadNotifications(ctx)
+	if err != nil {
+		t.Fatalf("count unread after ack: %v", err)
+	}
+	if unread != 1 {
+		t.Fatalf("unread after ack = %d, want 1", unread)
+	}
+	if err := st.AcknowledgeAllNotifications(ctx); err != nil {
+		t.Fatalf("ack all notifications: %v", err)
+	}
+	unread, err = st.CountUnreadNotifications(ctx)
+	if err != nil {
+		t.Fatalf("count unread after ack all: %v", err)
+	}
+	if unread != 0 {
+		t.Fatalf("unread after ack all = %d, want 0", unread)
 	}
 }
 

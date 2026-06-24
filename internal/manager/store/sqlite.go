@@ -89,17 +89,19 @@ type ProjectSpec struct {
 }
 
 type Project struct {
-	ID                 string
-	Name               string
-	Description        string
-	ProjectRules       string
-	ProjectPreferences string
-	WorkspacePath      string
-	QueueAutoWhenReady bool
-	QueueMaxConcurrent int
-	QueueBacklogCap    int
-	CreatedAt          string
-	UpdatedAt          string
+	ID                         string
+	Name                       string
+	Description                string
+	ProjectRules               string
+	ProjectPreferences         string
+	NotificationOnlyWhenNeeded bool
+	NotificationWhenFinished   bool
+	WorkspacePath              string
+	QueueAutoWhenReady         bool
+	QueueMaxConcurrent         int
+	QueueBacklogCap            int
+	CreatedAt                  string
+	UpdatedAt                  string
 }
 
 type Workspace struct {
@@ -332,6 +334,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureProjectRulesPreferencesSchema(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureProjectNotificationPreferencesSchema(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureDefaultProject(ctx); err != nil {
 		return err
 	}
@@ -417,6 +422,24 @@ func (s *Store) ensureProjectRulesPreferencesSchema(ctx context.Context) error {
 	return nil
 }
 
+func (s *Store) ensureProjectNotificationPreferencesSchema(ctx context.Context) error {
+	cols, err := s.tableColumns(ctx, "projects")
+	if err != nil {
+		return err
+	}
+	if _, ok := cols["notification_only_when_needed"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE projects ADD COLUMN notification_only_when_needed INTEGER NOT NULL DEFAULT 1`); err != nil {
+			return fmt.Errorf("add notification only-when-needed column: %w", err)
+		}
+	}
+	if _, ok := cols["notification_when_finished"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE projects ADD COLUMN notification_when_finished INTEGER NOT NULL DEFAULT 1`); err != nil {
+			return fmt.Errorf("add notification when-finished column: %w", err)
+		}
+	}
+	return nil
+}
+
 func DefaultProjectSpec(dataDir string) ProjectSpec {
 	return ProjectSpec{
 		ID:                 DefaultProjectID,
@@ -485,18 +508,20 @@ func (s *Store) normalizeProjectSpec(spec ProjectSpec) ProjectSpec {
 
 func (s *Store) GetProject(ctx context.Context, projectID string) (Project, error) {
 	var project Project
-	var auto int
-	err := s.db.QueryRowContext(ctx, `SELECT p.id, p.name, p.description, p.project_rules, p.project_preferences, w.path, p.queue_auto_when_ready, p.queue_max_concurrent, p.queue_backlog_cap, p.created_at, p.updated_at
-FROM projects p JOIN workspaces w ON w.project_id = p.id WHERE p.id = ?`, projectID).Scan(&project.ID, &project.Name, &project.Description, &project.ProjectRules, &project.ProjectPreferences, &project.WorkspacePath, &auto, &project.QueueMaxConcurrent, &project.QueueBacklogCap, &project.CreatedAt, &project.UpdatedAt)
+	var auto, notifyNeeded, notifyFinished int
+	err := s.db.QueryRowContext(ctx, `SELECT p.id, p.name, p.description, p.project_rules, p.project_preferences, p.notification_only_when_needed, p.notification_when_finished, w.path, p.queue_auto_when_ready, p.queue_max_concurrent, p.queue_backlog_cap, p.created_at, p.updated_at
+FROM projects p JOIN workspaces w ON w.project_id = p.id WHERE p.id = ?`, projectID).Scan(&project.ID, &project.Name, &project.Description, &project.ProjectRules, &project.ProjectPreferences, &notifyNeeded, &notifyFinished, &project.WorkspacePath, &auto, &project.QueueMaxConcurrent, &project.QueueBacklogCap, &project.CreatedAt, &project.UpdatedAt)
 	if err != nil {
 		return Project{}, fmt.Errorf("get project %s: %w", projectID, err)
 	}
+	project.NotificationOnlyWhenNeeded = notifyNeeded != 0
+	project.NotificationWhenFinished = notifyFinished != 0
 	project.QueueAutoWhenReady = auto != 0
 	return project, nil
 }
 
 func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT p.id, p.name, p.description, p.project_rules, p.project_preferences, w.path, p.queue_auto_when_ready, p.queue_max_concurrent, p.queue_backlog_cap, p.created_at, p.updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT p.id, p.name, p.description, p.project_rules, p.project_preferences, p.notification_only_when_needed, p.notification_when_finished, w.path, p.queue_auto_when_ready, p.queue_max_concurrent, p.queue_backlog_cap, p.created_at, p.updated_at
 FROM projects p JOIN workspaces w ON w.project_id = p.id ORDER BY p.created_at DESC, p.id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list projects: %w", err)
@@ -505,10 +530,12 @@ FROM projects p JOIN workspaces w ON w.project_id = p.id ORDER BY p.created_at D
 	var projects []Project
 	for rows.Next() {
 		var project Project
-		var auto int
-		if err := rows.Scan(&project.ID, &project.Name, &project.Description, &project.ProjectRules, &project.ProjectPreferences, &project.WorkspacePath, &auto, &project.QueueMaxConcurrent, &project.QueueBacklogCap, &project.CreatedAt, &project.UpdatedAt); err != nil {
+		var auto, notifyNeeded, notifyFinished int
+		if err := rows.Scan(&project.ID, &project.Name, &project.Description, &project.ProjectRules, &project.ProjectPreferences, &notifyNeeded, &notifyFinished, &project.WorkspacePath, &auto, &project.QueueMaxConcurrent, &project.QueueBacklogCap, &project.CreatedAt, &project.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan project: %w", err)
 		}
+		project.NotificationOnlyWhenNeeded = notifyNeeded != 0
+		project.NotificationWhenFinished = notifyFinished != 0
 		project.QueueAutoWhenReady = auto != 0
 		projects = append(projects, project)
 	}

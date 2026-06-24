@@ -43,7 +43,7 @@ func (h *Hub) Subscribe(runID string) (chan PatchMessage, func()) {
 
 func (h *Hub) Broadcast(topic string, ev event.Event, fragment string) {
 	topics := []string{topic}
-	if ev.ProjectID != "" {
+	if ev.ProjectID != "" && topic != NotificationsTopic {
 		projectTopic := projectChatTopic(ev.ProjectID)
 		if topic == "" {
 			topics[0] = projectTopic

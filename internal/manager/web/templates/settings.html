@@ -7,7 +7,8 @@
   <script type="module" src="/assets/datastar.min.js"></script>
   <style>{{template "styles" .}}</style>
 </head>
-<body data-signals:csrf="'{{.CSRF}}'">
+<body data-signals:csrf="'{{.CSRF}}'" data-on:load="@get('/notifications/events', {openWhenHidden: true})">
+  {{template "notifications_center.html" .Center}}
   <main>
     <header class="settings-header">
       <p class="breadcrumb"><a href="/projects">Projects</a> · <a href="/projects/{{.Project.ID}}">{{.Project.Name}}</a></p>
@@ -16,6 +17,7 @@
     </header>
     {{template "settings_section.html" .Rules}}
     {{template "settings_section.html" .Preferences}}
+    {{template "notification_settings.html" .Notifications}}
   </main>
 </body>
 </html>
