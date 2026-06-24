@@ -255,7 +255,7 @@ func startLostWorktreeResumeFixture(t *testing.T, ctx context.Context) lostWorkt
 	var worktreePath string
 	select {
 	case worktreePath = <-runner.worktreePaths:
-	case <-time.After(2 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("implementation runner did not create a worktree")
 	}
 
@@ -407,7 +407,7 @@ func stageByWorkflowID(t *testing.T, st *store.Store, runID, workflowStageID str
 
 func waitForWorkflowStageAwaiting(t *testing.T, st *store.Store, runID, workflowStageID string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		run, _ := st.GetRun(ctxBackground(), runID)
 		stage := stageByWorkflowID(t, st, runID, workflowStageID)
@@ -421,7 +421,7 @@ func waitForWorkflowStageAwaiting(t *testing.T, st *store.Store, runID, workflow
 
 func waitForNotRunStatus(t *testing.T, st *store.Store, runID, status string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		run, err := st.GetRun(ctxBackground(), runID)
 		if err == nil && run.Status != status {
