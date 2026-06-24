@@ -52,30 +52,6 @@
     <p class="muted">No messages yet. Start with the change you want Parley to make.</p>
     {{end}}
   </div>
-  {{range .TaskRuns}}
-  {{if .ReviewReady}}
-  <article class="chat-review-card">
-    <p><strong>{{.Task.Idea}}</strong></p>
-    <a href="/projects/{{$.Project.ID}}/runs/{{.Run.ID}}?tab=review">ready for review →</a>
-    <span class="muted">Run {{short .Run.ID}} needs a human verdict.</span>
-  </article>
-  {{end}}
-  {{end}}
-  {{if .TaskRuns}}
-  <details class="chat-linked-runs">
-    <summary>Tasks started from this chat</summary>
-    <ul class="run-list">
-      {{range .TaskRuns}}
-      <li>
-        {{if .HasRun}}<a href="/projects/{{$.Project.ID}}/runs/{{.Run.ID}}"><strong>{{short .Task.ID}}</strong></a>{{else}}<strong>{{short .Task.ID}}</strong>{{end}}
-        <span class="pill {{statusClass .Task.Status}}">{{statusLabel .Task.Status}}</span>
-        {{if .HasRun}}<span class="muted">Run <a href="/projects/{{$.Project.ID}}/runs/{{.Run.ID}}">{{short .Run.ID}}</a></span>{{end}}
-        <br><span>{{.Task.Idea}}</span>
-      </li>
-      {{end}}
-    </ul>
-  </details>
-  {{end}}
   <form method="post" action="/projects/{{.Project.ID}}/chat/messages">
     <input type="hidden" name="_csrf" value="{{.CSRF}}">
     <label for="chat-message">Idea</label>

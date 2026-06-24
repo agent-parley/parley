@@ -25,6 +25,23 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	s.handleProjectIndex(w, r, store.DefaultProjectID)
 }
 
+func (s *Server) handleProjectsIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/projects" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	data, err := s.projectsIndexData(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.writePage(w, "projects.html", data)
+}
+
 func (s *Server) handleProjectPath(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/projects/")
 	parts := strings.Split(strings.Trim(path, "/"), "/")
@@ -115,13 +132,75 @@ func (s *Server) indexData(r *http.Request, projectID string) (web.IndexData, er
 	if err != nil {
 		return web.IndexData{}, err
 	}
+	queue := web.NewQueueView(queueState)
+	csrf := csrfFromContext(r.Context())
+	tasks, err := s.projectTasksDataFromRuns(r, project, runs, queue, csrf)
+	if err != nil {
+		return web.IndexData{}, err
+	}
 	chat, err := s.projectChatData(r, project)
 	if err != nil {
 		return web.IndexData{}, err
 	}
-	csrf := csrfFromContext(r.Context())
 	chat.CSRF = csrf
-	return web.IndexData{Project: project, Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, Queue: web.NewQueueView(queueState), Chat: chat, CSRF: csrf, Title: "Parley · " + project.Name}, nil
+	return web.IndexData{Project: project, Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, Queue: queue, Tasks: tasks, Chat: chat, CSRF: csrf, Title: "Parley · " + project.Name}, nil
+}
+
+func (s *Server) projectsIndexData(r *http.Request) (web.ProjectsIndexData, error) {
+	projects, err := s.store.ListProjects(r.Context())
+	if err != nil {
+		return web.ProjectsIndexData{}, err
+	}
+	views := make([]web.ProjectNeedsYouView, 0, len(projects))
+	total := 0
+	for _, project := range projects {
+		count, err := s.store.CountRunsByProjectStatus(r.Context(), project.ID, store.RunStatusAwaitingHuman)
+		if err != nil {
+			return web.ProjectsIndexData{}, err
+		}
+		total += count
+		views = append(views, web.ProjectNeedsYouView{Project: project, NeedsYouCount: count})
+	}
+	return web.ProjectsIndexData{Projects: views, TotalNeedsYou: total, Title: "Parley · Projects"}, nil
+}
+
+func (s *Server) projectTasksData(r *http.Request, project store.Project, queue web.QueueView, csrf string) (web.ProjectTasksData, error) {
+	runs, err := s.store.ListRunsForProject(r.Context(), project.ID)
+	if err != nil {
+		return web.ProjectTasksData{}, err
+	}
+	return s.projectTasksDataFromRuns(r, project, runs, queue, csrf)
+}
+
+func (s *Server) projectTasksDataFromRuns(r *http.Request, project store.Project, runs []store.Run, queue web.QueueView, csrf string) (web.ProjectTasksData, error) {
+	bundles := make([]store.RunBundle, 0, len(runs))
+	for _, run := range runs {
+		bundle, err := s.store.RunBundle(r.Context(), run.ID)
+		if err != nil {
+			return web.ProjectTasksData{}, err
+		}
+		bundles = append(bundles, bundle)
+	}
+	return web.NewProjectTasksData(project, bundles, queue, csrf), nil
+}
+
+func (s *Server) projectHomeFragmentsData(r *http.Request, project store.Project) (web.ProjectHomeFragmentsData, error) {
+	queueState, err := s.engine.QueueState(r.Context())
+	if err != nil {
+		return web.ProjectHomeFragmentsData{}, err
+	}
+	csrf := csrfFromContext(r.Context())
+	queue := web.NewQueueView(queueState)
+	tasks, err := s.projectTasksData(r, project, queue, csrf)
+	if err != nil {
+		return web.ProjectHomeFragmentsData{}, err
+	}
+	chat, err := s.projectChatData(r, project)
+	if err != nil {
+		return web.ProjectHomeFragmentsData{}, err
+	}
+	chat.CSRF = csrf
+	return web.ProjectHomeFragmentsData{Tasks: tasks, Chat: chat}, nil
 }
 
 func (s *Server) handleProjectChatPath(w http.ResponseWriter, r *http.Request, projectID string, parts []string) {
@@ -207,12 +286,12 @@ func (s *Server) handleProjectChatEvents(w http.ResponseWriter, r *http.Request,
 		http.NotFound(w, r)
 		return
 	}
-	data, err := s.projectChatData(r, project)
+	data, err := s.projectHomeFragmentsData(r, project)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fragment, err := s.renderer.RenderProjectChat(data)
+	fragment, err := s.renderer.RenderProjectHomeFragments(data)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -229,7 +308,7 @@ func (s *Server) handleProjectChatEvents(w http.ResponseWriter, r *http.Request,
 		fragment string
 		refresh  bool
 	}
-	updates := make(chan chatPatch, len(data.TaskRuns)+1)
+	updates := make(chan chatPatch, 16)
 	var unsubscribes []func()
 	subscribe := func(topic string, refresh bool) {
 		ch, unsubscribe := s.hub.Subscribe(topic)
@@ -253,12 +332,7 @@ func (s *Server) handleProjectChatEvents(w http.ResponseWriter, r *http.Request,
 			}
 		}()
 	}
-	subscribe(projectChatTopic(project.ID), false)
-	for _, taskRun := range data.TaskRuns {
-		if taskRun.HasRun {
-			subscribe(taskRun.Run.ID, true)
-		}
-	}
+	subscribe(projectChatTopic(project.ID), true)
 	defer func() {
 		for _, unsubscribe := range unsubscribes {
 			unsubscribe()
@@ -269,11 +343,11 @@ func (s *Server) handleProjectChatEvents(w http.ResponseWriter, r *http.Request,
 		case update := <-updates:
 			patch := update.fragment
 			if update.refresh {
-				data, err := s.projectChatData(r, project)
+				data, err := s.projectHomeFragmentsData(r, project)
 				if err != nil {
 					continue
 				}
-				patch, err = s.renderer.RenderProjectChat(data)
+				patch, err = s.renderer.RenderProjectHomeFragments(data)
 				if err != nil {
 					continue
 				}
@@ -333,11 +407,11 @@ func (s *Server) projectChatRunBundles(r *http.Request, taskRuns []web.TaskRunVi
 }
 
 func (s *Server) broadcastProjectChat(r *http.Request, project store.Project) {
-	data, err := s.projectChatData(r, project)
+	data, err := s.projectHomeFragmentsData(r, project)
 	if err != nil {
 		return
 	}
-	fragment, err := s.renderer.RenderProjectChat(data)
+	fragment, err := s.renderer.RenderProjectHomeFragments(data)
 	if err != nil {
 		return
 	}

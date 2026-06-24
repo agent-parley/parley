@@ -23,6 +23,7 @@ type Renderer interface {
 	ExecutePage(name string, data any) (string, error)
 	RenderRunFragments(store.RunBundle) (string, error)
 	RenderProjectChat(ProjectChatData) (string, error)
+	RenderProjectHomeFragments(ProjectHomeFragmentsData) (string, error)
 }
 
 type TemplateRenderer struct {
@@ -35,10 +36,51 @@ type IndexData struct {
 	Runners         []store.Runner
 	RunnerEventPage store.SystemEventPage
 	Queue           QueueView
+	Tasks           ProjectTasksData
 	Chat            ProjectChatData
 	Notice          *Notice
 	CSRF            string
 	Title           string
+}
+
+type ProjectHomeFragmentsData struct {
+	Tasks ProjectTasksData
+	Chat  ProjectChatData
+}
+
+type ProjectTasksData struct {
+	Project store.Project
+	Items   []TaskOverviewItem
+	Queue   QueueView
+	CSRF    string
+}
+
+type TaskOverviewItem struct {
+	Task         store.Task
+	Run          store.Run
+	Idea         string
+	Status       string
+	Link         string
+	DetailID     string
+	NeedsYou     bool
+	NeedsReason  string
+	CurrentStage string
+	LastUpdate   string
+	Performer    string
+	Runner       string
+	StartQueued  bool
+	UpdatedAt    string
+}
+
+type ProjectsIndexData struct {
+	Projects      []ProjectNeedsYouView
+	TotalNeedsYou int
+	Title         string
+}
+
+type ProjectNeedsYouView struct {
+	Project       store.Project
+	NeedsYouCount int
 }
 
 type ProjectChatData struct {
@@ -185,6 +227,123 @@ type PRReadyView struct {
 	Branch         string
 	CommitSHA      string
 	DiffArtifactID string
+}
+
+func NewProjectTasksData(project store.Project, bundles []store.RunBundle, queue QueueView, csrf string) ProjectTasksData {
+	items := make([]TaskOverviewItem, 0, len(bundles))
+	for _, bundle := range bundles {
+		items = append(items, newTaskOverviewItem(project.ID, bundle, queue.AutoWhenReady))
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		leftRank := taskOverviewRank(items[i])
+		rightRank := taskOverviewRank(items[j])
+		if leftRank != rightRank {
+			return leftRank < rightRank
+		}
+		if items[i].UpdatedAt == items[j].UpdatedAt {
+			return items[i].Run.ID < items[j].Run.ID
+		}
+		return items[i].UpdatedAt > items[j].UpdatedAt
+	})
+	return ProjectTasksData{Project: project, Items: items, Queue: queue, CSRF: csrf}
+}
+
+func newTaskOverviewItem(projectID string, bundle store.RunBundle, autoWhenReady bool) TaskOverviewItem {
+	idea := strings.TrimSpace(bundle.Task.Idea)
+	if idea == "" {
+		idea = strings.TrimSpace(bundle.Run.Idea)
+	}
+	stage, performer := taskOverviewStage(bundle)
+	lastUpdate := taskOverviewLastUpdate(bundle)
+	link := "/projects/" + projectID + "/runs/" + bundle.Run.ID
+	item := TaskOverviewItem{
+		Task:         bundle.Task,
+		Run:          bundle.Run,
+		Idea:         idea,
+		Status:       bundle.Run.Status,
+		Link:         link,
+		DetailID:     "task-" + bundle.Run.ID + "-modal",
+		CurrentStage: stage,
+		LastUpdate:   lastUpdate,
+		Performer:    performer,
+		Runner:       taskOverviewRunner(bundle.Events),
+		StartQueued:  bundle.Run.Status == store.RunStatusPending && !autoWhenReady,
+		UpdatedAt:    taskOverviewUpdatedAt(bundle),
+	}
+	if bundle.Run.Status == store.RunStatusAwaitingHuman {
+		item.NeedsYou = true
+		if pendingIdeaQuestions(bundle) != nil {
+			item.NeedsReason = "question pending"
+		} else {
+			item.NeedsReason = "diff ready"
+			item.Link += "?tab=review"
+		}
+	}
+	return item
+}
+
+func taskOverviewRank(item TaskOverviewItem) int {
+	if item.NeedsYou {
+		return 0
+	}
+	if !store.RunStatusIsTerminal(item.Status) {
+		return 1
+	}
+	return 2
+}
+
+func taskOverviewStage(bundle store.RunBundle) (string, string) {
+	for _, stage := range bundle.Stages {
+		if stage.Status == store.StageStatusRunning || stage.Status == store.RunStatusAwaitingHuman {
+			return stageLabel(stage.StageType), performer(stage)
+		}
+	}
+	for i := len(bundle.Stages) - 1; i >= 0; i-- {
+		stage := bundle.Stages[i]
+		if stage.Status != store.StageStatusPending {
+			return stageLabel(stage.StageType), performer(stage)
+		}
+	}
+	if len(bundle.Stages) > 0 {
+		stage := bundle.Stages[0]
+		return stageLabel(stage.StageType), performer(stage)
+	}
+	return "Run lifecycle", "Harness"
+}
+
+func taskOverviewLastUpdate(bundle store.RunBundle) string {
+	if len(bundle.Events) == 0 {
+		return timeLabel(taskOverviewUpdatedAt(bundle))
+	}
+	latest := bundle.Events[len(bundle.Events)-1]
+	label := timeLabel(latest.Timestamp)
+	if latest.Summary != "" {
+		if label != "" {
+			return label + " · " + latest.Summary
+		}
+		return latest.Summary
+	}
+	return label
+}
+
+func taskOverviewUpdatedAt(bundle store.RunBundle) string {
+	if bundle.Run.UpdatedAt != "" {
+		return bundle.Run.UpdatedAt
+	}
+	return bundle.Run.CreatedAt
+}
+
+func taskOverviewRunner(events []event.Event) string {
+	for i := len(events) - 1; i >= 0; i-- {
+		ev := events[i]
+		if runnerID := eventString(ev, "runner_id"); runnerID != "" {
+			return runnerID
+		}
+		if ev.Actor.ID != "" && ev.Actor.Kind != "" {
+			return ev.Actor.Kind + "/" + ev.Actor.ID
+		}
+	}
+	return "—"
 }
 
 func NewTaskRunViews(tasks []store.Task, runs []store.Run) []TaskRunView {
@@ -351,6 +510,20 @@ func (r *TemplateRenderer) RenderProjectChat(data ProjectChatData) (string, erro
 	var buf bytes.Buffer
 	if err := r.templates.ExecuteTemplate(&buf, "project_chat.html", data); err != nil {
 		return "", fmt.Errorf("execute project chat fragment: %w", err)
+	}
+	return compactHTML(buf.String()), nil
+}
+
+func (r *TemplateRenderer) RenderProjectHomeFragments(data ProjectHomeFragmentsData) (string, error) {
+	var buf bytes.Buffer
+	for _, name := range []string{"tasks_overview.html", "project_chat.html"} {
+		var fragmentData any = data.Tasks
+		if name == "project_chat.html" {
+			fragmentData = data.Chat
+		}
+		if err := r.templates.ExecuteTemplate(&buf, name, fragmentData); err != nil {
+			return "", fmt.Errorf("execute project home fragment %s: %w", name, err)
+		}
 	}
 	return compactHTML(buf.String()), nil
 }

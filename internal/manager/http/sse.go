@@ -41,11 +41,23 @@ func (h *Hub) Subscribe(runID string) (chan PatchMessage, func()) {
 	}
 }
 
-func (h *Hub) Broadcast(runID string, ev event.Event, fragment string) {
+func (h *Hub) Broadcast(topic string, ev event.Event, fragment string) {
+	topics := []string{topic}
+	if ev.ProjectID != "" {
+		projectTopic := projectChatTopic(ev.ProjectID)
+		if topic == "" {
+			topics[0] = projectTopic
+		} else if topic != projectTopic {
+			topics = append(topics, projectTopic)
+		}
+	}
+
 	h.mu.RLock()
-	subs := make([]chan PatchMessage, 0, len(h.subs[runID]))
-	for ch := range h.subs[runID] {
-		subs = append(subs, ch)
+	subs := make([]chan PatchMessage, 0)
+	for _, topic := range topics {
+		for ch := range h.subs[topic] {
+			subs = append(subs, ch)
+		}
 	}
 	h.mu.RUnlock()
 	msg := PatchMessage{Event: ev, Fragment: fragment}

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <script type="module" src="/assets/datastar.min.js"></script>
+  <style>{{template "styles" .}}</style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Projects</h1>
+      <p class="muted">Cross-project needs-you count: <strong>{{.TotalNeedsYou}}</strong></p>
+    </header>
+    <section id="projects-index" class="card">
+      <h2>Project dashboard</h2>
+      {{if .Projects}}
+      <ul class="project-list">
+        {{range .Projects}}
+        <li class="project-row">
+          <a href="/projects/{{.Project.ID}}"><strong>{{.Project.Name}}</strong></a>
+          {{if .NeedsYouCount}}
+          <span class="needs-you-badge">⚠ {{.NeedsYouCount}} needs you</span>
+          {{else}}
+          <span class="muted">0 needs you</span>
+          {{end}}
+          <br><small>{{.Project.WorkspacePath}}</small>
+        </li>
+        {{end}}
+      </ul>
+      {{else}}
+      <p class="empty-state">No projects yet.</p>
+      {{end}}
+    </section>
+  </main>
+</body>
+</html>

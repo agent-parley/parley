@@ -9,13 +9,14 @@
 </head>
 <body data-on:load="@get('/projects/{{.Project.ID}}/chat/events', {openWhenHidden: true})">
   <main>
-    <header><h1>{{.Project.Name}}</h1><p>Project workspace: <code>{{.Project.WorkspacePath}}</code></p></header>
+    <header><h1>{{.Project.Name}}</h1><p><a href="/projects">Projects</a> · Project workspace: <code>{{.Project.WorkspacePath}}</code></p></header>
     {{with .Notice}}
     <section class="notice" role="status" aria-live="polite">
       <strong>{{.Title}}</strong>
       <p>{{.Message}}</p>
     </section>
     {{end}}
+    {{template "tasks_overview.html" .Tasks}}
     {{template "project_chat.html" .Chat}}
     <section class="card">
       <h2>New task run</h2>
@@ -62,18 +63,6 @@
       {{if .RunnerEventPage.HasOlder}}
       <p><a href="/projects/{{.Project.ID}}?runner_events_before={{.RunnerEventPage.OlderCursor}}#runner-timeline">Older runner events</a></p>
       {{end}}
-      {{end}}
-    </section>
-    <section class="card">
-      <h2>Runs</h2>
-      {{if .Runs}}
-      <ul class="run-list">
-        {{range .Runs}}
-        <li><a href="/projects/{{$.Project.ID}}/runs/{{.ID}}"><strong>{{short .ID}}</strong></a> <span class="pill {{statusClass .Status}}">{{statusLabel .Status}}</span>{{if eq .Status "pending"}} <span class="muted">waiting for a free runner slot{{if not $.Queue.AutoWhenReady}} · manual start required{{end}}</span>{{end}}<br><span>{{.Idea}}</span>{{if and (eq .Status "pending") (not $.Queue.AutoWhenReady)}}<form class="inline-form" method="post" action="/projects/{{$.Project.ID}}/runs/{{.ID}}/start"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><button type="submit">Start queued run</button></form>{{end}}</li>
-        {{end}}
-      </ul>
-      {{else}}
-      <p>No runs yet.</p>
       {{end}}
     </section>
   </main>
