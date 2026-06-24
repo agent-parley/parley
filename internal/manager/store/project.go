@@ -26,8 +26,12 @@ func (s *Store) UpdateProjectRules(ctx context.Context, projectID, rules string)
 	return s.updateProjectText(ctx, normalizeProjectID(projectID), "project_rules", rules)
 }
 
+func ReadProjectRulesCandidate(repositoryPath string) (string, error) {
+	return readProjectCandidateFile(repositoryPath, ProjectRulesCandidatePath)
+}
+
 func (s *Store) PromoteProjectRulesFromRepository(ctx context.Context, projectID, repositoryPath string) (Project, error) {
-	content, err := readProjectCandidateFile(repositoryPath, ProjectRulesCandidatePath)
+	content, err := ReadProjectRulesCandidate(repositoryPath)
 	if err != nil {
 		return Project{}, err
 	}
@@ -46,8 +50,12 @@ func (s *Store) UpdateProjectPreferences(ctx context.Context, projectID, prefere
 	return s.updateProjectText(ctx, normalizeProjectID(projectID), "project_preferences", preferences)
 }
 
+func ReadProjectPreferencesCandidate(repositoryPath string) (string, error) {
+	return readProjectCandidateFile(repositoryPath, ProjectPreferencesCandidatePath)
+}
+
 func (s *Store) PromoteProjectPreferencesFromRepository(ctx context.Context, projectID, repositoryPath string) (Project, error) {
-	content, err := readProjectCandidateFile(repositoryPath, ProjectPreferencesCandidatePath)
+	content, err := ReadProjectPreferencesCandidate(repositoryPath)
 	if err != nil {
 		return Project{}, err
 	}
@@ -77,7 +85,7 @@ func (s *Store) updateProjectText(ctx context.Context, projectID, column, conten
 func readProjectCandidateFile(repositoryPath, rel string) (string, error) {
 	repositoryPath = strings.TrimSpace(repositoryPath)
 	if repositoryPath == "" {
-		return "", fmt.Errorf("repository path is required to promote %s", rel)
+		return "", fmt.Errorf("repository path is required to read %s", rel)
 	}
 	content, err := os.ReadFile(filepath.Join(filepath.Clean(repositoryPath), rel))
 	if err != nil {

@@ -9,7 +9,7 @@
 </head>
 <body data-on:load="@get('/projects/{{.Project.ID}}/chat/events', {openWhenHidden: true})">
   <main>
-    <header><h1>{{.Project.Name}}</h1><p><a href="/projects">Projects</a> · Project workspace: <code>{{.Project.WorkspacePath}}</code></p></header>
+    <header><h1>{{.Project.Name}}</h1><p><a href="/projects">Projects</a> · <a href="/projects/{{.Project.ID}}/settings">Settings</a> · Project workspace: <code>{{.Project.WorkspacePath}}</code></p></header>
     {{with .Notice}}
     <section class="notice" role="status" aria-live="polite">
       <strong>{{.Title}}</strong>
