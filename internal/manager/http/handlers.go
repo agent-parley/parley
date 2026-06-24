@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/store"
@@ -395,7 +396,7 @@ func (s *Server) projectSettingsSectionData(r *http.Request, project store.Proje
 	candidateDiffers := false
 	if repoPath != "" {
 		if candidate, err := projectSettingsCandidate(repoPath, kind); err == nil {
-			candidateDiffers = candidate != projectSettingsSavedValue(project, kind)
+			candidateDiffers = projectSettingsCandidateDiffers(candidate, projectSettingsSavedValue(project, kind))
 		}
 	}
 	return web.ProjectSettingsSectionData{
@@ -452,6 +453,14 @@ func projectSettingsCandidate(repoPath, kind string) (string, error) {
 		return store.ReadProjectPreferencesCandidate(repoPath)
 	}
 	return store.ReadProjectRulesCandidate(repoPath)
+}
+
+func projectSettingsCandidateDiffers(candidate, saved string) bool {
+	return projectSettingsComparisonValue(candidate) != projectSettingsComparisonValue(saved)
+}
+
+func projectSettingsComparisonValue(value string) string {
+	return strings.TrimRightFunc(value, unicode.IsSpace)
 }
 
 func projectSettingsCandidatePath(kind string) string {
