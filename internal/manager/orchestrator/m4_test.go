@@ -514,6 +514,16 @@ type fakeBroadcaster struct{}
 
 func (fakeBroadcaster) Broadcast(string, event.Event, string) {}
 
+type capturingNotificationSink struct {
+	seen []store.Notification
+	err  error
+}
+
+func (s *capturingNotificationSink) Notify(_ context.Context, notification store.Notification) error {
+	s.seen = append(s.seen, notification)
+	return s.err
+}
+
 func initCommitSourceRepo(t *testing.T, ctx context.Context, files map[string]string) string {
 	t.Helper()
 	dir := t.TempDir()

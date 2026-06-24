@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
+	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
 
@@ -37,6 +39,101 @@ func TestCompletionEventType(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNotificationDispatcherPersistsSubscribedEventsAndContinuesOnSinkError(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRun(ctx, "ship notification center")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sink := &capturingNotificationSink{err: errors.New("sse down")}
+	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{NotificationSinks: []NotificationSink{sink}})
+
+	if _, err := engine.emit(ctx, reviewAwaitingEvent(wr)); err != nil {
+		t.Fatalf("emit awaiting human: %v", err)
+	}
+	if _, err := engine.emit(ctx, runEvent(wr, "run.completed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "done", map[string]any{"terminal_status": store.RunStatusCompleted})); err != nil {
+		t.Fatalf("emit completed: %v", err)
+	}
+
+	items, err := st.ListNotifications(ctx, 10)
+	if err != nil {
+		t.Fatalf("list notifications: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("notifications = %+v, want 2", items)
+	}
+	if len(sink.seen) != 2 {
+		t.Fatalf("sink saw %d notifications, want 2", len(sink.seen))
+	}
+	if items[0].RunID != wr.Run.ID || items[0].ProjectID != wr.Project.ID {
+		t.Fatalf("notification anchors = %+v", items[0])
+	}
+}
+
+func TestNotificationDispatcherRespectsTogglesAndExcludesNonSubscribedEvents(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRun(ctx, "avoid notification spam")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sink := &capturingNotificationSink{}
+	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{NotificationSinks: []NotificationSink{sink}})
+
+	if _, err := engine.emit(ctx, deepIdeaAwaitingEvent(wr)); err != nil {
+		t.Fatalf("emit deep idea awaiting human: %v", err)
+	}
+	if _, err := st.UpdateProjectNotificationPreferences(ctx, wr.Project.ID, store.ProjectNotificationPreferences{OnlyWhenNeeded: false, WhenFinished: true}); err != nil {
+		t.Fatalf("disable needed notifications: %v", err)
+	}
+	if _, err := engine.emit(ctx, reviewAwaitingEvent(wr)); err != nil {
+		t.Fatalf("emit awaiting human: %v", err)
+	}
+	if _, err := engine.emit(ctx, stageEvent(wr, wr.ImplementationStage, "stage.completed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "stage done", nil)); err != nil {
+		t.Fatalf("emit stage completed: %v", err)
+	}
+	if _, err := engine.emit(ctx, runEvent(wr, "run.cancelled", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "cancelled", map[string]any{"terminal_status": store.RunStatusCancelled})); err != nil {
+		t.Fatalf("emit cancelled: %v", err)
+	}
+	if _, err := engine.emit(ctx, runEvent(wr, "run.abandoned", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "needs input", map[string]any{"terminal_status": store.RunStatusNeedsInput})); err != nil {
+		t.Fatalf("emit needs input: %v", err)
+	}
+	if _, err := engine.emit(ctx, runEvent(wr, "run.failed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "invalid", map[string]any{"terminal_status": store.RunStatusInvalid})); err != nil {
+		t.Fatalf("emit invalid: %v", err)
+	}
+
+	items, err := st.ListNotifications(ctx, 10)
+	if err != nil {
+		t.Fatalf("list notifications: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("notifications = %+v, want only invalid run.failed", items)
+	}
+	if items[0].Class != store.NotificationClassFinished || !strings.Contains(items[0].Title, "Run invalid:") {
+		t.Fatalf("notification = %+v, want finished invalid", items[0])
+	}
+	if len(sink.seen) != 1 {
+		t.Fatalf("sink saw %d notifications, want 1", len(sink.seen))
+	}
+}
+
+func reviewAwaitingEvent(wr store.WorkflowRun) event.Event {
+	return event.Event{SchemaVersion: event.SchemaVersion, ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, Type: "stage.awaiting_human", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "awaiting verdict", Data: map[string]any{"stage_type": contract.StageTypeReview}}
+}
+
+func deepIdeaAwaitingEvent(wr store.WorkflowRun) event.Event {
+	return event.Event{SchemaVersion: event.SchemaVersion, ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, AttemptID: wr.Attempt.ID, Type: "stage.awaiting_human", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "deep idea refinement awaiting answers", Data: map[string]any{"stage_type": contract.StageTypeIdeaRefinement, "questions_artifact_id": "art_questions"}}
 }
 
 func TestDispatchStagePersistsStageBriefAndPassesItToRunner(t *testing.T) {

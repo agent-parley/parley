@@ -1,0 +1,30 @@
+<section id="settings-notifications" class="card settings-section">
+  <div class="settings-section-head">
+    <div>
+      <h2>Notifications</h2>
+      <p class="muted">Choose which run events create in-app notification inbox items for this project.</p>
+    </div>
+  </div>
+  {{if .Notice}}
+  <p class="settings-inline-notice" role="status" aria-live="polite">{{.Notice}}</p>
+  {{end}}
+  <form method="post" action="{{.SavePath}}" data-on:submit="@post('{{.SavePath}}', {contentType: 'form'})">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}" data-bind:csrf>
+    <div class="toggle-list">
+      <label class="toggle-row" for="notification-only-when-needed">
+        <input id="notification-only-when-needed" type="checkbox" name="only_when_needed" value="1" {{if .OnlyWhenNeeded}}checked{{end}}>
+        <span><strong>Only when I'm needed</strong><small>Human-review gates waiting on a verdict.</small></span>
+      </label>
+      <label class="toggle-row" for="notification-when-finished">
+        <input id="notification-when-finished" type="checkbox" name="when_finished" value="1" {{if .WhenFinished}}checked{{end}}>
+        <span><strong>When anything finishes</strong><small>Completed, failed, or invalid runs.</small></span>
+      </label>
+    </div>
+    <div class="settings-actions single-action">
+      <button type="submit">Save notification settings</button>
+    </div>
+    {{if .Status}}
+    <p class="settings-status muted" role="status" aria-live="polite">{{.Status}}</p>
+    {{end}}
+  </form>
+</section>

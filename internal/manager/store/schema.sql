@@ -4,6 +4,8 @@ CREATE TABLE IF NOT EXISTS projects (
   description TEXT NOT NULL DEFAULT '',
   project_rules TEXT NOT NULL DEFAULT '',
   project_preferences TEXT NOT NULL DEFAULT '',
+  notification_only_when_needed INTEGER NOT NULL DEFAULT 1,
+  notification_when_finished INTEGER NOT NULL DEFAULT 1,
   queue_auto_when_ready INTEGER NOT NULL DEFAULT 1,
   queue_max_concurrent INTEGER NOT NULL DEFAULT 1,
   queue_backlog_cap INTEGER NOT NULL DEFAULT 100,
@@ -168,6 +170,16 @@ CREATE TABLE IF NOT EXISTS events (
   data_json TEXT NOT NULL,
   envelope_json TEXT NOT NULL,
   UNIQUE(scope, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  class TEXT NOT NULL,
+  title TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  acknowledged_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS project_memory_entries (
