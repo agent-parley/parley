@@ -3,11 +3,14 @@ package manager
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	managerhttp "github.com/agent-parley/parley/internal/manager/http"
+	"github.com/agent-parley/parley/internal/manager/notify"
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/runnerclient"
 	"github.com/agent-parley/parley/internal/manager/secrets"
@@ -114,6 +117,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		BacklogCap:    project.QueueBacklogCap,
 	}
 	notificationSink := managerhttp.NewInAppNotificationSink(st, hub, renderer)
+	externalNotificationSink := notify.NewExternalSink(st, secretService, notify.ExternalSinkOptions{BaseURL: managerHTTPBaseURL(cfg.Addr)})
 	engine := orchestrator.NewEngineWithOptions(st, runner, renderer, hub, orchestrator.EngineOptions{
 		ImplementationAdapter: cfg.Adapter,
 		PlanningAdapter:       cfg.Adapter,
@@ -123,7 +127,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		ProjectID:             project.ID,
 		QueuePolicy:           &queuePolicy,
 		RunnerSlots:           1,
-		NotificationSinks:     []orchestrator.NotificationSink{notificationSink},
+		NotificationSinks:     []orchestrator.NotificationSink{notificationSink, externalNotificationSink},
 	})
 	app := &App{
 		cfg:     cfg,
@@ -144,7 +148,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		return nil, err
 	}
 	engineRunner := engine
-	httpServer := managerhttp.NewServer(cfg.Addr, st, engineRunner, hub, renderer)
+	httpServer := managerhttp.NewServer(cfg.Addr, st, engineRunner, hub, renderer, secretService)
 	app.http = httpServer
 	if err := engine.RecoverAndDispatch(ctx); err != nil {
 		_ = app.close(context.Background())
@@ -154,6 +158,21 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 }
 
 func (a *App) Secrets() *secrets.Service { return a.secrets }
+
+func managerHTTPBaseURL(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
+		return strings.TrimRight(addr, "/")
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err == nil {
+		if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+			host = "127.0.0.1"
+		}
+		return "http://" + net.JoinHostPort(host, port)
+	}
+	return "http://" + strings.TrimRight(addr, "/")
+}
 
 func (a *App) startRunnerChild(ctx context.Context, restarted bool) error {
 	a.mu.Lock()

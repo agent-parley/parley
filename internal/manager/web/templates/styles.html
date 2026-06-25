@@ -6,8 +6,8 @@ a { color: #93c5fd; }
 .notice { background: #422006; border: 1px solid #f59e0b; border-radius: 12px; color: #fffbeb; padding: 16px 20px; margin: 16px 0; }
 .notice p { margin: 8px 0 0; }
 .card { background: #1f2937; border: 1px solid #374151; border-radius: 12px; padding: 20px; margin: 16px 0; box-shadow: 0 10px 30px rgba(0,0,0,.18); }
-textarea, select, button { width: 100%; box-sizing: border-box; border-radius: 8px; border: 1px solid #4b5563; padding: 12px; font: inherit; }
-textarea, select { background: #111827; color: #f9fafb; margin: 8px 0 12px; }
+textarea, select, input, button { width: 100%; box-sizing: border-box; border-radius: 8px; border: 1px solid #4b5563; padding: 12px; font: inherit; }
+textarea, select, input { background: #111827; color: #f9fafb; margin: 8px 0 12px; }
 button { background: #2563eb; color: white; border: 0; cursor: pointer; font-weight: 700; }
 button.text-button { width: auto; padding: 0; background: transparent; color: #93c5fd; border: 0; font-size: .85rem; }
 button.text-button:hover { background: transparent; color: #bfdbfe; }
@@ -32,6 +32,14 @@ button:hover { background: #1d4ed8; }
 .toggle-row small { display: block; margin-top: 3px; color: #9ca3af; }
 .settings-inline-notice { margin: 12px 0; padding: 10px 12px; border: 1px solid #4b5563; border-radius: 8px; background: #111827; color: #fde68a; }
 .settings-status { margin: 10px 0 0; }
+.sink-create-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin: 16px 0; }
+.sink-create-grid form, .sink-card { background: #111827; border: 1px solid #374151; border-radius: 10px; padding: 14px; }
+.sink-list { display: grid; gap: 12px; margin-top: 16px; }
+.sink-card form { margin-top: 12px; }
+.sink-card fieldset, .sink-create-grid fieldset { border: 1px solid #374151; border-radius: 10px; margin: 10px 0; padding: 10px 12px; }
+.sink-card fieldset input, .sink-create-grid fieldset input { width: auto; margin-right: 6px; }
+.settings-inline-notice.success { color: #bbf7d0; border-color: #065f46; }
+.settings-inline-notice.warning { color: #fde68a; border-color: #f59e0b; }
 .candidate-badge { display: inline-flex; width: fit-content; vertical-align: middle; border-radius: 999px; padding: 2px 8px; background: #374151; color: #fde68a; font-size: .78rem; font-weight: 800; }
 .notification-center { position: fixed; top: 14px; right: 18px; z-index: 60; }
 .notification-menu { position: relative; }

@@ -26,7 +26,7 @@ func TestArtifactHandlerServesByIDOnlyAndEscapesPreview(t *testing.T) {
 		t.Fatalf("save artifact: %v", err)
 	}
 
-	srv := NewServer("127.0.0.1:8080", st, nil, NewHub(), nil)
+	srv := NewServer("127.0.0.1:8080", st, nil, NewHub(), nil, nil)
 	body := requestArtifact(t, srv, "/artifacts/"+artifact.ID, http.StatusOK)
 	if strings.Contains(body, "<script>") {
 		t.Fatalf("artifact preview was not escaped: %s", body)
@@ -55,7 +55,7 @@ func TestArtifactHandlerDownloadsRawHTML(t *testing.T) {
 		t.Fatalf("save artifact: %v", err)
 	}
 
-	srv := NewServer("127.0.0.1:8080", st, nil, NewHub(), nil)
+	srv := NewServer("127.0.0.1:8080", st, nil, NewHub(), nil, nil)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/artifacts/"+artifact.ID, nil)
 	srv.routes().ServeHTTP(rec, req)

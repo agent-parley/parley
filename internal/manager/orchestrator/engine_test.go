@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/workflow"
@@ -68,12 +69,51 @@ func TestNotificationDispatcherPersistsSubscribedEventsAndContinuesOnSinkError(t
 	if len(items) != 2 {
 		t.Fatalf("notifications = %+v, want 2", items)
 	}
-	if len(sink.seen) != 2 {
-		t.Fatalf("sink saw %d notifications, want 2", len(sink.seen))
-	}
+	sink.waitFor(t, 2)
 	if items[0].RunID != wr.Run.ID || items[0].ProjectID != wr.Project.ID {
 		t.Fatalf("notification anchors = %+v", items[0])
 	}
+}
+
+func TestNotificationDeliveryIsAsyncAndDoesNotBlockEmit(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	wr, err := st.CreateWorkflowRun(ctx, "external endpoint hangs")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sink := newBlockingNotificationSink()
+	engine := newRecordingEngine(t, st, nil, EngineOptions{NotificationSinks: []NotificationSink{sink}})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := engine.emit(ctx, reviewAwaitingEvent(wr))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("emit awaiting human: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("emit blocked behind notification delivery")
+	}
+	items, err := st.ListNotifications(ctx, 10)
+	if err != nil {
+		t.Fatalf("list notifications: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("notifications = %+v, want persisted notification before async delivery finishes", items)
+	}
+	select {
+	case <-sink.started:
+	case <-time.After(testWaitTimeout):
+		t.Fatal("blocking sink was not invoked")
+	}
+	close(sink.release)
 }
 
 func TestNotificationDispatcherRespectsTogglesAndExcludesNonSubscribedEvents(t *testing.T) {
@@ -121,8 +161,29 @@ func TestNotificationDispatcherRespectsTogglesAndExcludesNonSubscribedEvents(t *
 	if items[0].Class != store.NotificationClassFinished || !strings.Contains(items[0].Title, "Run invalid:") {
 		t.Fatalf("notification = %+v, want finished invalid", items[0])
 	}
-	if len(sink.seen) != 1 {
-		t.Fatalf("sink saw %d notifications, want 1", len(sink.seen))
+	sink.waitFor(t, 1)
+}
+
+type blockingNotificationSink struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func newBlockingNotificationSink() *blockingNotificationSink {
+	return &blockingNotificationSink{started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (s *blockingNotificationSink) Notify(ctx context.Context, _ store.Notification) error {
+	select {
+	case <-s.started:
+	default:
+		close(s.started)
+	}
+	select {
+	case <-s.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

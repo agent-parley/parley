@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <script type="module" src="/assets/datastar.min.js"></script>
+  <style>{{template "styles" .}}</style>
+</head>
+<body data-signals:csrf="'{{.CSRF}}'" data-on:load="@get('/notifications/events', {openWhenHidden: true})">
+  {{template "notifications_center.html" .Center}}
+  <main>
+    <header class="settings-header">
+      <p class="breadcrumb"><a href="/projects">Projects</a></p>
+      <h1>System Settings</h1>
+      <p class="muted">System settings apply globally across projects.</p>
+    </header>
+    {{template "external_notification_sinks.html" .Sinks}}
+  </main>
+</body>
+</html>

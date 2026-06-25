@@ -1,0 +1,113 @@
+<section id="external-notification-sinks" class="card settings-section">
+  <div class="settings-section-head">
+    <div>
+      <h2>External notification sinks</h2>
+      <p class="muted">Configure global Gotify and webhook destinations. Project notification settings still decide what is allowed to notify.</p>
+    </div>
+  </div>
+  {{if .SecretsMessage}}
+  <p class="settings-inline-notice warning" role="status" aria-live="polite">{{.SecretsMessage}}</p>
+  {{end}}
+  {{if .Notice}}
+  <p class="settings-inline-notice" role="alert">{{.Notice}}</p>
+  {{end}}
+  {{if .Status}}
+  <p class="settings-status muted" role="status" aria-live="polite">{{.Status}}</p>
+  {{end}}
+  {{if .OneTimeWebhookSecret}}
+  <div class="settings-inline-notice success" role="status" aria-live="polite">
+    <strong>Webhook signing secret — shown once:</strong>
+    <code>{{.OneTimeWebhookSecret}}</code>
+  </div>
+  {{end}}
+
+  <div class="sink-create-grid">
+    <form method="post" action="{{.CreateGotifyPath}}" data-on:submit="@post('{{.CreateGotifyPath}}', {contentType: 'form'})">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}" data-bind:csrf>
+      <h3>Add Gotify</h3>
+      <label>Base URL <input name="base_url" type="url" placeholder="https://gotify.example" {{if not .SecretsAvailable}}disabled{{end}} required></label>
+      <label>App token <input name="app_token" type="password" autocomplete="new-password" {{if not .SecretsAvailable}}disabled{{end}} required></label>
+      <label>Priority <input name="priority" type="number" value="5" {{if not .SecretsAvailable}}disabled{{end}}></label>
+      {{template "external_sink_common_fields" .SecretsAvailable}}
+      <button type="submit" {{if not .SecretsAvailable}}disabled{{end}}>Create Gotify sink</button>
+    </form>
+
+    <form method="post" action="{{.CreateWebhookPath}}" data-on:submit="@post('{{.CreateWebhookPath}}', {contentType: 'form'})">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}" data-bind:csrf>
+      <h3>Add Webhook</h3>
+      <label>URL <input name="url" type="url" placeholder="https://hooks.example/parley" {{if not .SecretsAvailable}}disabled{{end}} required></label>
+      <label>HTTP method
+        <select name="http_method" {{if not .SecretsAvailable}}disabled{{end}}>
+          <option value="POST">POST</option>
+          <option value="PUT">PUT</option>
+          <option value="PATCH">PATCH</option>
+        </select>
+      </label>
+      <p class="muted">The signing secret is generated automatically and shown once after creation.</p>
+      {{template "external_sink_common_fields" .SecretsAvailable}}
+      <button type="submit" {{if not .SecretsAvailable}}disabled{{end}}>Create webhook sink</button>
+    </form>
+  </div>
+
+  <div class="sink-list">
+    {{if .Sinks}}
+      {{range .Sinks}}
+      <article class="sink-card">
+        <div class="settings-section-head">
+          <div>
+            <h3>{{.TypeLabel}} <code>{{.ID}}</code></h3>
+            <p class="muted">Secret: {{if .SecretConfigured}}configured{{else}}missing{{end}} · updated {{.UpdatedAt}}</p>
+          </div>
+          <form method="post" action="{{.DeletePath}}" data-on:submit="@post('{{.DeletePath}}', {contentType: 'form'})">
+            <input type="hidden" name="_csrf" value="{{$.CSRF}}" data-bind:csrf>
+            <button class="secondary danger" type="submit">Delete</button>
+          </form>
+        </div>
+        <form method="post" action="{{.UpdatePath}}" data-on:submit="@post('{{.UpdatePath}}', {contentType: 'form'})">
+          <input type="hidden" name="_csrf" value="{{$.CSRF}}" data-bind:csrf>
+          <label class="toggle-row"><input type="checkbox" name="enabled" value="1" {{if .Enabled}}checked{{end}}> <span><strong>Enabled</strong><small>Deliver matching notifications to this sink.</small></span></label>
+          {{if eq .Type "gotify"}}
+          <label>Base URL <input name="base_url" type="url" value="{{.BaseURL}}" required></label>
+          <label>Priority <input name="priority" type="number" value="{{.Priority}}"></label>
+          <label>Replace app token <input name="app_token" type="password" autocomplete="new-password" placeholder="leave blank to keep current token"></label>
+          {{else}}
+          <label>URL <input name="url" type="url" value="{{.URL}}" required></label>
+          <label>HTTP method
+            <select name="http_method">
+              <option value="POST" {{if eq .HTTPMethod "POST"}}selected{{end}}>POST</option>
+              <option value="PUT" {{if eq .HTTPMethod "PUT"}}selected{{end}}>PUT</option>
+              <option value="PATCH" {{if eq .HTTPMethod "PATCH"}}selected{{end}}>PATCH</option>
+            </select>
+          </label>
+          {{end}}
+          <fieldset>
+            <legend>Classes</legend>
+            <label><input type="checkbox" name="send_needs_you" value="1" {{if .SendNeedsYou}}checked{{end}}> needs_you</label>
+            <label><input type="checkbox" name="send_finished" value="1" {{if .SendFinished}}checked{{end}}> finished</label>
+          </fieldset>
+          <label class="toggle-row"><input type="checkbox" name="allow_insecure_http" value="1" {{if .AllowInsecureHTTP}}checked{{end}}> <span><strong>Allow plain HTTP</strong><small>Trusted LAN only. HTTPS with verified certificates is required by default.</small></span></label>
+          <button type="submit">Save sink</button>
+        </form>
+        {{if eq .Type "webhook"}}
+        <form method="post" action="{{.RegeneratePath}}" data-on:submit="@post('{{.RegeneratePath}}', {contentType: 'form'})">
+          <input type="hidden" name="_csrf" value="{{$.CSRF}}" data-bind:csrf>
+          <button class="secondary" type="submit" {{if not $.SecretsAvailable}}disabled{{end}}>Regenerate signing secret</button>
+        </form>
+        {{end}}
+      </article>
+      {{end}}
+    {{else}}
+      <p class="muted">No external sinks configured.</p>
+    {{end}}
+  </div>
+</section>
+
+{{define "external_sink_common_fields"}}
+  <label class="toggle-row"><input type="checkbox" name="enabled" value="1" checked {{if not .}}disabled{{end}}> <span><strong>Enabled</strong><small>Start delivering after creation.</small></span></label>
+  <fieldset {{if not .}}disabled{{end}}>
+    <legend>Classes</legend>
+    <label><input type="checkbox" name="send_needs_you" value="1" checked> needs_you</label>
+    <label><input type="checkbox" name="send_finished" value="1" checked> finished</label>
+  </fieldset>
+  <label class="toggle-row"><input type="checkbox" name="allow_insecure_http" value="1" {{if not .}}disabled{{end}}> <span><strong>Allow plain HTTP</strong><small>Trusted LAN/homelab only. Keep off unless you accept cleartext transport.</small></span></label>
+{{end}}

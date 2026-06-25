@@ -371,6 +371,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureSecretsSchema(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureNotificationSinksSchema(ctx); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, string(schema)); err != nil {
 		return fmt.Errorf("refresh sqlite indexes: %w", err)
 	}
@@ -439,6 +442,46 @@ func (s *Store) ensureProjectNotificationPreferencesSchema(ctx context.Context) 
 	if _, ok := cols["notification_when_finished"]; !ok {
 		if _, err := s.db.ExecContext(ctx, `ALTER TABLE projects ADD COLUMN notification_when_finished INTEGER NOT NULL DEFAULT 1`); err != nil {
 			return fmt.Errorf("add notification when-finished column: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureNotificationSinksSchema(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS notification_sinks (
+		id TEXT PRIMARY KEY,
+		type TEXT NOT NULL CHECK (type IN ('gotify', 'webhook')),
+		enabled INTEGER NOT NULL DEFAULT 1,
+		base_url TEXT NOT NULL DEFAULT '',
+		url TEXT NOT NULL DEFAULT '',
+		http_method TEXT NOT NULL DEFAULT 'POST',
+		priority INTEGER NOT NULL DEFAULT 5,
+		secret_ciphertext BLOB NOT NULL,
+		allow_insecure_http INTEGER NOT NULL DEFAULT 0,
+		send_needs_you INTEGER NOT NULL DEFAULT 1,
+		send_finished INTEGER NOT NULL DEFAULT 1,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create notification sinks table: %w", err)
+	}
+	cols, err := s.tableColumns(ctx, "notification_sinks")
+	if err != nil {
+		return err
+	}
+	if _, ok := cols["allow_insecure_http"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE notification_sinks ADD COLUMN allow_insecure_http INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add notification sink allow-insecure-http column: %w", err)
+		}
+	}
+	if _, ok := cols["send_needs_you"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE notification_sinks ADD COLUMN send_needs_you INTEGER NOT NULL DEFAULT 1`); err != nil {
+			return fmt.Errorf("add notification sink needs-you class column: %w", err)
+		}
+	}
+	if _, ok := cols["send_finished"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE notification_sinks ADD COLUMN send_finished INTEGER NOT NULL DEFAULT 1`); err != nil {
+			return fmt.Errorf("add notification sink finished class column: %w", err)
 		}
 	}
 	return nil
