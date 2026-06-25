@@ -639,7 +639,7 @@ func capturePiDiff(ctx context.Context, prepared PiPreparedRun, sink runnerio.Si
 
 func initialPrompt(disp contract.Dispatch, workerInputPath, reportPath string) string {
 	if isConversationDispatch(disp) {
-		return "Read " + workerInputPath + ", inspect /project/repo only through read/list/grep-style read-only evidence, read the mounted orchestration-state snapshot when project/run status matters, answer the latest user message, and write " + reportPath + " with payload.reply_markdown when finished."
+		return "Read " + workerInputPath + ", inspect /project/repo only through read/list/grep-style read-only evidence, read the mounted orchestration-state snapshot when project/run status matters, answer the latest user message, optionally emit only an allow-listed create-Task action when the conversation has converged, and write " + reportPath + " with payload.reply_markdown when finished."
 	}
 	if isPlanningDispatch(disp) {
 		return "Read " + workerInputPath + ", inspect /project/repo as read-only evidence, produce the single-shot task plan requested there in payload.task_plan_markdown, and write " + reportPath + " when finished."
@@ -650,7 +650,7 @@ func initialPrompt(disp contract.Dispatch, workerInputPath, reportPath string) s
 func repairPrompt(disp contract.Dispatch, workerInputPath, reportPath string, validationErr error) string {
 	shape := "required JSON subset {status, summary, errors}"
 	if isConversationDispatch(disp) {
-		shape = "conversation JSON contract from " + workerInputPath + ", including payload.reply_markdown and no action fields"
+		shape = "conversation JSON contract from " + workerInputPath + ", including payload.reply_markdown and only optional allow-listed payload.actions"
 	} else if disp.StageType == contract.StageTypeReview {
 		shape = "review JSON contract from " + workerInputPath + ", including payload and verdict when the role is arbiter"
 	}
@@ -726,7 +726,11 @@ func appendConversationWorkerContract(b *strings.Builder, disp contract.Dispatch
 	b.WriteString("You are Parley's Conversational Planning Agent for Chat. This is one fresh per-message turn; there is no resident session. Rehydrate from the persisted Message history below, answer the latest user message, then stop.\n\n")
 	b.WriteString("### Authority boundary\n\n")
 	b.WriteString("- You may answer repo/project questions and discuss designs.\n")
-	b.WriteString("- This tracer slice has no state-changing orchestration actions: do not create Tasks, do not propose an action envelope, and do not mutate run state.\n")
+	b.WriteString("- You do not call the engine, mutate run state, or create Tasks directly. The harness may execute only the allow-listed action envelope you return.\n")
+	b.WriteString("- v1 state-changing authority is exactly `create-Task`; do not emit any other action type, more than one action, or fields other than `type` and `idea`.\n")
+	b.WriteString("- When the conversation has not converged, reply normally and omit `payload.actions`.\n")
+	b.WriteString("- When the conversation has converged and should become work, write a sectioned brief with exactly these Markdown section headings in this order: `Goal`, `In scope`, `Out of scope`, `Key decisions`, `Open assumptions`; emit one `create-Task` action whose `idea` is that brief verbatim.\n")
+	b.WriteString("- The harness will create the Task with `RefinementLevel=Direct`, the plan-gated Balanced template, and this conversation ID; `plan_review_human` is the human confirmation gate before any code runs. Do not choose a template or refinement level.\n")
 	b.WriteString("- Never edit, commit, push, or otherwise write to `/project/repo`; it is read-only repository evidence.\n")
 	b.WriteString("- Use `/project/workspace` only for private notes/artifacts if helpful; your final answer must be in `payload.reply_markdown`.\n\n")
 	b.WriteString("### Tool policy\n\n")
@@ -734,6 +738,10 @@ func appendConversationWorkerContract(b *strings.Builder, disp contract.Dispatch
 	b.WriteString("- Workspace tools: read and write under `/project/workspace`.\n")
 	b.WriteString("- Orchestration state is provided as mounted read-only evidence in this turn; read the snapshot file instead of calling or inventing an API.\n")
 	b.WriteString("- Do not use a JSON API or invent an API response; Parley will persist your reply as a Message and stream hypermedia over SSE.\n\n")
+	allowedActions := inputJSON(disp.Input, "allowed_actions", []any{})
+	b.WriteString("### Allowed actions\n\n```json\n")
+	b.WriteString(allowedActions)
+	b.WriteString("\n```\n\n")
 	appendConversationOrchestrationContract(b, disp, reportPath)
 	b.WriteString("### Conversation history\n\n```json\n")
 	b.WriteString(inputJSON(disp.Input, "messages", []any{}))
@@ -821,11 +829,15 @@ func appendPlanningRequiredReport(b *strings.Builder, disp contract.Dispatch, re
 }
 
 func appendConversationRequiredReport(b *strings.Builder, reportPath string) {
-	fmt.Fprintf(b, "Write exactly one report file at `%s`. The report must be valid JSON shaped like:\n\n", reportPath)
+	fmt.Fprintf(b, "Write exactly one report file at `%s`. The report must be valid JSON shaped like one of:\n\n", reportPath)
 	b.WriteString("```json\n")
 	b.WriteString("{\n  \"status\": \"completed\",\n  \"summary\": \"short reply summary\",\n  \"payload\": {\n    \"reply_markdown\": \"the assistant reply to persist as a Conversation Message\"\n  },\n  \"errors\": []\n}\n")
 	b.WriteString("```\n\n")
-	b.WriteString("Allowed status values: `completed`, `failed`, `needs_input`, `invalid`. If status is `failed` or `invalid`, `errors` must be non-empty. Do not include `action` or `actions` fields; actions are out of scope for this slice.\n")
+	b.WriteString("or, only when the conversation has converged into work:\n\n")
+	b.WriteString("```json\n")
+	b.WriteString("{\n  \"status\": \"completed\",\n  \"summary\": \"creating task\",\n  \"payload\": {\n    \"reply_markdown\": \"I have enough to create a gated Task.\",\n    \"actions\": [\n      {\n        \"type\": \"create-Task\",\n        \"idea\": \"## Goal\\n...\\n\\n## In scope\\n...\\n\\n## Out of scope\\n...\\n\\n## Key decisions\\n...\\n\\n## Open assumptions\\n...\"\n      }\n    ]\n  },\n  \"errors\": []\n}\n")
+	b.WriteString("```\n\n")
+	b.WriteString("Allowed status values: `completed`, `failed`, `needs_input`, `invalid`. If status is `failed` or `invalid`, `errors` must be non-empty. If you include `payload.actions`, it must contain exactly one object from `allowed_actions`; v1 allows only `create-Task` with a non-empty sectioned-brief `idea` using exactly the required Markdown headings. Do not include top-level action fields.\n")
 }
 
 func appendDefaultRequiredReport(b *strings.Builder, reportPath string) {

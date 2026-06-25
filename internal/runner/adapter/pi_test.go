@@ -204,6 +204,7 @@ func TestPiPrepareConversationUsesReadOnlyCommittedSnapshotAndWorkspace(t *testi
 		"trigger_message_id":           "msg_123",
 		"orchestration_state_summary":  "- Most recent included run: run_123 is completed.\n- Latest report on that run: stage review status changes_requested verdict changes_requested — review rejected stale cache handling.",
 		"orchestration_state_markdown": "# Parley Orchestration State Snapshot\n\nRun `run_123` review verdict `changes_requested`: review rejected stale cache handling.\n",
+		"allowed_actions":              []string{"create-Task"},
 		"messages": []map[string]any{{
 			"role": "user",
 			"body": "Where is auth handled?",
@@ -247,13 +248,13 @@ func TestPiPrepareConversationUsesReadOnlyCommittedSnapshotAndWorkspace(t *testi
 		t.Fatalf("orchestration-state.md missing run evidence:\n%s", stateMarkdown)
 	}
 	workerInput := readTestFile(t, prepared.WorkerInputPath)
-	for _, want := range []string{"Conversational Planning Agent", "no resident session", "Repository tools: read, list, grep", "Orchestration state", "orchestration-state.md", "review rejected stale cache handling", "payload.reply_markdown", "Do not include `action` or `actions`"} {
+	for _, want := range []string{"Conversational Planning Agent", "no resident session", "Repository tools: read, list, grep", "Orchestration state", "orchestration-state.md", "review rejected stale cache handling", "payload.reply_markdown", "Allowed actions", "create-Task", "plan-gated Balanced template", "Open assumptions"} {
 		if !strings.Contains(workerInput, want) {
 			t.Fatalf("conversation worker input missing %q:\n%s", want, workerInput)
 		}
 	}
 	prompt := prepared.Invocation.Command[len(prepared.Invocation.Command)-1]
-	if !strings.Contains(prompt, prepared.ContainerWorkerInputPath) || !strings.Contains(prompt, prepared.ContainerReportPath) || !strings.Contains(prompt, "orchestration-state") || !strings.Contains(prompt, "payload.reply_markdown") {
+	if !strings.Contains(prompt, prepared.ContainerWorkerInputPath) || !strings.Contains(prompt, prepared.ContainerReportPath) || !strings.Contains(prompt, "orchestration-state") || !strings.Contains(prompt, "payload.reply_markdown") || !strings.Contains(prompt, "create-Task") {
 		t.Fatalf("conversation prompt missing input/report paths or reply contract: %#v", prepared.Invocation.Command)
 	}
 }
