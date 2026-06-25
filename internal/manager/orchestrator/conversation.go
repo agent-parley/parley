@@ -345,22 +345,31 @@ func validateConversationBrief(brief string) error {
 	section := 0
 	activeSection := -1
 	seenContent := make([]bool, len(required))
+	inFence := false
 	for _, line := range strings.Split(brief, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
 			continue
 		}
-		if strings.HasPrefix(trimmed, "#") {
-			name := strings.TrimSpace(strings.Trim(strings.TrimLeft(trimmed, "#"), "#"))
-			if section >= len(required) {
-				return fmt.Errorf("create-Task idea must contain exactly these Markdown sections: %s", strings.Join(required, ", "))
+		if strings.HasPrefix(trimmed, "```") {
+			if activeSection >= 0 {
+				seenContent[activeSection] = true
 			}
-			if name != required[section] {
-				return fmt.Errorf("create-Task idea section %d must be %q", section+1, required[section])
-			}
-			activeSection = section
-			section++
+			inFence = !inFence
 			continue
+		}
+		if !inFence {
+			if name, ok := conversationBriefSectionHeading(trimmed); ok {
+				if section >= len(required) {
+					return fmt.Errorf("create-Task idea must contain exactly these Markdown sections: %s", strings.Join(required, ", "))
+				}
+				if name != required[section] {
+					return fmt.Errorf("create-Task idea section %d must be %q", section+1, required[section])
+				}
+				activeSection = section
+				section++
+				continue
+			}
 		}
 		if activeSection >= 0 {
 			seenContent[activeSection] = true
@@ -375,6 +384,19 @@ func validateConversationBrief(brief string) error {
 		}
 	}
 	return nil
+}
+
+func conversationBriefSectionHeading(trimmed string) (string, bool) {
+	if !strings.HasPrefix(trimmed, "## ") {
+		return "", false
+	}
+	name := strings.TrimSpace(strings.TrimPrefix(trimmed, "## "))
+	if i := strings.LastIndexFunc(name, func(r rune) bool { return r != '#' }); i >= 0 && i < len(name)-1 {
+		if name[i] == ' ' || name[i] == '\t' {
+			name = strings.TrimSpace(name[:i])
+		}
+	}
+	return name, true
 }
 
 func actionType(envelope map[string]any) string {
