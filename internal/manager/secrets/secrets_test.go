@@ -290,6 +290,47 @@ func TestInvalidWrappedDEKMetadataIsDistinctFromWrongKEK(t *testing.T) {
 	}
 }
 
+func TestInvalidKeyMetaRowFailsClosedAndDoesNotOverwriteDEK(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	key := testKey(10)
+	st, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := New(ctx, st, Config{KEKBase64: keyBase64(key)}); err != nil {
+		t.Fatalf("new secrets: %v", err)
+	}
+	metaBefore := readKeyMetaForTest(t, st.DB())
+	if _, err := st.DB().ExecContext(ctx, `UPDATE secrets_keymeta SET kek_version = 0 WHERE id = 1`); err != nil {
+		t.Fatalf("corrupt key metadata row: %v", err)
+	}
+	corruptMeta := readKeyMetaForTest(t, st.DB())
+	if corruptMeta.kekVersion != 0 || !bytes.Equal(corruptMeta.wrappedDEK, metaBefore.wrappedDEK) {
+		t.Fatal("test setup did not preserve wrapped DEK while corrupting metadata")
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	st, err = store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer st.Close()
+	svc, err := New(ctx, st, Config{KEKBase64: keyBase64(key)})
+	if err != nil {
+		t.Fatalf("new secrets with invalid key metadata row: %v", err)
+	}
+	if svc.Available() || svc.State() != StateInvalidKeyMeta || !errors.Is(svc.Err(), ErrInvalidKeyMetadata) {
+		t.Fatalf("invalid key metadata row state = available:%v state:%s err:%v, want invalid key metadata", svc.Available(), svc.State(), svc.Err())
+	}
+	metaAfter := readKeyMetaForTest(t, st.DB())
+	if metaAfter.kekVersion != corruptMeta.kekVersion || !bytes.Equal(metaAfter.wrappedDEK, corruptMeta.wrappedDEK) {
+		t.Fatal("invalid key metadata row changed during fail-closed startup")
+	}
+}
+
 func TestFailClosedWrongKEKDoesNotOverwriteDEK(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

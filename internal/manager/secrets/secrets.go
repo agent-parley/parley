@@ -93,6 +93,10 @@ func New(ctx context.Context, st *store.Store, cfg Config) (*Service, error) {
 
 	meta, err := loadKeyMeta(ctx, svc.db)
 	if err != nil {
+		if errors.Is(err, ErrInvalidKeyMetadata) {
+			svc.setUnavailable(StateInvalidKeyMeta, ErrInvalidKeyMetadata)
+			return svc, nil
+		}
 		return nil, err
 	}
 
@@ -281,7 +285,7 @@ func loadKeyMeta(ctx context.Context, db *sql.DB) (keyMeta, error) {
 		return keyMeta{}, fmt.Errorf("load secrets key metadata: %w", err)
 	}
 	if meta.kekVersion <= 0 || len(meta.wrappedDEK) == 0 {
-		return keyMeta{}, errors.New("load secrets key metadata: invalid row")
+		return keyMeta{}, fmt.Errorf("load secrets key metadata: %w", ErrInvalidKeyMetadata)
 	}
 	meta.exists = true
 	return meta, nil
