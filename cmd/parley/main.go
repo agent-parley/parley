@@ -24,11 +24,13 @@ func main() {
 		os.Exit(1)
 	}
 	cfg := manager.Config{
-		Addr:      getenv("PARLEY_ADDR", "127.0.0.1:8080"),
-		DataDir:   getenv("PARLEY_DATA_DIR", ".parley-data"),
-		RunnerBin: os.Getenv("PARLEY_RUNNER_BIN"),
-		Adapter:   getenv("PARLEY_ADAPTER", "noop"),
-		Settings:  loadedSettings.Settings,
+		Addr:           getenv("PARLEY_ADDR", "127.0.0.1:8080"),
+		DataDir:        getenv("PARLEY_DATA_DIR", ".parley-data"),
+		RunnerBin:      os.Getenv("PARLEY_RUNNER_BIN"),
+		Adapter:        getenv("PARLEY_ADAPTER", "noop"),
+		SecretsKEK:     getenv("PARLEY_SECRETS_KEK", ""),
+		SecretsKEKFile: getenv("PARLEY_SECRETS_KEK_FILE", ""),
+		Settings:       loadedSettings.Settings,
 	}
 	app, err := manager.New(ctx, cfg)
 	if err != nil {
