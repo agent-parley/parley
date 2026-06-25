@@ -278,6 +278,107 @@ func TestValidateConversationActionsAcceptsCreateTask(t *testing.T) {
 	}
 }
 
+func TestValidateConversationBriefAllowsMarkdownInsideSections(t *testing.T) {
+	cases := []struct {
+		name  string
+		brief string
+	}{
+		{
+			name: "fenced code block with hash lines",
+			brief: conversationBriefSections(
+				[2]string{"Goal", "Ship the conversation-created task path.\n\n```bash\n# install deps\n#!/bin/bash\nmake test\n```"},
+				[2]string{"In scope", "- Validate a create-Task action."},
+				[2]string{"Out of scope", "- Direct commits from chat."},
+				[2]string{"Key decisions", "- Use Direct refinement."},
+				[2]string{"Open assumptions", "- The human will approve the plan before code runs."},
+			),
+		},
+		{
+			name: "sub-heading in section body",
+			brief: conversationBriefSections(
+				[2]string{"Goal", "Ship the conversation-created task path."},
+				[2]string{"In scope", "### Validation cases\n- Accept ordinary Markdown inside sections."},
+				[2]string{"Out of scope", "- Direct commits from chat."},
+				[2]string{"Key decisions", "- Use Direct refinement."},
+				[2]string{"Open assumptions", "- The human will approve the plan before code runs."},
+			),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateConversationBrief(tc.brief); err != nil {
+				t.Fatalf("validateConversationBrief() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateConversationBriefRejectsRequiredSectionViolations(t *testing.T) {
+	cases := []struct {
+		name  string
+		brief string
+	}{
+		{
+			name: "missing section",
+			brief: conversationBriefSections(
+				[2]string{"Goal", "Ship the conversation-created task path."},
+				[2]string{"In scope", "- Validate a create-Task action."},
+				[2]string{"Out of scope", "- Direct commits from chat."},
+				[2]string{"Key decisions", "- Use Direct refinement."},
+			),
+		},
+		{
+			name: "out of order section",
+			brief: conversationBriefSections(
+				[2]string{"Goal", "Ship the conversation-created task path."},
+				[2]string{"Out of scope", "- Direct commits from chat."},
+				[2]string{"In scope", "- Validate a create-Task action."},
+				[2]string{"Key decisions", "- Use Direct refinement."},
+				[2]string{"Open assumptions", "- The human will approve the plan before code runs."},
+			),
+		},
+		{
+			name: "duplicated section",
+			brief: conversationBriefSections(
+				[2]string{"Goal", "Ship the conversation-created task path."},
+				[2]string{"Goal", "Duplicate goal."},
+				[2]string{"In scope", "- Validate a create-Task action."},
+				[2]string{"Out of scope", "- Direct commits from chat."},
+				[2]string{"Key decisions", "- Use Direct refinement."},
+				[2]string{"Open assumptions", "- The human will approve the plan before code runs."},
+			),
+		},
+		{
+			name: "empty section",
+			brief: conversationBriefSections(
+				[2]string{"Goal", "Ship the conversation-created task path."},
+				[2]string{"In scope", ""},
+				[2]string{"Out of scope", "- Direct commits from chat."},
+				[2]string{"Key decisions", "- Use Direct refinement."},
+				[2]string{"Open assumptions", "- The human will approve the plan before code runs."},
+			),
+		},
+		{
+			name: "extra top-level section",
+			brief: conversationBriefSections(
+				[2]string{"Goal", "Ship the conversation-created task path."},
+				[2]string{"In scope", "- Validate a create-Task action."},
+				[2]string{"Out of scope", "- Direct commits from chat."},
+				[2]string{"Key decisions", "- Use Direct refinement."},
+				[2]string{"Open assumptions", "- The human will approve the plan before code runs."},
+				[2]string{"Notes", "- Extra top-level sections are not allowed."},
+			),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateConversationBrief(tc.brief); err == nil {
+				t.Fatalf("validateConversationBrief() nil err; want rejection")
+			}
+		})
+	}
+}
+
 func TestValidateConversationActionsRejectsNonAllowListedAndMalformed(t *testing.T) {
 	brief := sectionedConversationBrief()
 	allowed := []string{conversationActionCreateTask}
@@ -307,7 +408,7 @@ func TestConversationCreateTaskActionCreatesDirectBalancedRunLinkedToConversatio
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	brief := sectionedConversationBrief()
+	brief := sectionedConversationBriefWithMarkdown()
 	runner := &conversationTestRunner{dispatches: make(chan contract.Dispatch, 1), payload: map[string]any{
 		"reply_markdown": "I have enough to create a gated Task.",
 		"actions":        []any{map[string]any{"type": conversationActionCreateTask, "idea": brief}},
@@ -398,7 +499,31 @@ func TestConversationRejectsInvalidActionAndCreatesNothing(t *testing.T) {
 }
 
 func sectionedConversationBrief() string {
-	return "## Goal\nShip the conversation-created task path.\n\n## In scope\n- Validate a create-Task action.\n- Start a gated Task.\n\n## Out of scope\n- Direct commits from chat.\n\n## Key decisions\n- Use Direct refinement.\n- Use the Balanced plan-gated template.\n\n## Open assumptions\n- The human will approve the plan before code runs."
+	return conversationBriefSections(
+		[2]string{"Goal", "Ship the conversation-created task path."},
+		[2]string{"In scope", "- Validate a create-Task action.\n- Start a gated Task."},
+		[2]string{"Out of scope", "- Direct commits from chat."},
+		[2]string{"Key decisions", "- Use Direct refinement.\n- Use the Balanced plan-gated template."},
+		[2]string{"Open assumptions", "- The human will approve the plan before code runs."},
+	)
+}
+
+func sectionedConversationBriefWithMarkdown() string {
+	return conversationBriefSections(
+		[2]string{"Goal", "Ship the conversation-created task path."},
+		[2]string{"In scope", "### Validation cases\n- Validate a create-Task action.\n- Start a gated Task.\n\n```bash\n# install deps\n#!/bin/bash\nmake test\n```"},
+		[2]string{"Out of scope", "- Direct commits from chat."},
+		[2]string{"Key decisions", "- Use Direct refinement.\n- Use the Balanced plan-gated template."},
+		[2]string{"Open assumptions", "- The human will approve the plan before code runs."},
+	)
+}
+
+func conversationBriefSections(sections ...[2]string) string {
+	parts := make([]string, 0, len(sections))
+	for _, section := range sections {
+		parts = append(parts, "## "+section[0]+"\n"+section[1])
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 type conversationTestRunner struct {
