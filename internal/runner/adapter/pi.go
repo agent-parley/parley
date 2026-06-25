@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/agent-parley/parley/internal/runner/provider"
 	"github.com/agent-parley/parley/internal/runner/runnerio"
@@ -22,16 +24,19 @@ import (
 )
 
 const (
-	piName                 = "pi"
-	defaultPiImage         = "localhost/parley-pi-worker:0.78.0"
-	defaultPiProvider      = "openai-codex"
-	defaultPiModel         = "gpt-5.5"
-	defaultPiThinking      = "high"
-	containerRepoPath      = "/project/repo"
-	containerWorkspacePath = "/project/workspace"
-	containerReferencePath = "/project/reference"
-	containerAgentDir      = "/home/node/.pi/agent"
-	containerAuthPath      = "/home/node/.pi-shared/agent/auth.json"
+	piName                             = "pi"
+	defaultPiImage                     = "localhost/parley-pi-worker:0.78.0"
+	defaultPiProvider                  = "openai-codex"
+	defaultPiModel                     = "gpt-5.5"
+	defaultPiThinking                  = "high"
+	containerRepoPath                  = "/project/repo"
+	containerWorkspacePath             = "/project/workspace"
+	containerReferencePath             = "/project/reference"
+	containerAgentDir                  = "/home/node/.pi/agent"
+	containerAuthPath                  = "/home/node/.pi-shared/agent/auth.json"
+	conversationSnapshotUseLockName    = ".snapshot-use.lock"
+	conversationSnapshotCreateLockName = ".snapshot-create.lock"
+	maxConversationRepoSnapshots       = 2
 )
 
 // PiCredentialStrategy provisions the per-run credential material that the Pi
@@ -109,6 +114,8 @@ type PiPreparedRun struct {
 	ContainerWorkerInputPath string
 	ContainerReportPath      string
 	AppendSystemPath         string
+	RepoSnapshotPath         string
+	RepoSnapshotLock         *os.File
 }
 
 func (a Pi) Run(ctx context.Context, disp contract.Dispatch, sink runnerio.Sink) (report.Report, error) {
@@ -121,6 +128,14 @@ func (a Pi) Run(ctx context.Context, disp contract.Dispatch, sink runnerio.Sink)
 			return report.Report{}, err
 		}
 	}
+	defer func() {
+		if prepared.RepoSnapshotLock != nil {
+			_ = prepared.RepoSnapshotLock.Close()
+		}
+		if prepared.RepoSnapshotPath != "" {
+			_ = cleanupConversationRepoSnapshots(prepared.RepoSnapshotPath)
+		}
+	}()
 
 	result, runErr := a.runInvocation(ctx, disp, prepared.Invocation, sink)
 	if ctx.Err() != nil {
@@ -208,13 +223,25 @@ func (a Pi) Prepare(ctx context.Context, disp contract.Dispatch) (PiPreparedRun,
 
 	var worktreePath string
 	var repoMountPath string
+	var repoSnapshotPath string
+	var repoSnapshotLock *os.File
+	prepareSucceeded := false
+	defer func() {
+		if prepareSucceeded || repoSnapshotLock == nil {
+			return
+		}
+		_ = repoSnapshotLock.Close()
+		if repoSnapshotPath != "" {
+			_ = cleanupConversationRepoSnapshots(repoSnapshotPath)
+		}
+	}()
 	workspaceMountPath := ""
 	artifactDir := a.opts.ArtifactDir
 	containerWorkerInputPath := filepath.ToSlash(filepath.Join(containerWorkspacePath, "worker-input.md"))
 	containerReportPath := filepath.ToSlash(filepath.Join(containerWorkspacePath, "report.json"))
 	if isConversationDispatch(disp) {
 		var err error
-		repoSnapshotPath, err := a.createConversationRepoSnapshot(ctx, projectID, effectiveAttemptID)
+		repoSnapshotPath, repoSnapshotLock, err = a.createConversationRepoSnapshot(ctx, projectID)
 		if err != nil {
 			return PiPreparedRun{}, err
 		}
@@ -292,6 +319,7 @@ func (a Pi) Prepare(ctx context.Context, disp contract.Dispatch) (PiPreparedRun,
 	}
 
 	inv := a.invocation(disp, repoMountPath, workspaceMountPath, agentDir, authCopyPath, containerWorkerInputPath, containerReportPath)
+	prepareSucceeded = true
 	return PiPreparedRun{
 		Invocation:               inv,
 		WorktreePath:             worktreePath,
@@ -305,6 +333,8 @@ func (a Pi) Prepare(ctx context.Context, disp contract.Dispatch) (PiPreparedRun,
 		ContainerWorkerInputPath: containerWorkerInputPath,
 		ContainerReportPath:      containerReportPath,
 		AppendSystemPath:         appendSystemPath,
+		RepoSnapshotPath:         repoSnapshotPath,
+		RepoSnapshotLock:         repoSnapshotLock,
 	}, nil
 }
 
@@ -364,46 +394,213 @@ func (a Pi) workspaceRoot(projectID string) string {
 	return filepath.Join(a.opts.DataRoot, "projects", projectID, "workspace")
 }
 
-func (a Pi) createConversationRepoSnapshot(ctx context.Context, projectID, effectiveAttemptID string) (string, error) {
-	ref, err := resolveConversationRepoRef(ctx, a.opts.SourceRepo)
+func (a Pi) createConversationRepoSnapshot(ctx context.Context, projectID string) (string, *os.File, error) {
+	ref, sha, err := resolveConversationRepoRef(ctx, a.opts.SourceRepo)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	snapshotPath := filepath.Join(a.opts.DataRoot, "projects", projectID, "repo-snapshots", effectiveAttemptID)
-	if err := os.RemoveAll(snapshotPath); err != nil {
-		return "", fmt.Errorf("clear conversation repo snapshot: %w", err)
+	snapshotRoot := filepath.Join(a.opts.DataRoot, "projects", projectID, "repo-snapshots")
+	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
+		return "", nil, fmt.Errorf("create conversation repo snapshot root: %w", err)
 	}
-	if err := os.MkdirAll(snapshotPath, 0o700); err != nil {
-		return "", fmt.Errorf("create conversation repo snapshot: %w", err)
+
+	useLock, err := acquireSnapshotRootLock(snapshotRoot, conversationSnapshotUseLockName, syscall.LOCK_SH)
+	if err != nil {
+		return "", nil, err
 	}
-	archivePath := snapshotPath + ".tar"
+	success := false
+	defer func() {
+		if !success {
+			_ = useLock.Close()
+		}
+	}()
+
+	targetPath := filepath.Join(snapshotRoot, sha)
+	exists, err := conversationSnapshotExists(targetPath)
+	if err != nil {
+		return "", nil, err
+	}
+	if exists {
+		success = true
+		return targetPath, useLock, nil
+	}
+
+	createLock, err := acquireSnapshotRootLock(snapshotRoot, conversationSnapshotCreateLockName, syscall.LOCK_EX)
+	if err != nil {
+		return "", nil, err
+	}
+	defer createLock.Close()
+
+	exists, err = conversationSnapshotExists(targetPath)
+	if err != nil {
+		return "", nil, err
+	}
+	if exists {
+		success = true
+		return targetPath, useLock, nil
+	}
+
+	tempPath, err := os.MkdirTemp(snapshotRoot, "."+sha+".tmp-")
+	if err != nil {
+		return "", nil, fmt.Errorf("create conversation repo snapshot temp dir: %w", err)
+	}
+	defer os.RemoveAll(tempPath)
+	archivePath := tempPath + ".tar"
 	defer os.Remove(archivePath)
-	cmd := exec.CommandContext(ctx, "git", "-C", a.opts.SourceRepo, "archive", "--format=tar", "--output", archivePath, ref)
+	cmd := exec.CommandContext(ctx, "git", "-C", a.opts.SourceRepo, "archive", "--format=tar", "--output", archivePath, sha)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("git archive %s: %w: %s", ref, err, strings.TrimSpace(string(out)))
+		return "", nil, fmt.Errorf("git archive %s (%s): %w: %s", ref, sha, err, strings.TrimSpace(string(out)))
 	}
 	archiveFile, err := os.Open(archivePath)
 	if err != nil {
-		return "", fmt.Errorf("open git archive: %w", err)
+		return "", nil, fmt.Errorf("open git archive: %w", err)
 	}
 	defer archiveFile.Close()
-	if err := extractTarSnapshot(archiveFile, snapshotPath); err != nil {
-		return "", err
+	if err := extractTarSnapshot(archiveFile, tempPath); err != nil {
+		return "", nil, err
 	}
-	return snapshotPath, nil
+	if err := os.Rename(tempPath, targetPath); err != nil {
+		exists, statErr := conversationSnapshotExists(targetPath)
+		if statErr != nil {
+			return "", nil, statErr
+		}
+		if exists {
+			success = true
+			return targetPath, useLock, nil
+		}
+		return "", nil, fmt.Errorf("publish conversation repo snapshot: %w", err)
+	}
+	success = true
+	return targetPath, useLock, nil
 }
 
-func resolveConversationRepoRef(ctx context.Context, sourceRepo string) (string, error) {
+func resolveConversationRepoRef(ctx context.Context, sourceRepo string) (string, string, error) {
 	var lastErr error
 	for _, ref := range []string{"origin/HEAD", "HEAD"} {
-		cmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "--verify", ref+"^{tree}")
+		cmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "rev-parse", "--verify", ref+"^{commit}")
 		if out, err := cmd.CombinedOutput(); err == nil {
-			return ref, nil
+			sha := strings.TrimSpace(string(out))
+			return ref, sha, nil
 		} else {
 			lastErr = fmt.Errorf("git rev-parse %s: %w: %s", ref, err, strings.TrimSpace(string(out)))
 		}
 	}
-	return "", fmt.Errorf("resolve repository snapshot ref: %w", lastErr)
+	return "", "", fmt.Errorf("resolve repository snapshot ref: %w", lastErr)
+}
+
+func conversationSnapshotExists(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err == nil {
+		if !info.IsDir() {
+			return false, fmt.Errorf("conversation repo snapshot path is not a directory: %s", path)
+		}
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, fmt.Errorf("stat conversation repo snapshot: %w", err)
+}
+
+func acquireSnapshotRootLock(snapshotRoot, name string, operation int) (*os.File, error) {
+	lock, acquired, err := lockSnapshotRoot(snapshotRoot, name, operation, false)
+	if err != nil {
+		return nil, err
+	}
+	if !acquired {
+		return nil, fmt.Errorf("lock conversation repo snapshots: not acquired")
+	}
+	return lock, nil
+}
+
+func tryAcquireSnapshotRootLock(snapshotRoot, name string, operation int) (*os.File, bool, error) {
+	return lockSnapshotRoot(snapshotRoot, name, operation, true)
+}
+
+func lockSnapshotRoot(snapshotRoot, name string, operation int, nonblocking bool) (*os.File, bool, error) {
+	lockPath := filepath.Join(snapshotRoot, name)
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, false, fmt.Errorf("open conversation repo snapshot lock: %w", err)
+	}
+	if nonblocking {
+		operation |= syscall.LOCK_NB
+	}
+	if err := syscall.Flock(int(lock.Fd()), operation); err != nil {
+		_ = lock.Close()
+		if nonblocking && (errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN)) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("lock conversation repo snapshots: %w", err)
+	}
+	return lock, true, nil
+}
+
+func cleanupConversationRepoSnapshots(keepPath string) error {
+	if keepPath == "" {
+		return nil
+	}
+	snapshotRoot := filepath.Dir(keepPath)
+	lock, acquired, err := tryAcquireSnapshotRootLock(snapshotRoot, conversationSnapshotUseLockName, syscall.LOCK_EX)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return nil
+	}
+	defer lock.Close()
+
+	entries, err := os.ReadDir(snapshotRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read repo snapshots root: %w", err)
+	}
+	snapshots := make([]struct {
+		path    string
+		modTime int64
+	}, 0, len(entries))
+	for _, entry := range entries {
+		path := filepath.Join(snapshotRoot, entry.Name())
+		if strings.Contains(entry.Name(), ".tmp-") {
+			if err := os.RemoveAll(path); err != nil {
+				return fmt.Errorf("remove stale temporary conversation repo snapshot: %w", err)
+			}
+			continue
+		}
+		if !entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("stat conversation repo snapshot: %w", err)
+		}
+		snapshots = append(snapshots, struct {
+			path    string
+			modTime int64
+		}{path: path, modTime: info.ModTime().UnixNano()})
+	}
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].modTime > snapshots[j].modTime
+	})
+
+	keep := map[string]bool{filepath.Clean(keepPath): true}
+	for _, snapshot := range snapshots {
+		if len(keep) >= maxConversationRepoSnapshots {
+			break
+		}
+		keep[filepath.Clean(snapshot.path)] = true
+	}
+	for _, snapshot := range snapshots {
+		if keep[filepath.Clean(snapshot.path)] {
+			continue
+		}
+		if err := os.RemoveAll(snapshot.path); err != nil {
+			return fmt.Errorf("remove stale conversation repo snapshot: %w", err)
+		}
+	}
+	return nil
 }
 
 func extractTarSnapshot(r io.Reader, root string) error {

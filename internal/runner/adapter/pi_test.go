@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -67,6 +71,9 @@ func TestPiPrepareBuildsPreflightSafeInvocationAndInputFiles(t *testing.T) {
 	prepared, err := adapter.Prepare(ctx, piTestDispatch())
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
+	}
+	if prepared.RepoSnapshotPath != "" || prepared.RepoSnapshotLock != nil {
+		t.Fatalf("implementation prepare snapshot state = %q/%v, want none", prepared.RepoSnapshotPath, prepared.RepoSnapshotLock)
 	}
 	policy := provider.PreflightPolicy{
 		WorktreeRoots:  []string{dataRoot},
@@ -256,6 +263,196 @@ func TestPiPrepareConversationUsesReadOnlyCommittedSnapshotAndWorkspace(t *testi
 	prompt := prepared.Invocation.Command[len(prepared.Invocation.Command)-1]
 	if !strings.Contains(prompt, prepared.ContainerWorkerInputPath) || !strings.Contains(prompt, prepared.ContainerReportPath) || !strings.Contains(prompt, "orchestration-state") || !strings.Contains(prompt, "payload.reply_markdown") || !strings.Contains(prompt, "create-Task") {
 		t.Fatalf("conversation prompt missing input/report paths or reply contract: %#v", prepared.Invocation.Command)
+	}
+}
+
+func TestPiPrepareConversationReusesSnapshotByCommitAndCleansOldOnNewCommit(t *testing.T) {
+	ctx := context.Background()
+	counterPath := installCountingGitArchiveWrapper(t, "")
+
+	fake := &scriptedPiProvider{}
+	source := initAdapterSourceRepo(t, ctx)
+	dataRoot := t.TempDir()
+	workspaceRoot := mkdirAdapterDir(t, dataRoot, "projects", "p1", "workspace")
+	agentState := mkdirAdapterDir(t, t.TempDir(), "agent-state")
+	authPath := writeTestAuth(t, t.TempDir())
+	adapter := NewPi(PiOptions{
+		Provider:           fake,
+		CredentialStrategy: AuthJSONCredentialStrategy{SourcePath: authPath},
+		DataRoot:           dataRoot,
+		ProjectID:          "p1",
+		SourceRepo:         source,
+		WorkspaceRoot:      workspaceRoot,
+		AgentStateRoot:     agentState,
+	})
+	disp := piTestDispatch()
+	disp.StageType = contract.StageTypeConversation
+	disp.Input = map[string]any{"input_mode": contract.AdapterInputModeConversation, "conversation_id": "conv_123", "trigger_message_id": "msg_123"}
+	runTurn := func(turnID string) string {
+		t.Helper()
+		disp.Input["trigger_message_id"] = turnID
+		before := len(fake.invocations)
+		if _, err := adapter.Run(ctx, disp, &recordingSink{}); err != nil {
+			t.Fatalf("Run(%s) error = %v", turnID, err)
+		}
+		if len(fake.invocations) == before {
+			t.Fatalf("Run(%s) did not invoke provider", turnID)
+		}
+		return mountHost(fake.invocations[before], containerRepoPath)
+	}
+	snapshotRoot := filepath.Join(dataRoot, "projects", "p1", "repo-snapshots")
+
+	firstMount := runTurn("msg_123")
+	firstSnapshotDirs := conversationSnapshotDirs(t, snapshotRoot)
+	if got := len(firstSnapshotDirs); got != 1 {
+		t.Fatalf("first snapshot dirs = %d, want 1", got)
+	}
+	if got := strings.TrimSpace(readTestFile(t, counterPath)); got != "1" {
+		t.Fatalf("git archive count after first run = %s, want 1", got)
+	}
+
+	if got := runTurn("msg_124"); got != firstMount {
+		t.Fatalf("second same-commit repo mount = %q, want reused snapshot %q", got, firstMount)
+	}
+	if got := strings.TrimSpace(readTestFile(t, counterPath)); got != "1" {
+		t.Fatalf("git archive count after same-commit run = %s, want 1", got)
+	}
+	if got := len(conversationSnapshotDirs(t, snapshotRoot)); got != 1 {
+		t.Fatalf("same-commit snapshot dirs = %d, want 1", got)
+	}
+
+	commitAdapterFile(t, ctx, source, "new-commit.txt", "next\n", "second")
+	newCommitMount := runTurn("msg_125")
+	if got := strings.TrimSpace(readTestFile(t, counterPath)); got != "2" {
+		t.Fatalf("git archive count after new commit = %s, want 2", got)
+	}
+	if newCommitMount == firstMount {
+		t.Fatalf("new-commit repo mount reused old snapshot %q", newCommitMount)
+	}
+	if got := len(conversationSnapshotDirs(t, snapshotRoot)); got > maxConversationRepoSnapshots {
+		t.Fatalf("snapshot dirs after second commit = %d, want bounded <= %d", got, maxConversationRepoSnapshots)
+	}
+
+	commitAdapterFile(t, ctx, source, "third-commit.txt", "third\n", "third")
+	runTurn("msg_126")
+	if got := strings.TrimSpace(readTestFile(t, counterPath)); got != "3" {
+		t.Fatalf("git archive count after third commit = %s, want 3", got)
+	}
+	finalDirs := conversationSnapshotDirs(t, snapshotRoot)
+	if got := len(finalDirs); got > maxConversationRepoSnapshots {
+		t.Fatalf("snapshot dirs after third commit = %d, want bounded <= %d", got, maxConversationRepoSnapshots)
+	}
+	for _, dir := range finalDirs {
+		if dir == firstSnapshotDirs[0] {
+			t.Fatalf("oldest snapshot %q was not garbage-collected; final dirs=%v", dir, finalDirs)
+		}
+	}
+}
+
+func TestPiPrepareConversationFailureReleasesSnapshotLock(t *testing.T) {
+	ctx := context.Background()
+	source := initAdapterSourceRepo(t, ctx)
+	dataRoot := t.TempDir()
+	adapter := NewPi(PiOptions{
+		Provider:           &scriptedPiProvider{},
+		CredentialStrategy: AuthJSONCredentialStrategy{SourcePath: filepath.Join(t.TempDir(), "missing-auth.json")},
+		DataRoot:           dataRoot,
+		ProjectID:          "p1",
+		SourceRepo:         source,
+		AgentStateRoot:     mkdirAdapterDir(t, t.TempDir(), "agent-state"),
+	})
+	disp := piTestDispatch()
+	disp.StageType = contract.StageTypeConversation
+	disp.Input = map[string]any{"input_mode": contract.AdapterInputModeConversation, "conversation_id": "conv_123", "trigger_message_id": "msg_123"}
+
+	if _, err := adapter.Prepare(ctx, disp); err == nil {
+		t.Fatalf("Prepare() error = nil, want credential failure")
+	}
+	snapshotRoot := filepath.Join(dataRoot, "projects", "p1", "repo-snapshots")
+	lock, acquired, err := tryAcquireSnapshotRootLock(snapshotRoot, conversationSnapshotUseLockName, syscall.LOCK_EX)
+	if err != nil {
+		t.Fatalf("tryAcquireSnapshotRootLock() error = %v", err)
+	}
+	if !acquired {
+		t.Fatalf("snapshot use lock still held after Prepare failure")
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatalf("close snapshot lock: %v", err)
+	}
+}
+
+func TestPiCreateConversationRepoSnapshotConcurrentSameSHAReusesPublishedSnapshot(t *testing.T) {
+	ctx := context.Background()
+	counterPath := installCountingGitArchiveWrapper(t, "1")
+	source := initAdapterSourceRepo(t, ctx)
+	dataRoot := t.TempDir()
+	adapter := NewPi(PiOptions{DataRoot: dataRoot, SourceRepo: source})
+
+	const workers = 5
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	paths := make([]string, workers)
+	errs := make([]error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			path, lock, err := adapter.createConversationRepoSnapshot(ctx, "p1")
+			if lock != nil {
+				defer lock.Close()
+			}
+			paths[i] = path
+			errs[i] = err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("worker %d createConversationRepoSnapshot() error = %v", i, err)
+		}
+		if paths[i] != paths[0] {
+			t.Fatalf("worker %d snapshot path = %q, want %q", i, paths[i], paths[0])
+		}
+	}
+	if got := strings.TrimSpace(readTestFile(t, counterPath)); got != "1" {
+		t.Fatalf("git archive count after concurrent same-SHA creates = %s, want 1", got)
+	}
+	if got := readTestFile(t, filepath.Join(paths[0], "README.md")); got != "hello\n" {
+		t.Fatalf("snapshot README = %q, want committed content", got)
+	}
+	if got := len(conversationSnapshotDirs(t, filepath.Join(dataRoot, "projects", "p1", "repo-snapshots"))); got != 1 {
+		t.Fatalf("snapshot dirs after concurrent creates = %d, want 1", got)
+	}
+}
+
+func TestCleanupConversationRepoSnapshotsSkipsWhileSnapshotInUse(t *testing.T) {
+	ctx := context.Background()
+	source := initAdapterSourceRepo(t, ctx)
+	dataRoot := t.TempDir()
+	adapter := NewPi(PiOptions{DataRoot: dataRoot, SourceRepo: source})
+
+	oldPath, oldLock, err := adapter.createConversationRepoSnapshot(ctx, "p1")
+	if err != nil {
+		t.Fatalf("create old snapshot: %v", err)
+	}
+	defer oldLock.Close()
+	commitAdapterFile(t, ctx, source, "new-commit.txt", "next\n", "second")
+	newPath, newLock, err := adapter.createConversationRepoSnapshot(ctx, "p1")
+	if err != nil {
+		t.Fatalf("create new snapshot: %v", err)
+	}
+	if err := newLock.Close(); err != nil {
+		t.Fatalf("close new snapshot lock: %v", err)
+	}
+
+	if err := cleanupConversationRepoSnapshots(newPath); err != nil {
+		t.Fatalf("cleanup with old snapshot in use: %v", err)
+	}
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Fatalf("old in-use snapshot was removed: %v", err)
 	}
 }
 
@@ -527,6 +724,51 @@ func readTestFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(content)
+}
+
+func installCountingGitArchiveWrapper(t *testing.T, delay string) string {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("lookpath git: %v", err)
+	}
+	binDir := t.TempDir()
+	counterPath := filepath.Join(t.TempDir(), "git-archive-count")
+	delayLine := ""
+	if delay != "" {
+		delayLine = "  sleep " + delay + "\n"
+	}
+	wrapper := "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = \"-C\" ] && [ \"${3:-}\" = \"archive\" ]; then\n  n=0\n  if [ -f \"" + counterPath + "\" ]; then n=$(cat \"" + counterPath + "\"); fi\n  n=$((n+1))\n  printf '%s' \"$n\" > \"" + counterPath + "\"\n" + delayLine + "fi\nexec \"" + realGit + "\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(wrapper), 0o700); err != nil {
+		t.Fatalf("write git wrapper: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return counterPath
+}
+
+func commitAdapterFile(t *testing.T, ctx context.Context, source, name, content, message string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(source, name), []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+	runAdapterGit(t, ctx, source, "add", name)
+	runAdapterGit(t, ctx, source, "commit", "-m", message)
+}
+
+func conversationSnapshotDirs(t *testing.T, snapshotRoot string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(snapshotRoot)
+	if err != nil {
+		t.Fatalf("read snapshot root: %v", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() && !strings.Contains(entry.Name(), ".tmp-") {
+			names = append(names, entry.Name())
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 func mountMode(inv provider.PreparedInvocation, containerPath string) string {
