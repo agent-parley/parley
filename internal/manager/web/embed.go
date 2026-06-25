@@ -61,6 +61,44 @@ type ProjectSettingsData struct {
 	Title         string
 }
 
+type SystemSettingsData struct {
+	Sinks  ExternalNotificationSinksData
+	Center NotificationCenterData
+	CSRF   string
+	Title  string
+}
+
+type ExternalNotificationSinksData struct {
+	Sinks                []NotificationSinkData
+	SecretsAvailable     bool
+	SecretsMessage       string
+	Notice               string
+	Status               string
+	OneTimeWebhookSecret string
+	CreateGotifyPath     string
+	CreateWebhookPath    string
+	CSRF                 string
+}
+
+type NotificationSinkData struct {
+	ID                string
+	Type              string
+	TypeLabel         string
+	Enabled           bool
+	BaseURL           string
+	URL               string
+	HTTPMethod        string
+	Priority          int
+	AllowInsecureHTTP bool
+	SendNeedsYou      bool
+	SendFinished      bool
+	SecretConfigured  bool
+	UpdatePath        string
+	DeletePath        string
+	RegeneratePath    string
+	UpdatedAt         string
+}
+
 type NotificationSettingsData struct {
 	Project        store.Project
 	OnlyWhenNeeded bool

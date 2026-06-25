@@ -7,7 +7,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/workflow"
@@ -510,13 +512,54 @@ type fakeBroadcaster struct{}
 func (fakeBroadcaster) Broadcast(string, event.Event, string) {}
 
 type capturingNotificationSink struct {
+	mu   sync.Mutex
 	seen []store.Notification
 	err  error
+	ch   chan struct{}
 }
 
 func (s *capturingNotificationSink) Notify(_ context.Context, notification store.Notification) error {
+	s.mu.Lock()
 	s.seen = append(s.seen, notification)
+	ch := s.ch
+	if ch == nil {
+		ch = make(chan struct{}, 8)
+		s.ch = ch
+	}
+	s.mu.Unlock()
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
 	return s.err
+}
+
+func (s *capturingNotificationSink) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.seen)
+}
+
+func (s *capturingNotificationSink) waitFor(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.After(testWaitTimeout)
+	for {
+		if s.count() >= want {
+			return
+		}
+		s.mu.Lock()
+		ch := s.ch
+		if ch == nil {
+			ch = make(chan struct{}, 8)
+			s.ch = ch
+		}
+		s.mu.Unlock()
+		select {
+		case <-ch:
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d notifications, got %d", want, s.count())
+		}
+	}
 }
 
 func initCommitSourceRepo(t *testing.T, ctx context.Context, files map[string]string) string {

@@ -1684,6 +1684,12 @@ func (e *Engine) dispatchNotification(ctx context.Context, ev event.Event, bundl
 		log.Printf("notification insert failed for event %s: %v", ev.ID, err)
 		return
 	}
+	if !e.spawn(func() { e.deliverNotification(e.rootCtx, notification) }) {
+		log.Printf("notification delivery skipped during shutdown for %s", notification.ID)
+	}
+}
+
+func (e *Engine) deliverNotification(ctx context.Context, notification store.Notification) {
 	for _, sink := range e.notificationSinks {
 		if sink == nil {
 			continue

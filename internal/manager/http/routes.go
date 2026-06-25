@@ -15,6 +15,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/notifications/events", s.handleNotificationEvents)
 	mux.HandleFunc("/notifications/ack-all", s.handleAcknowledgeAllNotifications)
 	mux.HandleFunc("/notifications/", s.handleNotificationPath)
+	mux.HandleFunc("/settings", s.handleSystemSettings)
+	mux.HandleFunc("/settings/", s.handleSystemSettingsPath)
 	mux.HandleFunc("/runs", s.handleRuns)
 	mux.HandleFunc("/runs/", s.handleRunPath)
 	mux.HandleFunc("/artifacts/", s.handleArtifact)

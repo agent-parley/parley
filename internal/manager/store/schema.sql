@@ -182,6 +182,22 @@ CREATE TABLE IF NOT EXISTS notifications (
   acknowledged_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS notification_sinks (
+  id TEXT PRIMARY KEY,
+  type TEXT NOT NULL CHECK (type IN ('gotify', 'webhook')),
+  enabled INTEGER NOT NULL DEFAULT 1,
+  base_url TEXT NOT NULL DEFAULT '',
+  url TEXT NOT NULL DEFAULT '',
+  http_method TEXT NOT NULL DEFAULT 'POST',
+  priority INTEGER NOT NULL DEFAULT 5,
+  secret_ciphertext BLOB NOT NULL,
+  allow_insecure_http INTEGER NOT NULL DEFAULT 0,
+  send_needs_you INTEGER NOT NULL DEFAULT 1,
+  send_finished INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS project_memory_entries (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -230,5 +246,6 @@ CREATE INDEX IF NOT EXISTS idx_events_project_sequence ON events(project_id, seq
 CREATE INDEX IF NOT EXISTS idx_events_scope_sequence ON events(scope, sequence);
 CREATE INDEX IF NOT EXISTS idx_artifacts_run_id ON artifacts(run_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_project_id ON artifacts(project_id);
+CREATE INDEX IF NOT EXISTS idx_notification_sinks_enabled ON notification_sinks(enabled, type, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_project_memory_entries_project ON project_memory_entries(project_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_project_memory_entries_source_run ON project_memory_entries(source_run_id);

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
+	"github.com/agent-parley/parley/internal/manager/secrets"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
 	"github.com/agent-parley/parley/internal/manager/workflow"
@@ -245,6 +246,89 @@ func TestProjectNotificationSettingsSaveSwapsSection(t *testing.T) {
 	}
 	if prefs.OnlyWhenNeeded || !prefs.WhenFinished {
 		t.Fatalf("notification prefs = %+v, want only when_finished", prefs)
+	}
+}
+
+func TestSystemSettingsExternalSinkCreationSealsSecretAndShowsWebhookSecretOnce(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	svc, err := secrets.New(ctx, st, secrets.Config{})
+	if err != nil {
+		t.Fatalf("new secrets: %v", err)
+	}
+	srv := newRouteTestServerWithSecrets(t, st, &fakeRunController{state: defaultRouteQueueState()}, svc)
+	body := getSettingsBody(t, srv, "/settings")
+	assertContains(t, body, "System Settings")
+	assertContains(t, body, "External notification sinks")
+	assertNotContains(t, body, externalSinkSecretUnavailable)
+	cookie, csrf := getCSRFToken(t, srv)
+
+	rec := postForm(t, srv, "/settings/notification-sinks/webhook", cookie, url.Values{
+		"url":            {"https://hooks.example/parley"},
+		"http_method":    {"POST"},
+		"enabled":        {"1"},
+		"send_needs_you": {"1"},
+		"_csrf":          {csrf},
+	})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST webhook sink status = %d want %d body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	body = rec.Body.String()
+	assertContains(t, body, "shown once")
+	secret := regexp.MustCompile(`<code>([^<]+)</code>`).FindStringSubmatch(body)
+	if len(secret) != 2 {
+		t.Fatalf("one-time secret not found in response: %s", body)
+	}
+	sinks, err := st.ListNotificationSinks(ctx)
+	if err != nil {
+		t.Fatalf("list sinks: %v", err)
+	}
+	if len(sinks) != 1 || sinks[0].Type != store.NotificationSinkTypeWebhook || !sinks[0].SendNeedsYou || sinks[0].SendFinished {
+		t.Fatalf("sinks = %+v, want one needs_you webhook", sinks)
+	}
+	if strings.Contains(string(sinks[0].SecretCiphertext), secret[1]) {
+		t.Fatal("stored webhook secret contains plaintext")
+	}
+	body = getSettingsBody(t, srv, "/settings")
+	assertContains(t, body, "Secret: configured")
+	assertNotContains(t, body, secret[1])
+}
+
+func TestSystemSettingsExternalSinkCreationRefusedWhenSecretsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	svc, err := secrets.New(ctx, st, secrets.Config{KeyProvider: noSecretsProvider{}})
+	if err != nil {
+		t.Fatalf("new secrets: %v", err)
+	}
+	if svc.Available() {
+		t.Fatal("test secrets service unexpectedly available")
+	}
+	srv := newRouteTestServerWithSecrets(t, st, &fakeRunController{state: defaultRouteQueueState()}, svc)
+	body := getSettingsBody(t, srv, "/settings")
+	assertContains(t, body, externalSinkSecretUnavailable)
+	cookie, csrf := getCSRFToken(t, srv)
+
+	rec := postForm(t, srv, "/settings/notification-sinks/gotify", cookie, url.Values{
+		"base_url":       {"https://gotify.example"},
+		"app_token":      {"plaintext-token"},
+		"enabled":        {"1"},
+		"send_needs_you": {"1"},
+		"_csrf":          {csrf},
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST gotify without secrets status = %d want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	assertContains(t, rec.Body.String(), externalSinkSecretUnavailable)
+	sinks, err := st.ListNotificationSinks(ctx)
+	if err != nil {
+		t.Fatalf("list sinks: %v", err)
+	}
+	if len(sinks) != 0 {
+		t.Fatalf("sinks = %+v, want none", sinks)
+	}
+	if _, err := st.InsertNotification(ctx, store.NotificationInput{ProjectID: store.DefaultProjectID, Class: store.NotificationClassNeedsYou, Title: "in-app still works"}); err != nil {
+		t.Fatalf("insert in-app notification with unavailable secrets: %v", err)
 	}
 }
 
@@ -974,11 +1058,22 @@ func openRouteTestStore(t *testing.T) *store.Store {
 
 func newRouteTestServer(t *testing.T, st *store.Store, controller *fakeRunController) *Server {
 	t.Helper()
+	return newRouteTestServerWithSecrets(t, st, controller, nil)
+}
+
+func newRouteTestServerWithSecrets(t *testing.T, st *store.Store, controller *fakeRunController, secretService *secrets.Service) *Server {
+	t.Helper()
 	renderer, err := web.NewRenderer()
 	if err != nil {
 		t.Fatalf("new renderer: %v", err)
 	}
-	return NewServer("127.0.0.1:8080", st, controller, NewHub(), renderer)
+	return NewServer("127.0.0.1:8080", st, controller, NewHub(), renderer, secretService)
+}
+
+type noSecretsProvider struct{}
+
+func (noSecretsProvider) ResolveKey(context.Context, secrets.KeyRequest) (secrets.KeyMaterial, error) {
+	return secrets.KeyMaterial{}, secrets.ErrNoKEK
 }
 
 var csrfInputRE = regexp.MustCompile(`name="_csrf" value="([^"]+)"`)

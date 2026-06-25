@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
+	"github.com/agent-parley/parley/internal/manager/secrets"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
 	"github.com/agent-parley/parley/internal/shared/contract"
@@ -30,14 +31,15 @@ type Server struct {
 	hub      *Hub
 	renderer web.Renderer
 	security *security
+	secrets  *secrets.Service
 	http     *http.Server
 }
 
-func NewServer(addr string, st *store.Store, engine RunController, hub *Hub, renderer web.Renderer) *Server {
+func NewServer(addr string, st *store.Store, engine RunController, hub *Hub, renderer web.Renderer, secretService *secrets.Service) *Server {
 	if addr == "" {
 		addr = "127.0.0.1:8080"
 	}
-	s := &Server{addr: addr, store: st, engine: engine, hub: hub, renderer: renderer, security: newSecurity(addr)}
+	s := &Server{addr: addr, store: st, engine: engine, hub: hub, renderer: renderer, security: newSecurity(addr), secrets: secretService}
 	s.http = &http.Server{Addr: addr, Handler: s.routes()}
 	return s
 }
