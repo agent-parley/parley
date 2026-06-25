@@ -33,10 +33,11 @@ func debugf(format string, args ...any) {
 }
 
 const (
-	TypeHello    = "hello"
-	TypeDispatch = "dispatch"
-	TypeCancel   = "cancel"
-	TypePing     = "ping"
+	TypeHello            = "hello"
+	TypeDispatch         = "dispatch"
+	TypeCancel           = "cancel"
+	TypeEvictWarmSession = "evict_warm_session"
+	TypePing             = "ping"
 
 	TypeReady    = "ready"
 	TypeEvent    = "event"
@@ -86,6 +87,10 @@ type CancelPayload struct {
 	RunID     string `json:"run_id"`
 	TaskID    string `json:"task_id"`
 	AttemptID string `json:"attempt_id,omitempty"`
+}
+
+type EvictWarmSessionPayload struct {
+	WarmSessionKey string `json:"warm_session_key"`
 }
 
 type EventPayload = event.Event

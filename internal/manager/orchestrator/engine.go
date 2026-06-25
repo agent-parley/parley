@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/agent-parley/parley/internal/manager/contextpack"
 	"github.com/agent-parley/parley/internal/manager/store"
@@ -90,6 +91,11 @@ type Engine struct {
 
 	queuePolicy           QueuePolicy
 	runnerSlots           int
+	conversationBudget    int
+	conversationIdleTTL   time.Duration
+	conversationMu        sync.Mutex
+	conversationSessions  map[string]*conversationSession
+	conversationReady     []string
 	gate                  func(context.Context, store.Run) (bool, error)
 	implementationAdapter string
 	planningAdapter       string
@@ -115,6 +121,8 @@ type EngineOptions struct {
 	GitExecutable         string
 	QueuePolicy           *QueuePolicy
 	RunnerSlots           int
+	ConversationBudget    int
+	ConversationIdleTTL   time.Duration
 	ContextAssembler      *contextpack.Assembler
 	NotificationSinks     []NotificationSink
 }
@@ -179,6 +187,14 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 	if runnerSlots <= 0 {
 		runnerSlots = 1
 	}
+	conversationBudget := opts.ConversationBudget
+	if conversationBudget <= 0 {
+		conversationBudget = 1
+	}
+	conversationIdleTTL := opts.ConversationIdleTTL
+	if conversationIdleTTL <= 0 {
+		conversationIdleTTL = 15 * time.Minute
+	}
 	contextAssembler := opts.ContextAssembler
 	if contextAssembler == nil {
 		contextAssembler = contextpack.NewAssembler(contextpack.Options{
@@ -201,6 +217,9 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 		runnerDown:            map[string]string{},
 		queuePolicy:           queuePolicy,
 		runnerSlots:           runnerSlots,
+		conversationBudget:    conversationBudget,
+		conversationIdleTTL:   conversationIdleTTL,
+		conversationSessions:  map[string]*conversationSession{},
 		implementationAdapter: implementationAdapter,
 		planningAdapter:       planningAdapter,
 		conversationAdapter:   conversationAdapter,

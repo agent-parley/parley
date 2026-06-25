@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-parley/parley/internal/manager/agentregistry"
 )
@@ -17,6 +18,9 @@ func TestLoadAbsentFilesUsesDefaults(t *testing.T) {
 	if loaded.Settings.Queue.AutoWhenReady != true || loaded.Settings.Queue.MaxConcurrent != 1 || loaded.Settings.Queue.BacklogCap != 100 {
 		t.Fatalf("settings = %+v, want queue defaults", loaded.Settings)
 	}
+	if loaded.Settings.Conversation.Budget != 1 || loaded.Settings.Conversation.IdleWarmHoldTTL != 15*time.Minute {
+		t.Fatalf("conversation = %+v, want conversation defaults", loaded.Settings.Conversation)
+	}
 	if len(loaded.Settings.AgentRegistry.Families) != 1 || loaded.Settings.AgentRegistry.Families[0].ID != agentregistry.FamilyPi {
 		t.Fatalf("agent families = %+v, want Pi-only defaults", loaded.Settings.AgentRegistry.Families)
 	}
@@ -27,6 +31,9 @@ func TestResolveDefaultsBackfillsProgrammaticPartialSettings(t *testing.T) {
 	if settings.Queue.AutoWhenReady != false || settings.Queue.MaxConcurrent != 2 || settings.Queue.BacklogCap != 10 {
 		t.Fatalf("queue = %+v, want caller-provided queue preserved", settings.Queue)
 	}
+	if settings.Conversation.Budget != 1 || settings.Conversation.IdleWarmHoldTTL != 15*time.Minute {
+		t.Fatalf("conversation = %+v, want conversation defaults", settings.Conversation)
+	}
 	if len(settings.AgentRegistry.Families) != 1 || settings.AgentRegistry.Families[0].ID != agentregistry.FamilyPi {
 		t.Fatalf("agent families = %+v, want Pi defaults", settings.AgentRegistry.Families)
 	}
@@ -35,14 +42,17 @@ func TestResolveDefaultsBackfillsProgrammaticPartialSettings(t *testing.T) {
 	if settings.Queue.AutoWhenReady != true || settings.Queue.MaxConcurrent != 1 || settings.Queue.BacklogCap != 100 {
 		t.Fatalf("queue = %+v, want queue defaults when only registry is provided", settings.Queue)
 	}
+	if settings.Conversation.Budget != 1 || settings.Conversation.IdleWarmHoldTTL != 15*time.Minute {
+		t.Fatalf("conversation = %+v, want conversation defaults when only registry is provided", settings.Conversation)
+	}
 }
 
 func TestLoadProjectOverridesGlobal(t *testing.T) {
 	dir := t.TempDir()
 	globalPath := filepath.Join(dir, "global.toml")
 	projectPath := filepath.Join(dir, "project.toml")
-	writeFile(t, globalPath, "[queue]\nauto_when_ready = false\nmax_concurrent = 2\nbacklog_cap = 10\n")
-	writeFile(t, projectPath, "[queue]\nauto_when_ready = true\nbacklog_cap = 25\n")
+	writeFile(t, globalPath, "[queue]\nauto_when_ready = false\nmax_concurrent = 2\nbacklog_cap = 10\n\n[conversation]\nbudget = 2\nidle_warm_hold_ttl = \"10m\"\n")
+	writeFile(t, projectPath, "[queue]\nauto_when_ready = true\nbacklog_cap = 25\n\n[conversation]\nidle_warm_hold_ttl = \"30m\"\n")
 	loaded, err := Load(LoadOptions{GlobalPath: globalPath, ProjectPath: projectPath})
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -50,6 +60,10 @@ func TestLoadProjectOverridesGlobal(t *testing.T) {
 	queue := loaded.Settings.Queue
 	if queue.AutoWhenReady != true || queue.MaxConcurrent != 2 || queue.BacklogCap != 25 {
 		t.Fatalf("queue = %+v, want project overrides layered on global", queue)
+	}
+	conversation := loaded.Settings.Conversation
+	if conversation.Budget != 2 || conversation.IdleWarmHoldTTL != 30*time.Minute {
+		t.Fatalf("conversation = %+v, want project overrides layered on global", conversation)
 	}
 }
 
@@ -138,6 +152,27 @@ func TestLoadRejectsInvalidQueuePolicy(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "queue.max_concurrent") {
 		t.Fatalf("error = %q, want max_concurrent validation", err.Error())
+	}
+}
+
+func TestLoadRejectsInvalidConversationPolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	writeFile(t, path, "[conversation]\nbudget = 0\nidle_warm_hold_ttl = \"15m\"\n")
+	_, err := Load(LoadOptions{ProjectPath: path})
+	if err == nil {
+		t.Fatal("Load() error = nil, want validation failure")
+	}
+	if !strings.Contains(err.Error(), "conversation.budget") {
+		t.Fatalf("error = %q, want conversation budget validation", err.Error())
+	}
+
+	writeFile(t, path, "[conversation]\nbudget = 1\nidle_warm_hold_ttl = \"0s\"\n")
+	_, err = Load(LoadOptions{ProjectPath: path})
+	if err == nil {
+		t.Fatal("Load() error = nil, want ttl validation failure")
+	}
+	if !strings.Contains(err.Error(), "conversation.idle_warm_hold_ttl") {
+		t.Fatalf("error = %q, want ttl validation", err.Error())
 	}
 }
 

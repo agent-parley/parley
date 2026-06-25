@@ -19,10 +19,10 @@ const (
 	conversationActionCreateTask    = "create-Task"
 )
 
-// SubmitConversationMessage persists one user message and starts a fresh agent
-// turn for that message. The turn is intentionally not a workflow run: it is a
-// per-message AgentAdapter dispatch that rehydrates from persisted Messages and
-// may only return an assistant reply plus allow-listed orchestration actions.
+// SubmitConversationMessage persists one user message and queues a managed
+// agent turn for that message. The turn is intentionally not a workflow run: it
+// is a per-message AgentAdapter dispatch that rehydrates from persisted Messages
+// and may only return an assistant reply plus allow-listed orchestration actions.
 func (e *Engine) SubmitConversationMessage(ctx context.Context, projectID, body string) (store.Message, error) {
 	body = strings.TrimSpace(body)
 	if body == "" {
@@ -47,13 +47,7 @@ func (e *Engine) SubmitConversationMessage(ctx context.Context, projectID, body 
 		return store.Message{}, err
 	}
 
-	dispatchInput, err := e.conversationDispatchInput(ctx, project, conversation, message.ID)
-	if err != nil {
-		return store.Message{}, err
-	}
-	e.spawn(func() {
-		e.dispatchConversationReply(e.rootCtx, project.ID, conversation.ID, message.ID, dispatchInput)
-	})
+	e.enqueueConversationTurn(ctx, project.ID, conversation.ID, message.ID)
 	return message, nil
 }
 
@@ -130,7 +124,9 @@ func conversationHistoryThrough(messages []store.Message, triggerMessageID strin
 func (e *Engine) dispatchConversationReply(ctx context.Context, projectID, conversationID, triggerMessageID string, input map[string]any) {
 	result, err := e.runConversationAgentTurn(ctx, projectID, input)
 	if err != nil {
-		_, _ = e.persistConversationAssistantMessage(ctx, projectID, conversationID, triggerMessageID, "The conversational agent could not complete this turn: "+err.Error(), event.Actor{Kind: event.ActorKindAdapter, ID: e.conversationAdapter}, "conversation agent failed")
+		if ctx.Err() == nil {
+			_, _ = e.persistConversationAssistantMessage(ctx, projectID, conversationID, triggerMessageID, "The conversational agent could not complete this turn: "+err.Error(), event.Actor{Kind: event.ActorKindAdapter, ID: e.conversationAdapter}, "conversation agent failed")
+		}
 		return
 	}
 	if _, err := e.persistConversationAssistantMessage(ctx, projectID, conversationID, triggerMessageID, result.Reply, event.Actor{Kind: event.ActorKindAdapter, ID: e.conversationAdapter}, "conversation agent replied"); err != nil {
@@ -201,15 +197,16 @@ func (e *Engine) runConversationAgentTurn(ctx context.Context, projectID string,
 		return conversationTurnResult{}, errors.New("runner unavailable")
 	}
 	disp := contract.Dispatch{
-		ProjectID:    projectID,
-		RepositoryID: inputRepositoryID(input),
-		RunID:        ids.New("convrun"),
-		TaskID:       ids.New("convturn"),
-		AttemptID:    ids.New("attempt"),
-		StageID:      ids.New("convstage"),
-		StageType:    contract.StageTypeConversation,
-		Adapter:      e.conversationAdapter,
-		Input:        input,
+		ProjectID:      projectID,
+		RepositoryID:   inputRepositoryID(input),
+		RunID:          ids.New("convrun"),
+		TaskID:         ids.New("convturn"),
+		AttemptID:      ids.New("attempt"),
+		StageID:        ids.New("convstage"),
+		StageType:      contract.StageTypeConversation,
+		Adapter:        e.conversationAdapter,
+		WarmSessionKey: inputConversationID(input),
+		Input:          input,
 	}
 	rep, err := e.runner.Dispatch(ctx, disp)
 	if err != nil {
@@ -236,6 +233,11 @@ func inputRepositoryID(input map[string]any) string {
 	repository, _ := input["repository"].(map[string]any)
 	id, _ := repository["id"].(string)
 	return id
+}
+
+func inputConversationID(input map[string]any) string {
+	conversationID, _ := input["conversation_id"].(string)
+	return conversationID
 }
 
 func allowedConversationActions(input map[string]any) []string {

@@ -19,23 +19,33 @@ import (
 type Runner struct {
 	session *protocol.Session
 
-	mu       sync.Mutex
-	runnerID string
-	adapters map[string]adapter.AgentAdapter
-	active   map[string]context.CancelFunc
+	mu        sync.Mutex
+	runnerID  string
+	adapters  map[string]adapter.AgentAdapter
+	active    map[string]context.CancelFunc
+	warm      map[string]*runnerWarmSession
+	warmLocks map[string]*sync.Mutex
+}
+
+type runnerWarmSession struct {
+	adapter string
+	active  bool
 }
 
 func New(sess *protocol.Session) *Runner {
 	r := &Runner{
-		session:  sess,
-		adapters: map[string]adapter.AgentAdapter{},
-		active:   map[string]context.CancelFunc{},
+		session:   sess,
+		adapters:  map[string]adapter.AgentAdapter{},
+		active:    map[string]context.CancelFunc{},
+		warm:      map[string]*runnerWarmSession{},
+		warmLocks: map[string]*sync.Mutex{},
 	}
 	r.Register(adapter.Noop{})
 	sess.Handle(protocol.TypeHello, r.handleHello)
 	sess.Handle(protocol.TypePing, r.handlePing)
 	sess.Handle(protocol.TypeDispatch, r.handleDispatch)
 	sess.Handle(protocol.TypeCancel, r.handleCancel)
+	sess.Handle(protocol.TypeEvictWarmSession, r.handleEvictWarmSession)
 	return r
 }
 
@@ -81,15 +91,37 @@ func (r *Runner) handleDispatch(ctx context.Context, msg protocol.Message) error
 
 	taskCtx, cancel := context.WithCancel(context.Background())
 	key := activeKey(disp.RunID, disp.TaskID, disp.AttemptID)
+	var warmLock *sync.Mutex
+	if disp.WarmSessionKey != "" {
+		warmLock = r.warmSessionLock(disp.WarmSessionKey)
+		warmLock.Lock()
+	}
 	r.mu.Lock()
 	r.active[key] = cancel
+	if disp.WarmSessionKey != "" {
+		session := r.warm[disp.WarmSessionKey]
+		if session == nil {
+			session = &runnerWarmSession{}
+			r.warm[disp.WarmSessionKey] = session
+		}
+		session.adapter = disp.Adapter
+		session.active = true
+	}
 	r.mu.Unlock()
 
 	go func() {
 		defer func() {
 			r.mu.Lock()
 			delete(r.active, key)
+			if disp.WarmSessionKey != "" {
+				if session := r.warm[disp.WarmSessionKey]; session != nil {
+					session.active = false
+				}
+			}
 			r.mu.Unlock()
+			if warmLock != nil {
+				warmLock.Unlock()
+			}
 			cancel()
 		}()
 		sink := sessionSink{session: r.session, disp: disp}
@@ -108,6 +140,53 @@ func (r *Runner) handleDispatch(ctx context.Context, msg protocol.Message) error
 		_ = r.send(context.Background(), protocol.TypeResult, protocol.ResultPayload{RunID: disp.RunID, TaskID: disp.TaskID, AttemptID: disp.AttemptID, TerminalStatus: terminal})
 	}()
 	return nil
+}
+
+func (r *Runner) handleEvictWarmSession(ctx context.Context, msg protocol.Message) error {
+	payload, err := protocol.DecodePayload[protocol.EvictWarmSessionPayload](msg)
+	if err != nil {
+		return err
+	}
+	if payload.WarmSessionKey == "" {
+		return nil
+	}
+	r.mu.Lock()
+	session := r.warm[payload.WarmSessionKey]
+	if session == nil || session.active {
+		r.mu.Unlock()
+		return nil
+	}
+	r.mu.Unlock()
+
+	lock := r.warmSessionLock(payload.WarmSessionKey)
+	lock.Lock()
+	defer lock.Unlock()
+
+	r.mu.Lock()
+	session = r.warm[payload.WarmSessionKey]
+	if session == nil || session.active {
+		r.mu.Unlock()
+		return nil
+	}
+	adapterName := session.adapter
+	delete(r.warm, payload.WarmSessionKey)
+	a := r.adapters[adapterName]
+	r.mu.Unlock()
+	if evicter, ok := a.(adapter.WarmSessionEvicter); ok {
+		return evicter.EvictWarmSession(ctx, payload.WarmSessionKey)
+	}
+	return nil
+}
+
+func (r *Runner) warmSessionLock(key string) *sync.Mutex {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lock := r.warmLocks[key]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		r.warmLocks[key] = lock
+	}
+	return lock
 }
 
 func (r *Runner) handleCancel(ctx context.Context, msg protocol.Message) error {

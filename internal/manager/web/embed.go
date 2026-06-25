@@ -188,7 +188,15 @@ type ProjectChatData struct {
 	Conversation store.Conversation
 	Messages     []store.Message
 	TaskRuns     []TaskRunView
+	TurnState    ProjectChatTurnState
 	CSRF         string
+}
+
+type ProjectChatTurnState struct {
+	Status      string
+	InFlight    bool
+	Queued      int
+	Cancellable bool
 }
 
 type TaskRunView struct {

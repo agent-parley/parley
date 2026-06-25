@@ -1,6 +1,7 @@
 package managerhttp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"html/template"
@@ -501,11 +502,37 @@ func (s *Server) handleProjectChatPath(w http.ResponseWriter, r *http.Request, p
 	switch parts[0] {
 	case "messages":
 		s.handleProjectChatMessage(w, r, projectID)
+	case "cancel":
+		s.handleProjectChatCancel(w, r, projectID)
 	case "events":
 		s.handleProjectChatEvents(w, r, projectID)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (s *Server) handleProjectChatCancel(w http.ResponseWriter, r *http.Request, projectID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	project, err := s.store.GetProject(r.Context(), projectID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	canceller, ok := s.engine.(interface {
+		CancelProjectConversationTurn(context.Context, string) error
+	})
+	if !ok {
+		http.Error(w, "conversation cancellation unavailable", http.StatusNotImplemented)
+		return
+	}
+	if err := canceller.CancelProjectConversationTurn(r.Context(), project.ID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/projects/"+project.ID, http.StatusSeeOther)
 }
 
 func (s *Server) handleProjectChatMessage(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -635,11 +662,19 @@ func (s *Server) projectChatData(r *http.Request, project store.Project) (web.Pr
 		return web.ProjectChatData{}, err
 	}
 	taskRuns := web.NewTaskRunViews(tasks, runs)
+	turnState := web.ProjectChatTurnState{Status: "idle"}
+	if reader, ok := s.engine.(interface {
+		ConversationTurnState(string) orchestrator.ConversationTurnState
+	}); ok {
+		state := reader.ConversationTurnState(conversation.ID)
+		turnState = web.ProjectChatTurnState{Status: state.Status, InFlight: state.InFlight, Queued: state.Queued, Cancellable: state.Cancellable}
+	}
 	return web.ProjectChatData{
 		Project:      project,
 		Conversation: conversation,
 		Messages:     messages,
 		TaskRuns:     taskRuns,
+		TurnState:    turnState,
 		CSRF:         csrfFromContext(r.Context()),
 	}, nil
 }

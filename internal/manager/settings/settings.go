@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/agent-parley/parley/internal/manager/agentregistry"
 	"github.com/pelletier/go-toml/v2"
@@ -15,6 +16,7 @@ const DefaultProjectConfigPath = ".parley/config.toml"
 
 type Settings struct {
 	Queue         QueueSettings          `toml:"queue"`
+	Conversation  ConversationSettings   `toml:"conversation"`
 	AgentRegistry agentregistry.Registry `toml:"-"`
 }
 
@@ -22,6 +24,11 @@ type QueueSettings struct {
 	AutoWhenReady bool `toml:"auto_when_ready"`
 	MaxConcurrent int  `toml:"max_concurrent"`
 	BacklogCap    int  `toml:"backlog_cap"`
+}
+
+type ConversationSettings struct {
+	Budget          int           `toml:"budget"`
+	IdleWarmHoldTTL time.Duration `toml:"idle_warm_hold_ttl"`
 }
 
 type LoadOptions struct {
@@ -36,8 +43,9 @@ type Loaded struct {
 }
 
 type fileSettings struct {
-	Queue  *fileQueueSettings       `toml:"queue"`
-	Agents *agentregistry.Overrides `toml:"agents"`
+	Queue        *fileQueueSettings        `toml:"queue"`
+	Conversation *fileConversationSettings `toml:"conversation"`
+	Agents       *agentregistry.Overrides  `toml:"agents"`
 }
 
 type fileQueueSettings struct {
@@ -46,15 +54,21 @@ type fileQueueSettings struct {
 	BacklogCap    *int  `toml:"backlog_cap"`
 }
 
+type fileConversationSettings struct {
+	Budget          *int    `toml:"budget"`
+	IdleWarmHoldTTL *string `toml:"idle_warm_hold_ttl"`
+}
+
 func Defaults() Settings {
 	return Settings{
 		Queue:         QueueSettings{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 100},
+		Conversation:  ConversationSettings{Budget: 1, IdleWarmHoldTTL: 15 * time.Minute},
 		AgentRegistry: agentregistry.Defaults(),
 	}
 }
 
 func IsZero(s Settings) bool {
-	return s.Queue == (QueueSettings{}) && agentRegistryIsZero(s.AgentRegistry)
+	return s.Queue == (QueueSettings{}) && s.Conversation == (ConversationSettings{}) && agentRegistryIsZero(s.AgentRegistry)
 }
 
 func ResolveDefaults(s Settings) Settings {
@@ -70,6 +84,16 @@ func ResolveDefaults(s Settings) Settings {
 		}
 		if s.Queue.BacklogCap == 0 {
 			s.Queue.BacklogCap = defaults.Queue.BacklogCap
+		}
+	}
+	if s.Conversation == (ConversationSettings{}) {
+		s.Conversation = defaults.Conversation
+	} else {
+		if s.Conversation.Budget == 0 {
+			s.Conversation.Budget = defaults.Conversation.Budget
+		}
+		if s.Conversation.IdleWarmHoldTTL == 0 {
+			s.Conversation.IdleWarmHoldTTL = defaults.Conversation.IdleWarmHoldTTL
 		}
 	}
 	if agentRegistryIsZero(s.AgentRegistry) {
@@ -111,6 +135,12 @@ func Validate(s Settings) error {
 	if s.Queue.BacklogCap < 1 {
 		return fmt.Errorf("queue.backlog_cap must be at least 1")
 	}
+	if s.Conversation.Budget < 1 {
+		return fmt.Errorf("conversation.budget must be at least 1")
+	}
+	if s.Conversation.IdleWarmHoldTTL <= 0 {
+		return fmt.Errorf("conversation.idle_warm_hold_ttl must be positive")
+	}
 	if err := agentregistry.Validate(s.AgentRegistry); err != nil {
 		return err
 	}
@@ -151,14 +181,24 @@ func mergeFile(dst *Settings, sourceName, path string) error {
 }
 
 func validateFileSettings(file fileSettings, sourceName, path string) error {
-	if file.Queue == nil {
-		return nil
+	if file.Queue != nil {
+		if file.Queue.MaxConcurrent != nil && *file.Queue.MaxConcurrent < 1 {
+			return fmt.Errorf("%s settings %s: queue.max_concurrent must be at least 1", sourceName, path)
+		}
+		if file.Queue.BacklogCap != nil && *file.Queue.BacklogCap < 1 {
+			return fmt.Errorf("%s settings %s: queue.backlog_cap must be at least 1", sourceName, path)
+		}
 	}
-	if file.Queue.MaxConcurrent != nil && *file.Queue.MaxConcurrent < 1 {
-		return fmt.Errorf("%s settings %s: queue.max_concurrent must be at least 1", sourceName, path)
-	}
-	if file.Queue.BacklogCap != nil && *file.Queue.BacklogCap < 1 {
-		return fmt.Errorf("%s settings %s: queue.backlog_cap must be at least 1", sourceName, path)
+	if file.Conversation != nil {
+		if file.Conversation.Budget != nil && *file.Conversation.Budget < 1 {
+			return fmt.Errorf("%s settings %s: conversation.budget must be at least 1", sourceName, path)
+		}
+		if file.Conversation.IdleWarmHoldTTL != nil {
+			ttl, err := time.ParseDuration(strings.TrimSpace(*file.Conversation.IdleWarmHoldTTL))
+			if err != nil || ttl <= 0 {
+				return fmt.Errorf("%s settings %s: conversation.idle_warm_hold_ttl must be a positive duration", sourceName, path)
+			}
+		}
 	}
 	return nil
 }
@@ -173,6 +213,18 @@ func merge(dst *Settings, sourceName string, file fileSettings) error {
 		}
 		if file.Queue.BacklogCap != nil {
 			dst.Queue.BacklogCap = *file.Queue.BacklogCap
+		}
+	}
+	if file.Conversation != nil {
+		if file.Conversation.Budget != nil {
+			dst.Conversation.Budget = *file.Conversation.Budget
+		}
+		if file.Conversation.IdleWarmHoldTTL != nil {
+			ttl, err := time.ParseDuration(strings.TrimSpace(*file.Conversation.IdleWarmHoldTTL))
+			if err != nil {
+				return fmt.Errorf("parse %s settings conversation.idle_warm_hold_ttl: %w", sourceName, err)
+			}
+			dst.Conversation.IdleWarmHoldTTL = ttl
 		}
 	}
 	if file.Agents != nil {

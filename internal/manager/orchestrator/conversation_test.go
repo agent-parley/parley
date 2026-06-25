@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -86,6 +87,202 @@ func TestSubmitConversationMessageDispatchesFreshAgentTurnAndPersistsReply(t *te
 	}
 	if !sawProjectConversationBroadcast(t, broadcast.events, project.ID) {
 		t.Fatalf("did not observe project-scoped conversation broadcast")
+	}
+}
+
+func TestConversationTurnsForOneConversationAreSerializedFIFO(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	project, err := st.EnsureProject(ctx, store.ProjectSpec{ID: store.DefaultProjectID, Name: "Default project", RepositoryPath: t.TempDir()})
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	runner := &managedConversationRunner{dispatches: make(chan contract.Dispatch, 4), releases: make(chan struct{}, 4), replies: []string{"reply one", "reply two"}}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, newEventRecorder(), EngineOptions{ConversationAdapter: "chat-agent"})
+	registerEngineTeardown(t, engine, st)
+
+	if _, err := engine.SubmitConversationMessage(ctx, project.ID, "first"); err != nil {
+		t.Fatalf("submit first: %v", err)
+	}
+	if _, err := engine.SubmitConversationMessage(ctx, project.ID, "second"); err != nil {
+		t.Fatalf("submit second: %v", err)
+	}
+	first := receiveDispatch(t, runner.dispatches)
+	if first.WarmSessionKey == "" {
+		t.Fatalf("first warm session key empty")
+	}
+	assertNoConversationDispatch(t, runner.dispatches, 75*time.Millisecond)
+	runner.releases <- struct{}{}
+	second := receiveDispatch(t, runner.dispatches)
+	if second.WarmSessionKey != first.WarmSessionKey {
+		t.Fatalf("warm session key = %q, want %q", second.WarmSessionKey, first.WarmSessionKey)
+	}
+	runner.releases <- struct{}{}
+
+	conversation, err := st.EnsureProjectConversation(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	messages := waitForConversationMessages(t, st, conversation.ID, 4)
+	if messages[2].Role != store.MessageRoleAssistant || messages[2].Body != "reply one" || messages[3].Role != store.MessageRoleAssistant || messages[3].Body != "reply two" {
+		t.Fatalf("messages = %#v, want ordered assistant replies", messages)
+	}
+}
+
+func TestConversationBudgetQueuesDifferentConversationUntilActiveTurnFinishes(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	projectA, err := st.EnsureProject(ctx, store.ProjectSpec{ID: "project-a", Name: "Project A", RepositoryPath: t.TempDir()})
+	if err != nil {
+		t.Fatalf("ensure project A: %v", err)
+	}
+	projectB, err := st.EnsureProject(ctx, store.ProjectSpec{ID: "project-b", Name: "Project B", RepositoryPath: t.TempDir()})
+	if err != nil {
+		t.Fatalf("ensure project B: %v", err)
+	}
+	runner := &managedConversationRunner{dispatches: make(chan contract.Dispatch, 4), releases: make(chan struct{}, 4), replies: []string{"reply A", "reply B"}, evictions: make(chan string, 2)}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, newEventRecorder(), EngineOptions{ConversationAdapter: "chat-agent", ConversationBudget: 1})
+	registerEngineTeardown(t, engine, st)
+
+	if _, err := engine.SubmitConversationMessage(ctx, projectA.ID, "message A"); err != nil {
+		t.Fatalf("submit A: %v", err)
+	}
+	first := receiveDispatch(t, runner.dispatches)
+	if _, err := engine.SubmitConversationMessage(ctx, projectB.ID, "message B"); err != nil {
+		t.Fatalf("submit B: %v", err)
+	}
+	assertNoConversationDispatch(t, runner.dispatches, 75*time.Millisecond)
+	runner.releases <- struct{}{}
+	second := receiveDispatch(t, runner.dispatches)
+	if second.WarmSessionKey == first.WarmSessionKey {
+		t.Fatalf("second warm session key = %q, want different conversation", second.WarmSessionKey)
+	}
+	if evicted := receiveEviction(t, runner.evictions); evicted != first.WarmSessionKey {
+		t.Fatalf("evicted warm session = %q, want %q", evicted, first.WarmSessionKey)
+	}
+	runner.releases <- struct{}{}
+}
+
+func TestConversationWarmSessionReusedAcrossTurnsUntilIdleTTLEvicts(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	project, err := st.EnsureProject(ctx, store.ProjectSpec{ID: store.DefaultProjectID, Name: "Default project", RepositoryPath: t.TempDir()})
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	runner := &managedConversationRunner{dispatches: make(chan contract.Dispatch, 4), replies: []string{"first reply", "second reply"}, evictions: make(chan string, 2)}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, newEventRecorder(), EngineOptions{ConversationAdapter: "chat-agent", ConversationBudget: 1, ConversationIdleTTL: 25 * time.Millisecond})
+	registerEngineTeardown(t, engine, st)
+
+	if _, err := engine.SubmitConversationMessage(ctx, project.ID, "first"); err != nil {
+		t.Fatalf("submit first: %v", err)
+	}
+	first := receiveDispatch(t, runner.dispatches)
+	if first.WarmSessionKey == "" {
+		t.Fatalf("first warm session key empty")
+	}
+	conversation, err := st.EnsureProjectConversation(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	waitForConversationMessages(t, st, conversation.ID, 2)
+	if evicted := receiveEviction(t, runner.evictions); evicted != first.WarmSessionKey {
+		t.Fatalf("evicted warm session = %q, want %q", evicted, first.WarmSessionKey)
+	}
+
+	if _, err := engine.SubmitConversationMessage(ctx, project.ID, "second"); err != nil {
+		t.Fatalf("submit second: %v", err)
+	}
+	second := receiveDispatch(t, runner.dispatches)
+	if second.WarmSessionKey != first.WarmSessionKey {
+		t.Fatalf("warm session key = %q, want %q", second.WarmSessionKey, first.WarmSessionKey)
+	}
+	history, ok := second.Input["messages"].([]map[string]any)
+	if !ok {
+		t.Fatalf("messages = %#v, want history", second.Input["messages"])
+	}
+	if len(history) != 3 || history[0]["body"] != "first" || history[1]["body"] != "first reply" || history[2]["body"] != "second" {
+		t.Fatalf("history = %#v, want cold resume from persisted transcript", history)
+	}
+}
+
+func TestConversationEvictionRaceColdStartsWithoutLosingQueuedTurn(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	project, err := st.EnsureProject(ctx, store.ProjectSpec{ID: store.DefaultProjectID, Name: "Default project", RepositoryPath: t.TempDir()})
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	runner := &managedConversationRunner{dispatches: make(chan contract.Dispatch, 4), replies: []string{"first reply", "second reply"}, evictStarted: make(chan string, 1), evictRelease: make(chan struct{}), evictions: make(chan string, 2)}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, newEventRecorder(), EngineOptions{ConversationAdapter: "chat-agent", ConversationBudget: 1, ConversationIdleTTL: 20 * time.Millisecond})
+	registerEngineTeardown(t, engine, st)
+
+	if _, err := engine.SubmitConversationMessage(ctx, project.ID, "first"); err != nil {
+		t.Fatalf("submit first: %v", err)
+	}
+	first := receiveDispatch(t, runner.dispatches)
+	conversation, err := st.EnsureProjectConversation(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	waitForConversationMessages(t, st, conversation.ID, 2)
+	if started := receiveEviction(t, runner.evictStarted); started != first.WarmSessionKey {
+		t.Fatalf("eviction started for %q, want %q", started, first.WarmSessionKey)
+	}
+	if _, err := engine.SubmitConversationMessage(ctx, project.ID, "second"); err != nil {
+		t.Fatalf("submit second: %v", err)
+	}
+	assertNoConversationDispatch(t, runner.dispatches, 75*time.Millisecond)
+	close(runner.evictRelease)
+	second := receiveDispatch(t, runner.dispatches)
+	if second.WarmSessionKey != first.WarmSessionKey {
+		t.Fatalf("warm session key = %q, want %q", second.WarmSessionKey, first.WarmSessionKey)
+	}
+	messages := waitForConversationMessages(t, st, conversation.ID, 4)
+	if messages[3].Body != "second reply" {
+		t.Fatalf("messages = %#v, want queued second turn reply", messages)
+	}
+}
+
+func TestConversationShutdownCancelsInFlightTurn(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	project, err := st.EnsureProject(ctx, store.ProjectSpec{ID: store.DefaultProjectID, Name: "Default project", RepositoryPath: t.TempDir()})
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	runner := &cancellableConversationRunner{dispatches: make(chan contract.Dispatch, 1), cancelled: make(chan struct{})}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, newEventRecorder(), EngineOptions{ConversationAdapter: "chat-agent"})
+	defer st.Close()
+
+	if _, err := engine.SubmitConversationMessage(ctx, project.ID, "please think"); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	_ = receiveDispatch(t, runner.dispatches)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), testWaitTimeout)
+	defer cancel()
+	if err := engine.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	select {
+	case <-runner.cancelled:
+	case <-time.After(testWaitTimeout):
+		t.Fatal("timed out waiting for conversation dispatch cancellation")
 	}
 }
 
@@ -526,6 +723,105 @@ func conversationBriefSections(sections ...[2]string) string {
 	return strings.Join(parts, "\n\n")
 }
 
+type managedConversationRunner struct {
+	dispatches   chan contract.Dispatch
+	releases     chan struct{}
+	replies      []string
+	evictions    chan string
+	evictStarted chan string
+	evictRelease chan struct{}
+
+	mu    sync.Mutex
+	count int
+}
+
+func (r *managedConversationRunner) Dispatch(ctx context.Context, disp contract.Dispatch) (report.Report, error) {
+	r.mu.Lock()
+	idx := r.count
+	r.count++
+	r.mu.Unlock()
+	select {
+	case r.dispatches <- disp:
+	case <-ctx.Done():
+		return report.Report{}, ctx.Err()
+	}
+	if r.releases != nil {
+		select {
+		case <-r.releases:
+		case <-ctx.Done():
+			return report.Report{}, ctx.Err()
+		}
+	}
+	reply := "conversation reply"
+	if idx < len(r.replies) {
+		reply = r.replies[idx]
+	}
+	return report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         disp.RunID,
+		TaskID:        disp.TaskID,
+		AttemptID:     disp.AttemptID,
+		StageID:       disp.StageID,
+		StageType:     disp.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: disp.Adapter},
+		Status:        report.StatusCompleted,
+		Summary:       "conversation reply",
+		Payload:       map[string]any{"reply_markdown": reply},
+		Errors:        []string{},
+	}, nil
+}
+
+func (r *managedConversationRunner) CancelAttempt(context.Context, string, string, string) error {
+	return nil
+}
+
+func (r *managedConversationRunner) EvictWarmSession(ctx context.Context, warmSessionKey string) error {
+	if r.evictStarted != nil {
+		select {
+		case r.evictStarted <- warmSessionKey:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if r.evictRelease != nil {
+		select {
+		case <-r.evictRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if r.evictions != nil {
+		select {
+		case r.evictions <- warmSessionKey:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+type cancellableConversationRunner struct {
+	dispatches chan contract.Dispatch
+	cancelled  chan struct{}
+	once       sync.Once
+}
+
+func (r *cancellableConversationRunner) Dispatch(ctx context.Context, disp contract.Dispatch) (report.Report, error) {
+	select {
+	case r.dispatches <- disp:
+	case <-ctx.Done():
+		r.once.Do(func() { close(r.cancelled) })
+		return report.Report{}, ctx.Err()
+	}
+	<-ctx.Done()
+	r.once.Do(func() { close(r.cancelled) })
+	return report.Report{}, ctx.Err()
+}
+
+func (r *cancellableConversationRunner) CancelAttempt(context.Context, string, string, string) error {
+	return nil
+}
+
 type conversationTestRunner struct {
 	dispatches chan contract.Dispatch
 	reply      string
@@ -591,6 +887,26 @@ func receiveDispatch(t *testing.T, ch <-chan contract.Dispatch) contract.Dispatc
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for conversation dispatch")
 		return contract.Dispatch{}
+	}
+}
+
+func assertNoConversationDispatch(t *testing.T, ch <-chan contract.Dispatch, d time.Duration) {
+	t.Helper()
+	select {
+	case disp := <-ch:
+		t.Fatalf("unexpected conversation dispatch: %#v", disp)
+	case <-time.After(d):
+	}
+}
+
+func receiveEviction(t *testing.T, ch <-chan string) string {
+	t.Helper()
+	select {
+	case warmSessionKey := <-ch:
+		return warmSessionKey
+	case <-time.After(testWaitTimeout):
+		t.Fatal("timed out waiting for warm session eviction")
+		return ""
 	}
 }
 

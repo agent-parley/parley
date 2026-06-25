@@ -1,6 +1,15 @@
 <section id="project-chat" class="card chat-pane">
   <h2>Project Chat</h2>
   <p class="muted">Messages here are persisted project dialogue. Ask about the project or repository; Parley replies in this chat.</p>
+  {{if .TurnState.Cancellable}}
+  <div class="status-row chat-status" role="status">
+    <span>{{if .TurnState.InFlight}}thinking…{{else}}queued{{end}}{{if .TurnState.Queued}} · {{.TurnState.Queued}} queued{{end}}</span>
+    <form method="post" action="/projects/{{.Project.ID}}/chat/cancel">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
+      <button type="submit" class="text-button">Cancel</button>
+    </form>
+  </div>
+  {{end}}
   <div class="chat-thread" aria-live="polite">
     {{if .Messages}}
     <ol class="messages">
