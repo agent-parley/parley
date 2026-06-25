@@ -201,6 +201,14 @@ CREATE TABLE IF NOT EXISTS project_memory_entries (
   UNIQUE(project_id, kind, title)
 );
 
+CREATE TABLE IF NOT EXISTS secrets_keymeta (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  kek_version INTEGER NOT NULL,
+  wrapped_dek BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_projects_created_at ON projects(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_workspaces_project_id ON workspaces(project_id);
 CREATE INDEX IF NOT EXISTS idx_repositories_project_id ON repositories(project_id);

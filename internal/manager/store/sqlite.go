@@ -368,6 +368,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureRunnerRegistrySchema(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureSecretsSchema(ctx); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, string(schema)); err != nil {
 		return fmt.Errorf("refresh sqlite indexes: %w", err)
 	}
@@ -883,6 +886,20 @@ func (s *Store) ensureRunnerRegistrySchema(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, `ALTER TABLE runner_registry ADD COLUMN missed_heartbeats INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("add runner missed_heartbeats column: %w", err)
 		}
+	}
+	return nil
+}
+
+func (s *Store) ensureSecretsSchema(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS secrets_keymeta (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  kek_version INTEGER NOT NULL,
+  wrapped_dek BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)`)
+	if err != nil {
+		return fmt.Errorf("ensure secrets schema: %w", err)
 	}
 	return nil
 }

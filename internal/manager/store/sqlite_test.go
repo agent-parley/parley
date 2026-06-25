@@ -15,6 +15,23 @@ import (
 	"github.com/agent-parley/parley/internal/shared/report"
 )
 
+func TestSecretsKeyMetaSchema(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	var tableName string
+	if err := st.DB().QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'secrets_keymeta'`).Scan(&tableName); err != nil {
+		t.Fatalf("secrets_keymeta table: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `INSERT INTO secrets_keymeta(id, kek_version, wrapped_dek, created_at, updated_at) VALUES (2, 1, x'00', 'now', 'now')`); err == nil {
+		t.Fatal("secrets_keymeta accepted id other than 1")
+	}
+}
+
 func TestStorePersistence(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(ctx, t.TempDir())

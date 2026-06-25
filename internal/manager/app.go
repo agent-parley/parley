@@ -10,6 +10,7 @@ import (
 	managerhttp "github.com/agent-parley/parley/internal/manager/http"
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/runnerclient"
+	"github.com/agent-parley/parley/internal/manager/secrets"
 	"github.com/agent-parley/parley/internal/manager/settings"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
@@ -25,18 +26,21 @@ const (
 )
 
 type Config struct {
-	Addr       string
-	DataDir    string
-	RunnerBin  string
-	Adapter    string
-	ProjectID  string
-	SourceRepo string
-	Settings   settings.Settings
+	Addr           string
+	DataDir        string
+	RunnerBin      string
+	Adapter        string
+	ProjectID      string
+	SourceRepo     string
+	SecretsKEK     string
+	SecretsKEKFile string
+	Settings       settings.Settings
 }
 
 type App struct {
 	cfg       Config
 	store     *store.Store
+	secrets   *secrets.Service
 	runner    *runnerProxy
 	engine    *orchestrator.Engine
 	http      *managerhttp.Server
@@ -65,6 +69,11 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 
 	st, err := store.Open(ctx, cfg.DataDir)
 	if err != nil {
+		return nil, err
+	}
+	secretService, err := secrets.New(ctx, st, secrets.Config{KEKBase64: cfg.SecretsKEK, KEKFile: cfg.SecretsKEKFile})
+	if err != nil {
+		_ = st.Close()
 		return nil, err
 	}
 	projectID := cfg.ProjectID
@@ -117,10 +126,11 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		NotificationSinks:     []orchestrator.NotificationSink{notificationSink},
 	})
 	app := &App{
-		cfg:    cfg,
-		store:  st,
-		runner: runner,
-		engine: engine,
+		cfg:     cfg,
+		store:   st,
+		secrets: secretService,
+		runner:  runner,
+		engine:  engine,
 		runnerEnv: []string{
 			"PARLEY_ADAPTER=" + cfg.Adapter,
 			"PARLEY_DATA_DIR=" + cfg.DataDir,
@@ -142,6 +152,8 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	}
 	return app, nil
 }
+
+func (a *App) Secrets() *secrets.Service { return a.secrets }
 
 func (a *App) startRunnerChild(ctx context.Context, restarted bool) error {
 	a.mu.Lock()
