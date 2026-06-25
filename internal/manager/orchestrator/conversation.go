@@ -7,18 +7,22 @@ import (
 	"strings"
 
 	"github.com/agent-parley/parley/internal/manager/store"
+	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/ids"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
 
-const conversationalPlanningAgentRole = "conversational_planning_agent"
+const (
+	conversationalPlanningAgentRole = "conversational_planning_agent"
+	conversationActionCreateTask    = "create-Task"
+)
 
 // SubmitConversationMessage persists one user message and starts a fresh agent
 // turn for that message. The turn is intentionally not a workflow run: it is a
 // per-message AgentAdapter dispatch that rehydrates from persisted Messages and
-// may only return an assistant reply in this tracer slice.
+// may only return an assistant reply plus allow-listed orchestration actions.
 func (e *Engine) SubmitConversationMessage(ctx context.Context, projectID, body string) (store.Message, error) {
 	body = strings.TrimSpace(body)
 	if body == "" {
@@ -96,7 +100,7 @@ func (e *Engine) conversationDispatchInput(ctx context.Context, project store.Pr
 			"repository": []string{"read", "list", "grep"},
 			"workspace":  []string{"read", "write"},
 		},
-		"allowed_actions": []string{},
+		"allowed_actions": []string{conversationActionCreateTask},
 	}
 	if strings.TrimSpace(project.ProjectRules) != "" {
 		input["project_rules"] = project.ProjectRules
@@ -124,11 +128,27 @@ func conversationHistoryThrough(messages []store.Message, triggerMessageID strin
 }
 
 func (e *Engine) dispatchConversationReply(ctx context.Context, projectID, conversationID, triggerMessageID string, input map[string]any) {
-	reply, err := e.runConversationAgentTurn(ctx, projectID, input)
+	result, err := e.runConversationAgentTurn(ctx, projectID, input)
 	if err != nil {
-		reply = "The conversational agent could not complete this turn: " + err.Error()
+		_, _ = e.persistConversationAssistantMessage(ctx, projectID, conversationID, triggerMessageID, "The conversational agent could not complete this turn: "+err.Error(), event.Actor{Kind: event.ActorKindAdapter, ID: e.conversationAdapter}, "conversation agent failed")
+		return
 	}
-	message, addErr := e.store.AddMessage(ctx, conversationID, store.MessageRoleAssistant, reply)
+	if _, err := e.persistConversationAssistantMessage(ctx, projectID, conversationID, triggerMessageID, result.Reply, event.Actor{Kind: event.ActorKindAdapter, ID: e.conversationAdapter}, "conversation agent replied"); err != nil {
+		return
+	}
+	if result.Action == nil {
+		return
+	}
+	wr, err := e.executeConversationAction(ctx, projectID, conversationID, *result.Action)
+	if err != nil {
+		_, _ = e.persistConversationAssistantMessage(ctx, projectID, conversationID, triggerMessageID, "The conversational agent could not create a Task: "+err.Error(), event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "conversation action failed")
+		return
+	}
+	_, _ = e.persistConversationAssistantMessage(ctx, projectID, conversationID, triggerMessageID, conversationTaskCreatedMessage(wr), event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "conversation task created")
+}
+
+func (e *Engine) persistConversationAssistantMessage(ctx context.Context, projectID, conversationID, triggerMessageID, body string, actor event.Actor, summary string) (store.Message, error) {
+	message, addErr := e.store.AddMessage(ctx, conversationID, store.MessageRoleAssistant, body)
 	if addErr != nil {
 		_, _ = e.emit(ctx, event.Event{
 			SchemaVersion: event.SchemaVersion,
@@ -142,14 +162,43 @@ func (e *Engine) dispatchConversationReply(ctx context.Context, projectID, conve
 				"error":              addErr.Error(),
 			},
 		})
-		return
+		return store.Message{}, addErr
 	}
-	_, _ = e.emit(ctx, conversationMessageEvent(projectID, conversationID, message, "conversation.agent_replied", event.Actor{Kind: event.ActorKindAdapter, ID: e.conversationAdapter}, "conversation agent replied"))
+	_, _ = e.emit(ctx, conversationMessageEvent(projectID, conversationID, message, "conversation.agent_replied", actor, summary))
+	return message, nil
 }
 
-func (e *Engine) runConversationAgentTurn(ctx context.Context, projectID string, input map[string]any) (string, error) {
+func (e *Engine) executeConversationAction(ctx context.Context, projectID, conversationID string, action conversationAction) (store.WorkflowRun, error) {
+	switch action.Type {
+	case conversationActionCreateTask:
+		runID, err := e.StartProjectRunInput(ctx, projectID, contract.TaskInput{
+			Idea:               action.Idea,
+			RefinementLevel:    contract.RefinementLevelDirect,
+			WorkflowTemplateID: workflow.BalancedPRDeliveryID,
+			ConversationID:     conversationID,
+		})
+		if err != nil {
+			return store.WorkflowRun{}, err
+		}
+		return e.store.GetWorkflowRun(ctx, runID)
+	default:
+		return store.WorkflowRun{}, fmt.Errorf("unsupported conversation action %q", action.Type)
+	}
+}
+
+type conversationTurnResult struct {
+	Reply  string
+	Action *conversationAction
+}
+
+type conversationAction struct {
+	Type string
+	Idea string
+}
+
+func (e *Engine) runConversationAgentTurn(ctx context.Context, projectID string, input map[string]any) (conversationTurnResult, error) {
 	if e.runner == nil {
-		return "", errors.New("runner unavailable")
+		return conversationTurnResult{}, errors.New("runner unavailable")
 	}
 	disp := contract.Dispatch{
 		ProjectID:    projectID,
@@ -164,22 +213,23 @@ func (e *Engine) runConversationAgentTurn(ctx context.Context, projectID string,
 	}
 	rep, err := e.runner.Dispatch(ctx, disp)
 	if err != nil {
-		return "", err
+		return conversationTurnResult{}, err
 	}
 	if rep.Status != report.StatusCompleted {
 		if len(rep.Errors) > 0 {
-			return "", fmt.Errorf("agent returned %s: %s", rep.Status, strings.Join(rep.Errors, "; "))
+			return conversationTurnResult{}, fmt.Errorf("agent returned %s: %s", rep.Status, strings.Join(rep.Errors, "; "))
 		}
-		return "", fmt.Errorf("agent returned %s", rep.Status)
+		return conversationTurnResult{}, fmt.Errorf("agent returned %s", rep.Status)
 	}
-	if err := rejectConversationActions(rep.Payload); err != nil {
-		return "", err
+	action, err := validateConversationActions(rep.Payload, allowedConversationActions(input))
+	if err != nil {
+		return conversationTurnResult{}, err
 	}
 	reply := conversationReplyFromReport(rep)
 	if reply == "" {
-		return "", fmt.Errorf("agent report missing payload.reply_markdown")
+		return conversationTurnResult{}, fmt.Errorf("agent report missing payload.reply_markdown")
 	}
-	return reply, nil
+	return conversationTurnResult{Reply: reply, Action: action}, nil
 }
 
 func inputRepositoryID(input map[string]any) string {
@@ -188,44 +238,172 @@ func inputRepositoryID(input map[string]any) string {
 	return id
 }
 
-func rejectConversationActions(payload map[string]any) error {
-	if payload == nil {
-		return nil
+func allowedConversationActions(input map[string]any) []string {
+	raw, ok := input["allowed_actions"].([]string)
+	if ok {
+		out := make([]string, 0, len(raw))
+		for _, action := range raw {
+			if strings.TrimSpace(action) != "" {
+				out = append(out, strings.TrimSpace(action))
+			}
+		}
+		return out
 	}
-	for _, key := range []string{"action", "actions"} {
-		raw, ok := payload[key]
-		if !ok || actionValueEmpty(raw) {
+	rawAny, _ := input["allowed_actions"].([]any)
+	out := make([]string, 0, len(rawAny))
+	for _, item := range rawAny {
+		if action, ok := item.(string); ok && strings.TrimSpace(action) != "" {
+			out = append(out, strings.TrimSpace(action))
+		}
+	}
+	return out
+}
+
+func validateConversationActions(payload map[string]any, allowed []string) (*conversationAction, error) {
+	if payload == nil {
+		return nil, nil
+	}
+	singular, hasSingular := payload["action"]
+	plural, hasPlural := payload["actions"]
+	singularPresent := hasSingular && conversationActionFieldPresent(singular)
+	pluralPresent := hasPlural && conversationActionFieldPresent(plural)
+	if singularPresent && pluralPresent {
+		return nil, fmt.Errorf("conversation report must use either payload.action or payload.actions, not both")
+	}
+	if singularPresent {
+		action, err := parseConversationAction(singular, allowed)
+		if err != nil {
+			return nil, err
+		}
+		return &action, nil
+	}
+	if !pluralPresent {
+		return nil, nil
+	}
+	actions, ok := plural.([]any)
+	if !ok {
+		return nil, fmt.Errorf("payload.actions must be an array")
+	}
+	if len(actions) == 0 {
+		return nil, nil
+	}
+	if len(actions) > 1 {
+		return nil, fmt.Errorf("conversation report may contain at most one action")
+	}
+	action, err := parseConversationAction(actions[0], allowed)
+	if err != nil {
+		return nil, err
+	}
+	return &action, nil
+}
+
+func conversationActionFieldPresent(raw any) bool {
+	switch v := raw.(type) {
+	case nil:
+		return false
+	case []any:
+		return len(v) > 0
+	default:
+		return true
+	}
+}
+
+func parseConversationAction(raw any, allowed []string) (conversationAction, error) {
+	envelope, ok := raw.(map[string]any)
+	if !ok {
+		return conversationAction{}, fmt.Errorf("conversation action envelope must be an object")
+	}
+	for key := range envelope {
+		if key != "type" && key != "idea" {
+			return conversationAction{}, fmt.Errorf("conversation action %q contains unsupported field %q", actionType(envelope), key)
+		}
+	}
+	typ := actionType(envelope)
+	if typ == "" {
+		return conversationAction{}, fmt.Errorf("conversation action missing type")
+	}
+	if !conversationActionAllowed(typ, allowed) {
+		return conversationAction{}, fmt.Errorf("conversation action %q is not allowed", typ)
+	}
+	switch typ {
+	case conversationActionCreateTask:
+		idea, ok := envelope["idea"].(string)
+		if !ok || strings.TrimSpace(idea) == "" {
+			return conversationAction{}, fmt.Errorf("create-Task action requires non-empty idea")
+		}
+		if err := validateConversationBrief(idea); err != nil {
+			return conversationAction{}, err
+		}
+		return conversationAction{Type: typ, Idea: idea}, nil
+	default:
+		return conversationAction{}, fmt.Errorf("unsupported conversation action %q", typ)
+	}
+}
+
+func validateConversationBrief(brief string) error {
+	required := []string{"Goal", "In scope", "Out of scope", "Key decisions", "Open assumptions"}
+	section := 0
+	activeSection := -1
+	seenContent := make([]bool, len(required))
+	for _, line := range strings.Split(brief, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
 			continue
 		}
-		return fmt.Errorf("conversation actions are not enabled in this slice")
+		if strings.HasPrefix(trimmed, "#") {
+			name := strings.TrimSpace(strings.Trim(strings.TrimLeft(trimmed, "#"), "#"))
+			if section >= len(required) {
+				return fmt.Errorf("create-Task idea must contain exactly these Markdown sections: %s", strings.Join(required, ", "))
+			}
+			if name != required[section] {
+				return fmt.Errorf("create-Task idea section %d must be %q", section+1, required[section])
+			}
+			activeSection = section
+			section++
+			continue
+		}
+		if activeSection >= 0 {
+			seenContent[activeSection] = true
+		}
+	}
+	if section != len(required) {
+		return fmt.Errorf("create-Task idea must contain exactly these Markdown sections: %s", strings.Join(required, ", "))
+	}
+	for i, ok := range seenContent {
+		if !ok {
+			return fmt.Errorf("create-Task idea section %q must not be empty", required[i])
+		}
 	}
 	return nil
 }
 
-func actionValueEmpty(raw any) bool {
-	switch v := raw.(type) {
-	case nil:
-		return true
-	case string:
-		return strings.TrimSpace(v) == ""
-	case []any:
-		return len(v) == 0
-	case map[string]any:
-		return len(v) == 0
-	default:
-		return false
+func actionType(envelope map[string]any) string {
+	typ, _ := envelope["type"].(string)
+	return strings.TrimSpace(typ)
+}
+
+func conversationActionAllowed(action string, allowed []string) bool {
+	for _, allowedAction := range allowed {
+		if action == allowedAction {
+			return true
+		}
 	}
+	return false
+}
+
+func conversationTaskCreatedMessage(wr store.WorkflowRun) string {
+	return fmt.Sprintf("Created Task `%s` / Run `%s` from this conversation. It is awaiting `plan_review_human` for human confirmation before any code runs.", wr.Task.ID, wr.Run.ID)
 }
 
 func conversationReplyFromReport(rep report.Report) string {
-	if rep.Payload != nil {
-		for _, key := range []string{"reply_markdown", "reply", "message"} {
-			if value, ok := rep.Payload[key].(string); ok && strings.TrimSpace(value) != "" {
-				return strings.TrimSpace(value)
-			}
-		}
+	if rep.Payload == nil {
+		return ""
 	}
-	return strings.TrimSpace(rep.Summary)
+	value, ok := rep.Payload["reply_markdown"].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
 }
 
 func conversationMessageEvent(projectID, conversationID string, message store.Message, typ string, actor event.Actor, summary string) event.Event {

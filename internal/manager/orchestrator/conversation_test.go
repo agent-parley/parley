@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/agent-parley/parley/internal/manager/store"
+	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/report"
@@ -52,8 +53,8 @@ func TestSubmitConversationMessageDispatchesFreshAgentTurnAndPersistsReply(t *te
 	if got := disp.Input["input_mode"]; got != contract.AdapterInputModeConversation {
 		t.Fatalf("input_mode = %v, want conversation", got)
 	}
-	if actions, ok := disp.Input["allowed_actions"].([]string); !ok || len(actions) != 0 {
-		t.Fatalf("allowed_actions = %#v, want empty allow-list", disp.Input["allowed_actions"])
+	if actions, ok := disp.Input["allowed_actions"].([]string); !ok || len(actions) != 1 || actions[0] != conversationActionCreateTask {
+		t.Fatalf("allowed_actions = %#v, want create-Task allow-list", disp.Input["allowed_actions"])
 	}
 	repository, ok := disp.Input["repository"].(map[string]any)
 	if !ok || repository["mode"] != "read_only" || repository["mount_path"] != "/project/repo" {
@@ -150,8 +151,8 @@ func TestConversationDispatchInputIncludesReadOnlyOrchestrationState(t *testing.
 	if err != nil {
 		t.Fatalf("conversationDispatchInput() error = %v", err)
 	}
-	if actions, ok := input["allowed_actions"].([]string); !ok || len(actions) != 0 {
-		t.Fatalf("allowed_actions = %#v, want empty allow-list", input["allowed_actions"])
+	if actions, ok := input["allowed_actions"].([]string); !ok || len(actions) != 1 || actions[0] != conversationActionCreateTask {
+		t.Fatalf("allowed_actions = %#v, want create-Task allow-list", input["allowed_actions"])
 	}
 	state, ok := input["orchestration_state"].(conversationOrchestrationState)
 	if !ok {
@@ -191,7 +192,7 @@ func TestConversationDispatchInputIncludesReadOnlyOrchestrationState(t *testing.
 	}
 }
 
-func TestConversationReadOrchestrationDoesNotCreateWorkOrEmitActions(t *testing.T) {
+func TestConversationReadOrchestrationNoActionReplyDoesNotCreateWork(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
 	if err != nil {
@@ -226,8 +227,8 @@ func TestConversationReadOrchestrationDoesNotCreateWorkOrEmitActions(t *testing.
 		t.Fatalf("SubmitConversationMessage() error = %v", err)
 	}
 	disp := receiveDispatch(t, runner.dispatches)
-	if actions, ok := disp.Input["allowed_actions"].([]string); !ok || len(actions) != 0 {
-		t.Fatalf("allowed_actions = %#v, want empty allow-list", disp.Input["allowed_actions"])
+	if actions, ok := disp.Input["allowed_actions"].([]string); !ok || len(actions) != 1 || actions[0] != conversationActionCreateTask {
+		t.Fatalf("allowed_actions = %#v, want create-Task allow-list", disp.Input["allowed_actions"])
 	}
 	if _, ok := disp.Input["orchestration_state"].(conversationOrchestrationState); !ok {
 		t.Fatalf("orchestration_state = %#v, want structured state", disp.Input["orchestration_state"])
@@ -253,13 +254,64 @@ func TestConversationReadOrchestrationDoesNotCreateWorkOrEmitActions(t *testing.
 	}
 }
 
-func TestConversationAgentActionsAreRejectedInTracerSlice(t *testing.T) {
+func TestValidateConversationActionsAcceptsCreateTask(t *testing.T) {
+	brief := sectionedConversationBrief()
+	action, err := validateConversationActions(map[string]any{
+		"reply_markdown": "Creating a task.",
+		"actions":        []any{map[string]any{"type": conversationActionCreateTask, "idea": brief}},
+	}, []string{conversationActionCreateTask})
+	if err != nil {
+		t.Fatalf("validateConversationActions() error = %v", err)
+	}
+	if action == nil || action.Type != conversationActionCreateTask || action.Idea != brief {
+		t.Fatalf("action = %#v, want create-Task with verbatim brief", action)
+	}
+
+	singular, err := validateConversationActions(map[string]any{
+		"action": map[string]any{"type": conversationActionCreateTask, "idea": brief},
+	}, []string{conversationActionCreateTask})
+	if err != nil {
+		t.Fatalf("validateConversationActions() singular error = %v", err)
+	}
+	if singular == nil || singular.Idea != brief {
+		t.Fatalf("singular action = %#v, want verbatim brief", singular)
+	}
+}
+
+func TestValidateConversationActionsRejectsNonAllowListedAndMalformed(t *testing.T) {
+	brief := sectionedConversationBrief()
+	allowed := []string{conversationActionCreateTask}
+	cases := []struct {
+		name    string
+		payload map[string]any
+	}{
+		{name: "unknown action", payload: map[string]any{"actions": []any{map[string]any{"type": "rerun-stage", "idea": brief}}}},
+		{name: "missing idea", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask}}}},
+		{name: "too many actions", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask, "idea": brief}, map[string]any{"type": conversationActionCreateTask, "idea": brief}}}},
+		{name: "unsupported field", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask, "idea": brief, "workflow_template_id": workflow.DirectCommitID}}}},
+		{name: "non-sectioned brief", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask, "idea": "Just build it."}}}},
+		{name: "malformed actions", payload: map[string]any{"actions": "create-Task"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if action, err := validateConversationActions(tc.payload, allowed); err == nil {
+				t.Fatalf("validateConversationActions() = %#v, nil err; want rejection", action)
+			}
+		})
+	}
+}
+
+func TestConversationCreateTaskActionCreatesDirectBalancedRunLinkedToConversation(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	runner := &conversationTestRunner{dispatches: make(chan contract.Dispatch, 1), reply: "", payload: map[string]any{"reply_markdown": "Creating a task.", "actions": []any{map[string]any{"type": "create-Task"}}}}
+	brief := sectionedConversationBrief()
+	runner := &conversationTestRunner{dispatches: make(chan contract.Dispatch, 1), payload: map[string]any{
+		"reply_markdown": "I have enough to create a gated Task.",
+		"actions":        []any{map[string]any{"type": conversationActionCreateTask, "idea": brief}},
+	}}
 	engine := newRecordingEngine(t, st, runner, EngineOptions{ConversationAdapter: "chat-agent"})
 	conversation, err := st.EnsureProjectConversation(ctx, store.DefaultProjectID)
 	if err != nil {
@@ -269,18 +321,84 @@ func TestConversationAgentActionsAreRejectedInTracerSlice(t *testing.T) {
 		t.Fatalf("SubmitConversationMessage() error = %v", err)
 	}
 	_ = receiveDispatch(t, runner.dispatches)
-	messages := waitForConversationMessages(t, st, conversation.ID, 2)
+	messages := waitForConversationMessages(t, st, conversation.ID, 3)
+	if messages[len(messages)-2].Body != "I have enough to create a gated Task." {
+		t.Fatalf("agent reply = %#v", messages[len(messages)-2])
+	}
 	last := messages[len(messages)-1]
-	if last.Role != store.MessageRoleAssistant || last.Body == "Creating a task." {
-		t.Fatalf("last message = %#v, want rejected action notice", last)
+	if last.Role != store.MessageRoleAssistant || !strings.Contains(last.Body, "awaiting `plan_review_human`") {
+		t.Fatalf("last message = %#v, want task-created plan-review note", last)
 	}
 	runs, err := st.ListRunsForProject(ctx, store.DefaultProjectID)
 	if err != nil {
 		t.Fatalf("list runs: %v", err)
 	}
-	if len(runs) != 0 {
-		t.Fatalf("runs = %#v, want no created run when action is present", runs)
+	if len(runs) != 1 {
+		t.Fatalf("runs = %#v, want one created run", runs)
 	}
+	waitForWorkflowStageAwaiting(t, st, runs[0].ID, "plan_review_human")
+	wr, err := st.GetWorkflowRun(ctx, runs[0].ID)
+	if err != nil {
+		t.Fatalf("get workflow run: %v", err)
+	}
+	if wr.Run.Idea != brief || wr.Task.Idea != brief {
+		t.Fatalf("idea = run:%q task:%q, want verbatim brief %q", wr.Run.Idea, wr.Task.Idea, brief)
+	}
+	if wr.Run.RefinementLevel != contract.RefinementLevelDirect || wr.Task.RefinementLevel != contract.RefinementLevelDirect {
+		t.Fatalf("refinement = run:%q task:%q, want direct", wr.Run.RefinementLevel, wr.Task.RefinementLevel)
+	}
+	if wr.Run.WorkflowTemplateID != workflow.BalancedPRDeliveryID {
+		t.Fatalf("workflow template = %q, want %q", wr.Run.WorkflowTemplateID, workflow.BalancedPRDeliveryID)
+	}
+	if wr.Task.ConversationID != conversation.ID {
+		t.Fatalf("task conversation_id = %q, want %q", wr.Task.ConversationID, conversation.ID)
+	}
+}
+
+func TestConversationRejectsInvalidActionAndCreatesNothing(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload map[string]any
+	}{
+		{name: "unknown", payload: map[string]any{"reply_markdown": "Creating a task.", "actions": []any{map[string]any{"type": "rerun-stage", "idea": sectionedConversationBrief()}}}},
+		{name: "malformed", payload: map[string]any{"reply_markdown": "Creating a task.", "actions": []any{map[string]any{"type": conversationActionCreateTask}}}},
+		{name: "non-sectioned", payload: map[string]any{"reply_markdown": "Creating a task.", "actions": []any{map[string]any{"type": conversationActionCreateTask, "idea": "Just build it."}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			st, err := store.Open(ctx, t.TempDir())
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			runner := &conversationTestRunner{dispatches: make(chan contract.Dispatch, 1), payload: tc.payload}
+			engine := newRecordingEngine(t, st, runner, EngineOptions{ConversationAdapter: "chat-agent"})
+			conversation, err := st.EnsureProjectConversation(ctx, store.DefaultProjectID)
+			if err != nil {
+				t.Fatalf("ensure conversation: %v", err)
+			}
+			if _, err := engine.SubmitConversationMessage(ctx, store.DefaultProjectID, "Start the work"); err != nil {
+				t.Fatalf("SubmitConversationMessage() error = %v", err)
+			}
+			_ = receiveDispatch(t, runner.dispatches)
+			messages := waitForConversationMessages(t, st, conversation.ID, 2)
+			last := messages[len(messages)-1]
+			if last.Role != store.MessageRoleAssistant || !strings.Contains(last.Body, "could not complete this turn") {
+				t.Fatalf("last message = %#v, want rejected action notice", last)
+			}
+			runs, err := st.ListRunsForProject(ctx, store.DefaultProjectID)
+			if err != nil {
+				t.Fatalf("list runs: %v", err)
+			}
+			if len(runs) != 0 {
+				t.Fatalf("runs = %#v, want no created run", runs)
+			}
+		})
+	}
+}
+
+func sectionedConversationBrief() string {
+	return "## Goal\nShip the conversation-created task path.\n\n## In scope\n- Validate a create-Task action.\n- Start a gated Task.\n\n## Out of scope\n- Direct commits from chat.\n\n## Key decisions\n- Use Direct refinement.\n- Use the Balanced plan-gated template.\n\n## Open assumptions\n- The human will approve the plan before code runs."
 }
 
 type conversationTestRunner struct {
