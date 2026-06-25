@@ -2,50 +2,55 @@
 
 > **Open-source, local-first harness that takes a software idea to a sandboxed, inspectable PR-ready stop.**
 
-[![Status](https://img.shields.io/badge/status-early%20design-orange.svg)](#status)
+[![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Namespace](https://img.shields.io/badge/namespace-agent--parley-blue.svg)](#name-and-namespace)
 
 Parley is a **control-plane harness**, not a coding agent. It owns run state, runner coordination, sandbox setup, artifacts, events, and delivery policy; agents are the workers it dispatches.
 
-The current repo contains a live-validated walking skeleton, not the full configurable workflow product. A manually submitted idea runs through a deterministic local path: implementation in an isolated worktree, containerized validation, a commit built from the worker snapshot, and a stop at a **PR-ready human handoff**. The end-to-end commit → PR-ready loop requires a diff-producing adapter (the **Pi** agent); the default `noop` adapter runs the path but makes no changes, so the run stops at the commit stage with *no changes to commit*. Parley does **not** push branches or open pull requests yet.
+The current build is a local-first **operator app**, not yet the full configurable workflow product. You drive it through a **chat-primary web UI**: a conversation can discuss a repository and, when you ask, author a scoped **Task** that the harness runs through a deterministic delivery loop — idea intake (with a refinement level), implementation in an isolated worktree, containerized validation, and a commit built from the worker snapshot — suspending at human review/approval gates and stopping at a **PR-ready handoff**. Repo-aware chat and real diffs require a diff-producing adapter, the **Pi** agent; the default `noop` adapter exercises the same paths but writes nothing (chat returns a placeholder reply, and a run reaches the commit stage with *no changes to commit*). Parley does **not** push branches or open pull requests yet, and executes one local runner slot at a time.
 
 > [!warning]
-> Parley is early. The walking skeleton runs, but the product surface and workflow model will keep changing. This README separates what works today from intended direction.
+> Parley is early/alpha. The operator app and delivery loop run, but the product surface and workflow model are still changing. This README separates what works today from intended direction.
 
 ## Status
 
-Walking skeleton status:
+What runs today:
 
-- **Built and live-validated:** Manager spawns and dials one Runner over a persistent WebSocket.
-- **Built and live-validated:** deterministic `idea → implementation → validation → commit → pr_ready` path.
-- **Built and live-validated:** rootless Podman sandbox provider, isolated git worktrees, SQLite + filesystem artifacts, durable events, and per-run JSONL logs.
-- **Built and live-validated:** one real agent family, **Pi**, behind the runner adapter interface.
-- **Built and live-validated:** embedded hypermedia web UI using Datastar + SSE, including run events, artifacts, cancellation, and runner-health/supervision surfaces.
-- **Built:** optional TOML project/global settings and a local auto-queue — `POST /runs` enqueues runs that auto-dispatch to free runner slots (approval gates preserved), with a backlog cap and crash/startup recovery. Capacity equals the number of local runner slots (currently one).
-- **Not yet built:** push/PR creation. The workflow stops at PR-ready metadata for a human/operator.
-- **Not yet built:** auto-pickup, issue polling, agent profiles, workflow templates, project memory, semantic review verdicts, or human-stage parity.
+- **Built, live-validated:** the core control plane — Manager spawns and dials one Runner over a persistent WebSocket; deterministic `idea → implementation → validation → commit → pr_ready` delivery loop; rootless Podman sandbox provider; isolated git worktrees; SQLite + filesystem artifacts; durable events; per-run JSONL logs; one real agent family, **Pi**, behind the runner adapter interface.
+- **Built:** chat-primary **operator UI** (embedded hypermedia, Datastar + SSE) with three surfaces — **Chat** (a conversation is a first-class entity), **Run story** (stage/event progress, artifacts, diffs, cancellation, runner health), and **Settings**. A conversation can author an allow-listed **Task** (`create-Task`) that the harness runs, stopping at human plan review.
+- **Built:** **idea-intake refinement levels** — `direct` (deterministic) and `standard` (single-shot plan). Legacy `deep` values degrade to `standard`.
+- **Built:** **human review/approval stages** that suspend a run to durable state (`awaiting_human`) and resume on a verdict (pass / changes-requested / blocked).
+- **Built:** in-app notifications **and** external notification sinks (gotify + signed webhook); a centralized **secrets-at-rest facility** (envelope encryption, XChaCha20-Poly1305, pluggable key provider, fail-closed); optional TOML settings and a local auto-queue — `POST /runs` enqueues runs that auto-dispatch to free slots (approval gates preserved), with a backlog cap and crash/startup recovery.
+- **Not yet built:** push/PR creation (stops at PR-ready metadata); concurrent multi-runner execution (single local slot — one run at a time, the rest queue); editable workflow templates; agent profiles; project memory; semantic review verdicts; auto-pickup / issue polling; non-Pi agents and non-Podman substrates.
 - **No published release yet.** Expect sharp edges.
 
-The skeleton runs a single local runner slot, so one run executes at a time; additional submitted runs are queued and auto-dispatched as the slot frees. There is no external scheduler or issue auto-pickup yet.
+There is a single local runner slot, so one run executes at a time; additional submitted runs are queued and auto-dispatched as the slot frees. There is no external scheduler or issue auto-pickup yet.
 
 ## What works today
 
-The current deterministic path is:
+There are two ways to drive Parley:
+
+1. **Chat** — open a project and talk to its conversation. The conversational agent can discuss the repository and, when you ask, emit an allow-listed `create-Task` action; the harness then runs that Task through the delivery loop, suspending at human plan review. (Repo-aware replies need the Pi adapter; with `noop` the agent returns a placeholder.)
+2. **Direct run submission** — `POST /runs` (or the UI) enqueues an idea with a refinement level and dispatches it to the runner slot.
+
+Either way, the deterministic delivery loop is:
 
 ```text
-Idea intake         (manager creates the run and task contract)
+Idea intake         (manager creates the run and task contract; refinement: direct | standard)
   → Implementation  (Pi adapter in an isolated worktree; noop adapter by default)
   → Validation      (containerized validation command; status gate only)
   → Commit          (commit made from the post-implementation worker snapshot)
   → PR-ready stop   (branch/commit/diff metadata; no forge push, no PR)
 ```
 
+Human review/approval stages can **suspend** the run to durable state (`awaiting_human`) and resume on a verdict.
+
 The full commit → PR-ready loop requires an adapter that produces changes (the Pi agent). With the default `noop` adapter the implementation step writes nothing, so the run reaches the commit stage and stops there with *no changes to commit*.
 
-Routing is based on structured `status` values only. There is no resident coordinator LLM, semantic verdict engine, review stage, configurable fix loop, or human approval stage in the skeleton.
+Delivery **routing** is deterministic on structured `status` values only — the conversational agent plans and authors Tasks but does not alter that routing. There is no semantic verdict engine, configurable fix loop, or editable workflow template yet.
 
-The web UI lets you submit a run, watch stage/event progress over SSE, inspect artifacts and diffs, cancel a run, and see runner health. Runs and artifacts are persisted under `.parley-data` by default.
+The web UI lets you hold a conversation, submit and watch runs (stage/event progress over SSE), inspect artifacts and diffs, act on human-review gates, cancel a run, manage notifications and settings, and see runner health. Runs, conversations, and artifacts are persisted under `.parley-data` by default.
 
 Submitted runs are enqueued and auto-dispatched to the local runner slot as it frees; the UI shows queue depth and the effective policy. Optional TOML settings (`.parley/config.toml`) select defaults such as the queue policy (`auto_when_ready`, `max_concurrent`, `backlog_cap`); settings change which defaults apply, never the deterministic routing.
 
@@ -54,9 +59,10 @@ Submitted runs are enqueued and auto-dispatched to the local runner slot as it f
 The long-term product direction is still a configurable workflow harness:
 
 - editable workflow templates and run snapshots
-- agent-or-human stages for planning, implementation, review, validation, commit, PR creation, and memory update
+- richer agent-or-human stage configuration across the workflow (planning, review, validation, commit, PR creation, memory update)
 - semantic review verdicts and fix loops
 - configurable delivery policy, including real push/PR creation
+- concurrent multi-runner execution beyond the single local slot
 - agent profiles, context packets, auto-pickup, and curated memory
 - additional agent families and sandbox substrates beyond Pi/rootless Podman
 
@@ -84,7 +90,7 @@ Prerequisites:
 
 - Go 1.26 (see `go.mod`)
 - `make`
-- rootless Podman (required for submitted-run validation and the live test targets)
+- rootless Podman — required for the sandboxed run pipeline (validation), the Pi agent, and the live test targets. The web UI and **chat with the default `noop` adapter run without Podman** (useful for demoing the operator surface); the full delivery loop and repo-aware Pi replies need it.
 
 Build both binaries:
 
@@ -129,7 +135,7 @@ The live targets are guarded and require the Podman images, Pi auth volume/path,
 
 - not a claim that multiple agents always beat a single agent
 - not a replacement for engineering judgment
-- not a generic chatbot UI
+- not a generic chatbot — chat authors scoped specs that execute under review, it is not free-form conversation for its own sake
 - not a black-box "fully autonomous engineer"
 - not a hosted cloud service
 - not currently a tool that pushes branches or opens pull requests for you
@@ -144,7 +150,7 @@ The product is **Parley**; the project uses **`agent-parley`** for URLs and pack
 
 ## Contributing
 
-Parley is early and welcomes focused contributions to the current skeleton and its next layers: workflow depth, sandbox safety, event/artifact contracts, runner adapters, web UI, and PR-ready delivery. Open an issue or design note before a large PR.
+Parley is early and welcomes focused contributions to the current build and its next layers: workflow depth, sandbox safety, event/artifact contracts, runner adapters, web UI, and PR-ready delivery. Open an issue or design note before a large PR.
 
 ## License
 
