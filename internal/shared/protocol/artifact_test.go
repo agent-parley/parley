@@ -49,6 +49,7 @@ func TestSendArtifactWritesBinaryFrameContent(t *testing.T) {
 			serverDone <- err
 			return
 		}
+		defer conn.CloseNow()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		typ, data, err := conn.Read(ctx)
