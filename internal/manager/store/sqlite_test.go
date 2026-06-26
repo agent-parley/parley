@@ -857,3 +857,389 @@ func TestUpdateRunStatusFromAndAppendSystemEventIsAtomic(t *testing.T) {
 		t.Fatalf("system events = %#v, want exactly one queue.dispatched", page.Events)
 	}
 }
+
+func TestProjectRepositoryTaskAndRunInputErrorPaths(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	if dataDir := st.DataDir(); dataDir == "" {
+		t.Fatal("DataDir() returned empty path")
+	}
+	if _, err := st.GetProject(ctx, "missing_project"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetProject missing error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := st.GetRepository(ctx, "missing_repo"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetRepository missing error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := st.GetConversation(ctx, "missing_conversation"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetConversation missing error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := st.GetTask(ctx, "missing_task"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetTask missing error = %v, want sql.ErrNoRows", err)
+	}
+
+	custom, err := st.EnsureProject(ctx, ProjectSpec{ID: "project_b", Name: "Project B", RepositoryPath: filepath.Join(t.TempDir(), "repo-b")})
+	if err != nil {
+		t.Fatalf("ensure custom project: %v", err)
+	}
+	repoID, err := st.DefaultRepositoryID(ctx, custom.ID)
+	if err != nil {
+		t.Fatalf("default repository id: %v", err)
+	}
+	if repoID != defaultRepositoryID(custom.ID) {
+		t.Fatalf("default repo id = %q, want %q", repoID, defaultRepositoryID(custom.ID))
+	}
+	repo, err := st.GetRepository(ctx, repoID)
+	if err != nil {
+		t.Fatalf("get repository: %v", err)
+	}
+	if repo.ProjectID != custom.ID || !repo.IsDefault {
+		t.Fatalf("repository = %+v, want default for project %s", repo, custom.ID)
+	}
+	projects, err := st.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("list projects: %v", err)
+	}
+	if !containsProject(projects, DefaultProjectID) || !containsProject(projects, custom.ID) {
+		t.Fatalf("projects = %+v, want default and custom", projects)
+	}
+	conversation, err := st.CreateConversation(ctx, custom.ID, "custom chat")
+	if err != nil {
+		t.Fatalf("create custom conversation: %v", err)
+	}
+	conversations, err := st.ListConversationsForProject(ctx, custom.ID)
+	if err != nil {
+		t.Fatalf("list conversations: %v", err)
+	}
+	if len(conversations) != 1 || conversations[0].ID != conversation.ID {
+		t.Fatalf("conversations = %+v, want %s", conversations, conversation.ID)
+	}
+
+	if _, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "   "}); err == nil || !strings.Contains(err.Error(), "idea is required") {
+		t.Fatalf("empty idea error = %v, want required error", err)
+	}
+	if _, err := st.CreateWorkflowRunForProjectInput(ctx, "missing_project", contract.TaskInput{Idea: "build"}); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing project error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "build", WorkflowTemplateID: "missing_template"}); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing template error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "build", ConversationID: conversation.ID}); err == nil || !strings.Contains(err.Error(), "does not belong") {
+		t.Fatalf("mismatched conversation error = %v, want ownership error", err)
+	}
+}
+
+func TestRunAttemptListsStatusesAndWorkflowSnapshots(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	wr, err := st.CreateWorkflowRun(ctx, "exercise run helpers")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	attempt, stages, err := st.CreateAttemptForRun(ctx, wr.Run.ID, workflow.DefaultTemplate())
+	if err != nil {
+		t.Fatalf("create attempt: %v", err)
+	}
+	if attempt.RunID != wr.Run.ID || len(stages) != len(workflow.DefaultTemplate().Stages) {
+		t.Fatalf("attempt=%+v stages=%d, want run %s default stages", attempt, len(stages), wr.Run.ID)
+	}
+	count, err := st.CountAttemptsForRun(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("count attempts: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("attempt count = %d, want 2", count)
+	}
+	if err := st.UpdateAttemptStatus(ctx, attempt.ID, RunStatusRunning); err != nil {
+		t.Fatalf("update attempt status: %v", err)
+	}
+	if err := st.UpdateStageStatus(ctx, stages[0].ID, StageStatusRunning); err != nil {
+		t.Fatalf("update stage status: %v", err)
+	}
+	if err := st.UpdateStageAdapter(ctx, stages[0].ID, "test-adapter"); err != nil {
+		t.Fatalf("update stage adapter: %v", err)
+	}
+	loadedStages, err := st.ListStagesForAttempt(ctx, wr.Run.ID, attempt.ID)
+	if err != nil {
+		t.Fatalf("list stages for attempt: %v", err)
+	}
+	if len(loadedStages) == 0 || loadedStages[0].Status != StageStatusRunning || loadedStages[0].Adapter != "test-adapter" {
+		t.Fatalf("updated stages = %+v, want first running on test-adapter", loadedStages)
+	}
+
+	runs, err := st.ListRuns(ctx)
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	if len(runs) != 1 || runs[0].ID != wr.Run.ID {
+		t.Fatalf("runs = %+v, want %s", runs, wr.Run.ID)
+	}
+	projectRuns, err := st.ListRunsForProject(ctx, wr.Project.ID)
+	if err != nil {
+		t.Fatalf("list project runs: %v", err)
+	}
+	if len(projectRuns) != 1 || projectRuns[0].ProjectID != wr.Project.ID {
+		t.Fatalf("project runs = %+v, want project %s", projectRuns, wr.Project.ID)
+	}
+	pendingRuns, err := st.ListRunsByStatus(ctx, RunStatusPending, 1)
+	if err != nil {
+		t.Fatalf("list pending runs: %v", err)
+	}
+	if len(pendingRuns) != 1 || pendingRuns[0].ID != wr.Run.ID {
+		t.Fatalf("pending runs = %+v, want %s", pendingRuns, wr.Run.ID)
+	}
+	projectPendingRuns, err := st.ListRunsByProjectStatus(ctx, wr.Project.ID, RunStatusPending, 0)
+	if err != nil {
+		t.Fatalf("list project pending runs: %v", err)
+	}
+	if len(projectPendingRuns) != 1 || projectPendingRuns[0].ID != wr.Run.ID {
+		t.Fatalf("project pending runs = %+v, want %s", projectPendingRuns, wr.Run.ID)
+	}
+	pendingCount, err := st.CountRunsByStatus(ctx, RunStatusPending)
+	if err != nil {
+		t.Fatalf("count pending runs: %v", err)
+	}
+	projectPendingCount, err := st.CountRunsByProjectStatus(ctx, wr.Project.ID, RunStatusPending)
+	if err != nil {
+		t.Fatalf("count project pending runs: %v", err)
+	}
+	if pendingCount != 1 || projectPendingCount != 1 {
+		t.Fatalf("pending counts = %d/%d, want 1/1", pendingCount, projectPendingCount)
+	}
+
+	changed, err := st.UpdateRunStatusFrom(ctx, wr.Run.ID, RunStatusPending, RunStatusRunning)
+	if err != nil {
+		t.Fatalf("update run status from: %v", err)
+	}
+	if !changed {
+		t.Fatal("pending->running transition did not change run")
+	}
+	changed, err = st.UpdateRunStatusFrom(ctx, wr.Run.ID, RunStatusPending, RunStatusCompleted)
+	if err != nil {
+		t.Fatalf("stale update run status from: %v", err)
+	}
+	if changed {
+		t.Fatal("stale pending transition unexpectedly changed run")
+	}
+	changed, err = st.UpdateRunStatusIfOpen(ctx, wr.Run.ID, RunStatusCompleted)
+	if err != nil {
+		t.Fatalf("update run status if open: %v", err)
+	}
+	if !changed {
+		t.Fatal("open running run did not transition to completed")
+	}
+	changed, err = st.UpdateRunStatusIfOpen(ctx, wr.Run.ID, RunStatusFailed)
+	if err != nil {
+		t.Fatalf("update terminal run status if open: %v", err)
+	}
+	if changed {
+		t.Fatal("terminal run transitioned despite UpdateRunStatusIfOpen")
+	}
+	if !RunStatusIsTerminal(RunStatusCompleted) || RunStatusIsTerminal(RunStatusRunning) {
+		t.Fatal("RunStatusIsTerminal returned unexpected values")
+	}
+
+	template := workflow.DefaultTemplate()
+	if err := st.SaveWorkflowSnapshot(ctx, wr.Run.ID, map[string]any{"workflow_template_snapshot": template, "source": "unit"}); err != nil {
+		t.Fatalf("save workflow snapshot: %v", err)
+	}
+	snapshot, err := st.LatestWorkflowSnapshot(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("latest workflow snapshot: %v", err)
+	}
+	if snapshot["source"] != "unit" {
+		t.Fatalf("snapshot = %+v, want source=unit", snapshot)
+	}
+	loadedTemplate, err := st.LatestWorkflowTemplateSnapshot(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("latest workflow template snapshot: %v", err)
+	}
+	if loadedTemplate.ID != template.ID || len(loadedTemplate.Stages) != len(template.Stages) {
+		t.Fatalf("loaded template = %+v, want default template", loadedTemplate)
+	}
+	if err := st.SaveWorkflowSnapshot(ctx, wr.Run.ID, map[string]any{"source": "missing template"}); err != nil {
+		t.Fatalf("save snapshot without template: %v", err)
+	}
+	if _, err := st.LatestWorkflowTemplateSnapshot(ctx, wr.Run.ID); err == nil || !strings.Contains(err.Error(), "missing workflow_template_snapshot") {
+		t.Fatalf("missing template snapshot error = %v, want missing field error", err)
+	}
+	if err := st.SaveWorkflowSnapshot(ctx, "missing_run", map[string]any{}); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("save snapshot for missing run error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := st.LatestWorkflowSnapshot(ctx, "missing_run"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("latest missing snapshot error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestRunnerRegistryCRUD(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	if _, err := st.GetRunner(ctx, "missing_runner"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing runner error = %v, want sql.ErrNoRows", err)
+	}
+	if err := st.UpsertRunnerWithOrigin(ctx, "runner_spawned", RunnerStatusConnected, RunnerOriginSpawned, map[string]any{"adapters": []string{"noop"}}); err != nil {
+		t.Fatalf("upsert spawned runner: %v", err)
+	}
+	spawned, err := st.GetRunner(ctx, "runner_spawned")
+	if err != nil {
+		t.Fatalf("get spawned runner: %v", err)
+	}
+	if spawned.Status != RunnerStatusConnected || spawned.Origin != RunnerOriginSpawned || !strings.Contains(spawned.CapabilitiesJSON, "noop") || spawned.MissedHeartbeats != 0 {
+		t.Fatalf("spawned runner = %+v, want connected spawned noop runner", spawned)
+	}
+	if err := st.UpdateRunnerHealth(ctx, spawned.ID, RunnerStatusSuspect, 2); err != nil {
+		t.Fatalf("update runner health: %v", err)
+	}
+	spawned, err = st.GetRunner(ctx, spawned.ID)
+	if err != nil {
+		t.Fatalf("get updated runner: %v", err)
+	}
+	if spawned.Status != RunnerStatusSuspect || spawned.MissedHeartbeats != 2 {
+		t.Fatalf("updated runner = %+v, want suspect with two missed heartbeats", spawned)
+	}
+	if err := st.UpsertRunner(ctx, "runner_registered", RunnerStatusConnected, map[string]any{"adapters": []string{"pi"}}); err != nil {
+		t.Fatalf("upsert registered runner: %v", err)
+	}
+	if err := st.UpsertRunner(ctx, spawned.ID, RunnerStatusConnected, map[string]any{"adapters": []string{"noop", "pi"}}); err != nil {
+		t.Fatalf("upsert existing runner: %v", err)
+	}
+	spawned, err = st.GetRunner(ctx, spawned.ID)
+	if err != nil {
+		t.Fatalf("get reconnected runner: %v", err)
+	}
+	if spawned.Origin != RunnerOriginRegistered || spawned.MissedHeartbeats != 0 || !strings.Contains(spawned.CapabilitiesJSON, "pi") {
+		t.Fatalf("reconnected runner = %+v, want registered origin, reset heartbeat, pi capability", spawned)
+	}
+	runners, err := st.ListRunners(ctx)
+	if err != nil {
+		t.Fatalf("list runners: %v", err)
+	}
+	if len(runners) != 2 || !containsRunner(runners, "runner_spawned") || !containsRunner(runners, "runner_registered") {
+		t.Fatalf("runners = %+v, want both runner ids", runners)
+	}
+}
+
+func TestNotificationSinkCRUDValidationAndClassFiltering(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	table, column, rowID := NotificationSinkSecretAD(" sink_1 ")
+	if table != notificationSinksTable || column != "secret_ciphertext" || rowID != "sink_1" {
+		t.Fatalf("NotificationSinkSecretAD = %q/%q/%q", table, column, rowID)
+	}
+	invalidInputs := []NotificationSinkInput{
+		{Type: "", SecretCiphertext: []byte("secret")},
+		{Type: NotificationSinkTypeGotify, SecretCiphertext: []byte("secret")},
+		{Type: NotificationSinkTypeWebhook, SecretCiphertext: []byte("secret")},
+		{Type: NotificationSinkTypeWebhook, URL: "https://example.test/hook", HTTPMethod: "DELETE", SecretCiphertext: []byte("secret")},
+		{Type: NotificationSinkTypeGotify, BaseURL: "https://gotify.example", SecretCiphertext: nil},
+	}
+	for _, input := range invalidInputs {
+		if _, err := st.InsertNotificationSink(ctx, input); err == nil {
+			t.Fatalf("InsertNotificationSink(%+v) succeeded, want validation error", input)
+		}
+	}
+
+	gotify, err := st.InsertNotificationSink(ctx, NotificationSinkInput{ID: " gotify_main ", Type: "GOTIFY", Enabled: true, BaseURL: " https://gotify.example ", Priority: 0, SecretCiphertext: []byte("old-secret"), SendNeedsYou: true, SendFinished: false})
+	if err != nil {
+		t.Fatalf("insert gotify sink: %v", err)
+	}
+	if gotify.ID != "gotify_main" || gotify.Type != NotificationSinkTypeGotify || gotify.Priority != 5 || gotify.BaseURL != "https://gotify.example" || gotify.SendFinished {
+		t.Fatalf("gotify sink = %+v, want normalized gotify defaults", gotify)
+	}
+	webhook, err := st.InsertNotificationSink(ctx, NotificationSinkInput{ID: "webhook_main", Type: NotificationSinkTypeWebhook, Enabled: true, URL: "https://example.test/hook", HTTPMethod: "patch", Priority: 7, SecretCiphertext: []byte("webhook-secret"), SendNeedsYou: false, SendFinished: true})
+	if err != nil {
+		t.Fatalf("insert webhook sink: %v", err)
+	}
+	all, err := st.ListNotificationSinks(ctx)
+	if err != nil {
+		t.Fatalf("list notification sinks: %v", err)
+	}
+	if len(all) != 2 || all[0].ID != gotify.ID || all[1].ID != webhook.ID {
+		t.Fatalf("notification sinks = %+v, want insertion order", all)
+	}
+	needsYou, err := st.ListEnabledNotificationSinksForClass(ctx, NotificationClassNeedsYou)
+	if err != nil {
+		t.Fatalf("list needs-you sinks: %v", err)
+	}
+	if len(needsYou) != 1 || needsYou[0].ID != gotify.ID {
+		t.Fatalf("needs-you sinks = %+v, want gotify only", needsYou)
+	}
+	finished, err := st.ListEnabledNotificationSinksForClass(ctx, NotificationClassFinished)
+	if err != nil {
+		t.Fatalf("list finished sinks: %v", err)
+	}
+	if len(finished) != 1 || finished[0].ID != webhook.ID {
+		t.Fatalf("finished sinks = %+v, want webhook only", finished)
+	}
+	unknown, err := st.ListEnabledNotificationSinksForClass(ctx, "unknown")
+	if err != nil {
+		t.Fatalf("list unknown class sinks: %v", err)
+	}
+	if len(unknown) != 0 {
+		t.Fatalf("unknown class sinks = %+v, want none", unknown)
+	}
+
+	updated, err := st.UpdateNotificationSink(ctx, gotify.ID, NotificationSinkUpdate{Enabled: false, BaseURL: "https://gotify2.example", Priority: 9, AllowInsecureHTTP: true, SendNeedsYou: false, SendFinished: true})
+	if err != nil {
+		t.Fatalf("update gotify sink: %v", err)
+	}
+	if updated.Enabled || updated.BaseURL != "https://gotify2.example" || updated.Priority != 9 || !updated.AllowInsecureHTTP || string(updated.SecretCiphertext) != "old-secret" {
+		t.Fatalf("updated sink = %+v, want disabled gotify with preserved secret", updated)
+	}
+	updated, err = st.UpdateNotificationSink(ctx, updated.ID, NotificationSinkUpdate{Enabled: true, BaseURL: "https://gotify3.example", Priority: 3, SendNeedsYou: true, SendFinished: true, ReplaceSecret: true, SecretCiphertext: []byte("new-secret")})
+	if err != nil {
+		t.Fatalf("replace gotify secret: %v", err)
+	}
+	if string(updated.SecretCiphertext) != "new-secret" || !updated.Enabled {
+		t.Fatalf("updated secret sink = %+v, want replaced secret and enabled", updated)
+	}
+	if _, err := st.UpdateNotificationSink(ctx, updated.ID, NotificationSinkUpdate{Enabled: true, BaseURL: "", ReplaceSecret: true, SecretCiphertext: []byte("secret")}); err == nil {
+		t.Fatal("update sink accepted missing gotify base URL")
+	}
+	if err := st.DeleteNotificationSink(ctx, webhook.ID); err != nil {
+		t.Fatalf("delete webhook sink: %v", err)
+	}
+	if _, err := st.GetNotificationSink(ctx, webhook.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted sink error = %v, want sql.ErrNoRows", err)
+	}
+	if err := st.DeleteNotificationSink(ctx, webhook.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("delete missing sink error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func containsProject(projects []Project, id string) bool {
+	for _, project := range projects {
+		if project.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func containsRunner(runners []Runner, id string) bool {
+	for _, runner := range runners {
+		if runner.ID == id {
+			return true
+		}
+	}
+	return false
+}
