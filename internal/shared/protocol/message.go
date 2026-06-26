@@ -242,8 +242,9 @@ func (s *Session) send(ctx context.Context, msg Message, binary []byte, hasBinar
 }
 
 func (s *Session) Close(status websocket.StatusCode, reason string) error {
-	s.close()
-	return s.conn.Close(status, reason)
+	return s.closeWith(func() error {
+		return s.conn.Close(status, reason)
+	})
 }
 
 func (s *Session) Done() <-chan struct{} {
@@ -375,8 +376,13 @@ func (s *Session) dispatch(ctx context.Context, msg Message) error {
 }
 
 func (s *Session) close() {
+	_ = s.closeWith(s.conn.CloseNow)
+}
+
+func (s *Session) closeWith(closeConn func() error) (err error) {
 	s.once.Do(func() {
 		close(s.done)
-		_ = s.conn.Close(websocket.StatusNormalClosure, "session closed")
+		err = closeConn()
 	})
+	return err
 }
