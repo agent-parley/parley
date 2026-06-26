@@ -1,0 +1,22 @@
+# Core package coverage floors for the CI gate.
+#
+# Format: <module-relative-package-path> <minimum-statement-coverage-percent>
+#
+# These floors intentionally ratchet below the 2026-06-26 baseline by roughly
+# five percentage points. Keep this allowlist limited to core packages.
+#
+# Not gated here: cmd/parley, cmd/parley-runner, internal/manager, and the
+# boundary packages internal/manager/{store,runnerclient,http} plus
+# internal/runner/session. Boundary coverage is tracked separately by #131.
+internal/manager/orchestrator 70
+internal/manager/workflow 80
+internal/runner/provider 75
+internal/runner/adapter 70
+internal/runner 70
+internal/manager/secrets 68
+internal/manager/settings 70
+internal/manager/contextpack 70
+internal/manager/agentregistry 75
+internal/shared/ids 90
+internal/shared/report 75
+internal/manager/notify 70
