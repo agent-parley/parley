@@ -395,7 +395,6 @@ func TestConversationReadOrchestrationNoActionReplyDoesNotCreateWork(t *testing.
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
 	repoPath := t.TempDir()
 	project, err := st.EnsureProject(ctx, store.ProjectSpec{ID: store.DefaultProjectID, Name: "Default project", RepositoryPath: repoPath})
 	if err != nil {
@@ -419,6 +418,7 @@ func TestConversationReadOrchestrationNoActionReplyDoesNotCreateWork(t *testing.
 	}
 	runner := &conversationTestRunner{dispatches: make(chan contract.Dispatch, 1), reply: "Run `" + wr.Run.ID + "` is visible from orchestration state."}
 	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{ConversationAdapter: "chat-agent"})
+	registerEngineTeardown(t, engine, st)
 
 	if _, err := engine.SubmitConversationMessage(ctx, project.ID, "How did the last run go?"); err != nil {
 		t.Fatalf("SubmitConversationMessage() error = %v", err)
