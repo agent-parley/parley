@@ -7,7 +7,13 @@ ARG DEBIAN_SNAPSHOT=20260601T000000Z
 # the HTTPS snapshot archive below can be TLS-verified. node:22-slim ships
 # without ca-certificates, so rewriting to https://snapshot.debian.org before
 # installing them is a chicken-and-egg that fails the TLS handshake.
+#
+# Disable apt's download sandbox: under rootless Podman the _apt sandbox user
+# resolves to uid/gid 65534 (nobody/nogroup), which falls outside the userns id
+# map, so apt's methods die with "setgroups 65534: Invalid argument". Running
+# the methods as inner root is safe in this unprivileged, ephemeral build.
 RUN set -eu; \
+    printf 'APT::Sandbox::User "root";\n' > /etc/apt/apt.conf.d/00no-sandbox; \
     apt-get update -qq; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
       ca-certificates; \
