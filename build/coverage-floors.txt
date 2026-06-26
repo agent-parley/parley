@@ -6,8 +6,8 @@
 # five percentage points. Keep this allowlist limited to core packages.
 #
 # Not gated here: cmd/parley, cmd/parley-runner, internal/manager, and the
-# boundary packages internal/manager/{store,runnerclient,http} plus
-# internal/runner/session. Boundary coverage is tracked separately by #131.
+# boundary package internal/manager/http. Thin HTTP boundary coverage remains
+# tracked outside this core gate.
 internal/manager/orchestrator 70
 internal/manager/workflow 80
 internal/runner/provider 75
@@ -20,3 +20,6 @@ internal/manager/agentregistry 75
 internal/shared/ids 90
 internal/shared/report 75
 internal/manager/notify 70
+internal/manager/store 70
+internal/manager/runnerclient 58
+internal/runner/session 88
