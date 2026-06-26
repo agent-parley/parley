@@ -52,7 +52,7 @@ Delivery **routing** is deterministic on structured `status` values only — the
 
 The web UI lets you hold a conversation, submit and watch runs (stage/event progress over SSE), inspect artifacts and diffs, act on human-review gates, cancel a run, manage notifications and settings, and see runner health. Runs, conversations, and artifacts are persisted under `.parley-data` by default.
 
-Submitted runs are enqueued and auto-dispatched to the local runner slot as it frees; the UI shows queue depth and the effective policy. Optional TOML settings (`.parley/config.toml`) select defaults such as the queue policy (`auto_when_ready`, `max_concurrent`, `backlog_cap`); settings change which defaults apply, never the deterministic routing.
+Submitted runs are enqueued and auto-dispatched to the local runner slot as it frees; the UI shows queue depth and the effective policy. Conversation turns use a separate bounded budget (`[conversation] budget`, default `1`) and an idle warm-session TTL (`idle_warm_hold_ttl`, default `"15m"`). Optional TOML settings (`.parley/config.toml`) select defaults such as the queue policy (`auto_when_ready`, `max_concurrent`, `backlog_cap`) and conversation lifecycle; settings change which defaults apply, never the deterministic routing.
 
 ## Intended direction
 

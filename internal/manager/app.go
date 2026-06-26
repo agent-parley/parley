@@ -127,6 +127,8 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		ProjectID:             project.ID,
 		QueuePolicy:           &queuePolicy,
 		RunnerSlots:           1,
+		ConversationBudget:    cfg.Settings.Conversation.Budget,
+		ConversationIdleTTL:   cfg.Settings.Conversation.IdleWarmHoldTTL,
 		NotificationSinks:     []orchestrator.NotificationSink{notificationSink, externalNotificationSink},
 	})
 	app := &App{
@@ -414,6 +416,14 @@ func (p *runnerProxy) CancelAttempt(ctx context.Context, runID, taskID, attemptI
 		return err
 	}
 	return client.CancelAttempt(ctx, runID, taskID, attemptID)
+}
+
+func (p *runnerProxy) EvictWarmSession(ctx context.Context, warmSessionKey string) error {
+	client, err := p.waitClient(ctx)
+	if err != nil {
+		return err
+	}
+	return client.EvictWarmSession(ctx, warmSessionKey)
 }
 
 func (p *runnerProxy) Close(ctx context.Context) error {

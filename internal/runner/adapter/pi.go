@@ -291,6 +291,9 @@ func (a Pi) Prepare(ctx context.Context, disp contract.Dispatch) (PiPreparedRun,
 	}
 
 	runStateDir := filepath.Join(a.opts.AgentStateRoot, "runs", disp.RunID, disp.TaskID, effectiveAttemptID)
+	if isConversationDispatch(disp) && disp.WarmSessionKey != "" {
+		runStateDir = a.conversationWarmStateDir(disp.WarmSessionKey)
+	}
 	agentDir := filepath.Join(runStateDir, "agent")
 	if err := os.MkdirAll(agentDir, 0o700); err != nil {
 		return PiPreparedRun{}, fmt.Errorf("create pi agent dir: %w", err)
@@ -392,6 +395,21 @@ func (a Pi) workspaceRoot(projectID string) string {
 		return a.opts.WorkspaceRoot
 	}
 	return filepath.Join(a.opts.DataRoot, "projects", projectID, "workspace")
+}
+
+func (a Pi) conversationWarmStateDir(warmSessionKey string) string {
+	segment := sanitizePathSegment(warmSessionKey)
+	if segment == "" {
+		segment = "conversation"
+	}
+	return filepath.Join(a.opts.AgentStateRoot, "warm-conversations", segment)
+}
+
+func (a Pi) EvictWarmSession(_ context.Context, warmSessionKey string) error {
+	if strings.TrimSpace(warmSessionKey) == "" || a.opts.AgentStateRoot == "" {
+		return nil
+	}
+	return os.RemoveAll(a.conversationWarmStateDir(warmSessionKey))
 }
 
 func (a Pi) createConversationRepoSnapshot(ctx context.Context, projectID string) (string, *os.File, error) {
@@ -920,7 +938,7 @@ func workerInputMarkdown(disp contract.Dispatch, reportPath string) string {
 
 func appendConversationWorkerContract(b *strings.Builder, disp contract.Dispatch, reportPath string) {
 	b.WriteString("## Conversational Planning Agent Contract\n\n")
-	b.WriteString("You are Parley's Conversational Planning Agent for Chat. This is one fresh per-message turn; there is no resident session. Rehydrate from the persisted Message history below, answer the latest user message, then stop.\n\n")
+	b.WriteString("You are Parley's Conversational Planning Agent for Chat. Act only for this dispatched user message; any warm runtime state is a dormant cache, not authority to act between turns. Rehydrate from the persisted Message history plus any notes you wrote under `/project/workspace`, answer the latest user message, then stop.\n\n")
 	b.WriteString("### Authority boundary\n\n")
 	b.WriteString("- You may answer repo/project questions and discuss designs.\n")
 	b.WriteString("- You do not call the engine, mutate run state, or create Tasks directly. The harness may execute only the allow-listed action envelope you return.\n")

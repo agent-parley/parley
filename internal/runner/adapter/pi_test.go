@@ -255,7 +255,7 @@ func TestPiPrepareConversationUsesReadOnlyCommittedSnapshotAndWorkspace(t *testi
 		t.Fatalf("orchestration-state.md missing run evidence:\n%s", stateMarkdown)
 	}
 	workerInput := readTestFile(t, prepared.WorkerInputPath)
-	for _, want := range []string{"Conversational Planning Agent", "no resident session", "Repository tools: read, list, grep", "Orchestration state", "orchestration-state.md", "review rejected stale cache handling", "payload.reply_markdown", "Allowed actions", "create-Task", "plan-gated Balanced template", "Open assumptions"} {
+	for _, want := range []string{"Conversational Planning Agent", "dormant cache", "Repository tools: read, list, grep", "Orchestration state", "orchestration-state.md", "review rejected stale cache handling", "payload.reply_markdown", "Allowed actions", "create-Task", "plan-gated Balanced template", "Open assumptions"} {
 		if !strings.Contains(workerInput, want) {
 			t.Fatalf("conversation worker input missing %q:\n%s", want, workerInput)
 		}

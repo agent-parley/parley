@@ -307,6 +307,13 @@ func (c *Client) CancelAttempt(ctx context.Context, runID, taskID, attemptID str
 	return c.send(ctx, protocol.TypeCancel, protocol.CancelPayload{RunID: runID, TaskID: taskID, AttemptID: attemptID})
 }
 
+func (c *Client) EvictWarmSession(ctx context.Context, warmSessionKey string) error {
+	if strings.TrimSpace(warmSessionKey) == "" {
+		return nil
+	}
+	return c.send(ctx, protocol.TypeEvictWarmSession, protocol.EvictWarmSessionPayload{WarmSessionKey: warmSessionKey})
+}
+
 func (c *Client) Ping(ctx context.Context) error {
 	for {
 		select {
