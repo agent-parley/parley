@@ -24,12 +24,23 @@ type Runner struct {
 	adapters  map[string]adapter.AgentAdapter
 	active    map[string]context.CancelFunc
 	warm      map[string]*runnerWarmSession
-	warmLocks map[string]*sync.Mutex
+	warmLocks map[string]*warmSessionLock
 }
 
 type runnerWarmSession struct {
 	adapter string
 	active  bool
+}
+
+type warmSessionLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+type warmSessionLockLease struct {
+	runner *Runner
+	key    string
+	lock   *warmSessionLock
 }
 
 func New(sess *protocol.Session) *Runner {
@@ -38,7 +49,7 @@ func New(sess *protocol.Session) *Runner {
 		adapters:  map[string]adapter.AgentAdapter{},
 		active:    map[string]context.CancelFunc{},
 		warm:      map[string]*runnerWarmSession{},
-		warmLocks: map[string]*sync.Mutex{},
+		warmLocks: map[string]*warmSessionLock{},
 	}
 	r.Register(adapter.Noop{})
 	sess.Handle(protocol.TypeHello, r.handleHello)
@@ -91,10 +102,9 @@ func (r *Runner) handleDispatch(ctx context.Context, msg protocol.Message) error
 
 	taskCtx, cancel := context.WithCancel(context.Background())
 	key := activeKey(disp.RunID, disp.TaskID, disp.AttemptID)
-	var warmLock *sync.Mutex
+	var warmLock *warmSessionLockLease
 	if disp.WarmSessionKey != "" {
-		warmLock = r.warmSessionLock(disp.WarmSessionKey)
-		warmLock.Lock()
+		warmLock = r.acquireWarmSessionLock(disp.WarmSessionKey)
 	}
 	r.mu.Lock()
 	r.active[key] = cancel
@@ -158,8 +168,7 @@ func (r *Runner) handleEvictWarmSession(ctx context.Context, msg protocol.Messag
 	}
 	r.mu.Unlock()
 
-	lock := r.warmSessionLock(payload.WarmSessionKey)
-	lock.Lock()
+	lock := r.acquireWarmSessionLock(payload.WarmSessionKey)
 	defer lock.Unlock()
 
 	r.mu.Lock()
@@ -170,6 +179,9 @@ func (r *Runner) handleEvictWarmSession(ctx context.Context, msg protocol.Messag
 	}
 	adapterName := session.adapter
 	delete(r.warm, payload.WarmSessionKey)
+	// The per-key mutex is reaped when this eviction releases it and no
+	// dispatch is queued on the same key; deleting it here would let a racing
+	// dispatch create a second mutex and bypass dispatch-vs-evict serialization.
 	a := r.adapters[adapterName]
 	r.mu.Unlock()
 	if evicter, ok := a.(adapter.WarmSessionEvicter); ok {
@@ -178,15 +190,34 @@ func (r *Runner) handleEvictWarmSession(ctx context.Context, msg protocol.Messag
 	return nil
 }
 
-func (r *Runner) warmSessionLock(key string) *sync.Mutex {
+func (r *Runner) acquireWarmSessionLock(key string) *warmSessionLockLease {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	lock := r.warmLocks[key]
 	if lock == nil {
-		lock = &sync.Mutex{}
+		lock = &warmSessionLock{}
 		r.warmLocks[key] = lock
 	}
-	return lock
+	lock.refs++
+	r.mu.Unlock()
+
+	lock.mu.Lock()
+	return &warmSessionLockLease{runner: r, key: key, lock: lock}
+}
+
+func (l *warmSessionLockLease) Unlock() {
+	l.lock.mu.Unlock()
+	l.runner.releaseWarmSessionLock(l.key, l.lock)
+}
+
+func (r *Runner) releaseWarmSessionLock(key string, lock *warmSessionLock) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if lock.refs > 0 {
+		lock.refs--
+	}
+	if lock.refs == 0 && r.warm[key] == nil && r.warmLocks[key] == lock {
+		delete(r.warmLocks, key)
+	}
 }
 
 func (r *Runner) handleCancel(ctx context.Context, msg protocol.Message) error {

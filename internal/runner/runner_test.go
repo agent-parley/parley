@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -349,11 +350,35 @@ func TestHandleEvictWarmSessionNoopsWhileActiveThenEvictsIdleOnce(t *testing.T) 
 		t.Fatalf("evicted keys = %#v, want [%q]", keys, warmKey)
 	}
 	assertNoWarmSession(t, h.runner, warmKey)
+	assertNoWarmSessionLock(t, h.runner, warmKey)
 
 	h.handleEvictWarmSession(t, warmKey)
 	if got := adapter.evictCount(); got != 1 {
 		t.Fatalf("evict count after repeated idle eviction = %d, want still 1", got)
 	}
+}
+
+func TestWarmSessionMapsReturnToBaselineAfterChurn(t *testing.T) {
+	adapter := &fakeAdapter{name: "warm"}
+	h := newRunnerHarness(t, adapter)
+
+	const count = 25
+	for i := range count {
+		warmKey := fmt.Sprintf("conversation-%d", i)
+		disp := testDispatch("run_churn", "task_1", fmt.Sprintf("attempt_%d", i), adapter.Name())
+		disp.WarmSessionKey = warmKey
+		h.handleDispatch(t, disp)
+		_ = h.nextReport(t)
+		_ = h.nextResult(t)
+
+		h.handleEvictWarmSession(t, warmKey)
+		assertNoWarmSession(t, h.runner, warmKey)
+		assertNoWarmSessionLock(t, h.runner, warmKey)
+	}
+	if got := adapter.evictCount(); got != count {
+		t.Fatalf("evict count after churn = %d, want %d", got, count)
+	}
+	assertNoWarmState(t, h.runner)
 }
 
 func TestHandleEvictWarmSessionSerializesWithRacingDispatch(t *testing.T) {
@@ -430,6 +455,13 @@ func TestHandleEvictWarmSessionSerializesWithRacingDispatch(t *testing.T) {
 	if got := adapter.evictCount(); got != 1 {
 		t.Fatalf("evict count = %d, want 1", got)
 	}
+
+	h.handleEvictWarmSession(t, warmKey)
+	if got := adapter.evictCount(); got != 2 {
+		t.Fatalf("evict count after reaped warm session = %d, want 2", got)
+	}
+	assertNoWarmSession(t, h.runner, warmKey)
+	assertNoWarmSessionLock(t, h.runner, warmKey)
 }
 
 func TestHandleCancelRoutesByAttemptAndTaskPrefix(t *testing.T) {
@@ -664,5 +696,26 @@ func assertNoWarmSession(t *testing.T, r *Runner, key string) {
 	defer r.mu.Unlock()
 	if session := r.warm[key]; session != nil {
 		t.Fatalf("warm session %q still present: %+v", key, session)
+	}
+}
+
+func assertNoWarmSessionLock(t *testing.T, r *Runner, key string) {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if lock := r.warmLocks[key]; lock != nil {
+		t.Fatalf("warm session lock %q still present: %+v", key, lock)
+	}
+}
+
+func assertNoWarmState(t *testing.T, r *Runner) {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.warm) != 0 {
+		t.Fatalf("warm sessions still present: %#v", r.warm)
+	}
+	if len(r.warmLocks) != 0 {
+		t.Fatalf("warm session locks still present: %#v", r.warmLocks)
 	}
 }
