@@ -11,6 +11,7 @@ parley.db*
 /bin/
 /dist/
 *.test
+cover.out
 coverage.out
 
 # OS/editor

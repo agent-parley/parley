@@ -1,4 +1,4 @@
-.PHONY: build test vet run clean test-race test-integration test-live-m4 test-live-m5 test-live-m5-loop
+.PHONY: build test test-cover check-coverage vet run clean test-race test-integration test-live-m4 test-live-m5 test-live-m5-loop
 
 BIN_DIR := bin
 MANAGER := $(BIN_DIR)/parley
@@ -28,6 +28,12 @@ vet:
 
 test:
 	go test ./...
+
+test-cover:
+	go test -coverprofile=cover.out ./...
+
+check-coverage:
+	build/check-coverage.sh cover.out
 
 # Race detector — needs a cgo-capable host (gcc).
 test-race:
