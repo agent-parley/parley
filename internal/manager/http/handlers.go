@@ -855,7 +855,7 @@ func (s *Server) handleReRunStage(w http.ResponseWriter, r *http.Request, projec
 		http.NotFound(w, r)
 		return
 	}
-	if _, err := s.engine.ReRunStage(r.Context(), runID, stageID); err != nil {
+	if _, err := s.engine.ReRunStage(r.Context(), runID, stageID, event.Actor{Kind: event.ActorKindOperator, ID: "operator"}); err != nil {
 		if errors.Is(err, orchestrator.ErrStageReRunInvalidTarget) || errors.Is(err, orchestrator.ErrStageReRunPrerequisiteGap) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return

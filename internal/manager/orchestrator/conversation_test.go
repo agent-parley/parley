@@ -1030,6 +1030,17 @@ func TestConversationReRunStageActionFromAgentStartsNewAttempt(t *testing.T) {
 	if afterAttempts != beforeAttempts+1 {
 		t.Fatalf("attempt count = %d, want %d", afterAttempts, beforeAttempts+1)
 	}
+	events, err := st.ListEvents(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	rerunEvent := latestEventOfType(events, "run.stage_rerun_started")
+	if rerunEvent.Type == "" {
+		t.Fatalf("missing run.stage_rerun_started in events %#v", eventTypes(events))
+	}
+	if rerunEvent.Actor != (event.Actor{Kind: event.ActorKindAdapter, ID: "chat-agent"}) {
+		t.Fatalf("rerun actor = %#v, want chat adapter", rerunEvent.Actor)
+	}
 	if !runner.sawStageType(contract.StageTypeImplementation) || !runner.sawStageType(contract.StageTypeValidation) {
 		t.Fatalf("dispatch stage types = %#v, want implementation and validation", runner.stageTypes())
 	}

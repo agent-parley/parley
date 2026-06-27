@@ -270,7 +270,7 @@ func (e *Engine) executeConversationAction(ctx context.Context, projectID, conve
 		if conversation.ProjectID != projectID {
 			return store.WorkflowRun{}, fmt.Errorf("%w: conversation %q is not in project %q", ErrConversationRunNotReadable, conversationID, projectID)
 		}
-		if _, err := e.ReRunStage(ctx, action.RunID, action.Stage); err != nil {
+		if _, err := e.ReRunStage(ctx, action.RunID, action.Stage, event.Actor{Kind: event.ActorKindAdapter, ID: e.conversationAdapter}); err != nil {
 			return store.WorkflowRun{}, err
 		}
 		return e.store.GetWorkflowRun(ctx, action.RunID)

@@ -807,9 +807,12 @@ func TestHandleReRunStageReturnsHTMLFragment(t *testing.T) {
 	}
 	controller := &fakeRunController{state: defaultRouteQueueState()}
 	var reRunAttempt store.Attempt
-	controller.reRunStageFunc = func(_ context.Context, runID, stageID string) (store.Attempt, error) {
+	controller.reRunStageFunc = func(_ context.Context, runID, stageID string, actor event.Actor) (store.Attempt, error) {
 		if runID != wr.Run.ID || stageID != wr.ImplementationStage.ID {
 			t.Fatalf("ReRunStage run=%s stage=%s", runID, stageID)
+		}
+		if actor != (event.Actor{Kind: event.ActorKindOperator, ID: "operator"}) {
+			t.Fatalf("ReRunStage actor = %#v, want operator", actor)
 		}
 		attempt, stages, err := st.CreateAttemptForRun(ctx, runID, workflow.DefaultTemplate())
 		if err != nil {
@@ -835,7 +838,7 @@ func TestHandleReRunStageReturnsHTMLFragment(t *testing.T) {
 			TaskID:        wr.Task.ID,
 			AttemptID:     attempt.ID,
 			Type:          "run.stage_rerun_started",
-			Actor:         event.Actor{Kind: event.ActorKindOperator, ID: "operator"},
+			Actor:         actor,
 			Summary:       "stage re-run started",
 			Data: map[string]any{
 				"target_stage_id":   targetStage.ID,
@@ -868,6 +871,23 @@ func TestHandleReRunStageReturnsHTMLFragment(t *testing.T) {
 	assertContains(t, body, "run.stage_rerun_started")
 	assertContains(t, body, "stage re-run started")
 	assertNotContains(t, body, "application/json")
+
+	events, err := st.ListEvents(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	var rerunEvent event.Event
+	for _, evt := range events {
+		if evt.Type == "run.stage_rerun_started" {
+			rerunEvent = evt
+		}
+	}
+	if rerunEvent.Type == "" {
+		t.Fatalf("missing run.stage_rerun_started in events")
+	}
+	if rerunEvent.Actor != (event.Actor{Kind: event.ActorKindOperator, ID: "operator"}) {
+		t.Fatalf("rerun actor = %#v, want operator", rerunEvent.Actor)
+	}
 }
 
 func TestHandleReRunStageInvalidRequestDoesNotMutate(t *testing.T) {
@@ -885,7 +905,7 @@ func TestHandleReRunStageInvalidRequestDoesNotMutate(t *testing.T) {
 		t.Fatalf("count attempts: %v", err)
 	}
 	controller := &fakeRunController{state: defaultRouteQueueState()}
-	controller.reRunStageFunc = func(context.Context, string, string) (store.Attempt, error) {
+	controller.reRunStageFunc = func(context.Context, string, string, event.Actor) (store.Attempt, error) {
 		return store.Attempt{}, orchestrator.ErrStageReRunInvalidTarget
 	}
 
@@ -1155,7 +1175,7 @@ type fakeRunController struct {
 	submitConversationMessageFunc func(context.Context, string, string) (store.Message, error)
 	startQueuedRunFunc            func(context.Context, string) error
 	cancelRunFunc                 func(context.Context, string) error
-	reRunStageFunc                func(context.Context, string, string) (store.Attempt, error)
+	reRunStageFunc                func(context.Context, string, string, event.Actor) (store.Attempt, error)
 	humanReviewFunc               func(context.Context, string, string, orchestrator.HumanReviewSubmission) (report.Report, error)
 }
 
@@ -1197,9 +1217,9 @@ func (f *fakeRunController) CancelRun(ctx context.Context, runID string) error {
 	return errors.New("unexpected CancelRun call")
 }
 
-func (f *fakeRunController) ReRunStage(ctx context.Context, runID, stageID string) (store.Attempt, error) {
+func (f *fakeRunController) ReRunStage(ctx context.Context, runID, stageID string, actor event.Actor) (store.Attempt, error) {
 	if f.reRunStageFunc != nil {
-		return f.reRunStageFunc(ctx, runID, stageID)
+		return f.reRunStageFunc(ctx, runID, stageID, actor)
 	}
 	return store.Attempt{}, errors.New("unexpected ReRunStage call")
 }
