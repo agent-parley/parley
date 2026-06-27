@@ -23,7 +23,7 @@ var (
 // the requested workflow stage, continuing forward through the run's frozen
 // workflow snapshot. The target may be either a workflow stage ID from the
 // frozen template or a persisted stage ID from any attempt of the run.
-func (e *Engine) ReRunStage(ctx context.Context, runID, stageID string) (store.Attempt, error) {
+func (e *Engine) ReRunStage(ctx context.Context, runID, stageID string, actor event.Actor) (store.Attempt, error) {
 	runID = strings.TrimSpace(runID)
 	stageID = strings.TrimSpace(stageID)
 	if runID == "" || stageID == "" {
@@ -86,7 +86,7 @@ func (e *Engine) ReRunStage(ctx context.Context, runID, stageID string) (store.A
 		return store.Attempt{}, err
 	}
 	newWR.Run.Status = store.RunStatusRunning
-	if _, err := e.emit(ctx, runEvent(newWR, "run.stage_rerun_started", event.Actor{Kind: event.ActorKindOperator, ID: "operator"}, "stage re-run started", map[string]any{
+	if _, err := e.emit(ctx, runEvent(newWR, "run.stage_rerun_started", actor, "stage re-run started", map[string]any{
 		"run_id":                   wr.Run.ID,
 		"attempt_id":               attempt.ID,
 		"previous_attempt_id":      wr.Attempt.ID,

@@ -11,6 +11,7 @@ import (
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
 	"github.com/agent-parley/parley/internal/shared/contract"
+	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
 
@@ -20,7 +21,7 @@ type RunController interface {
 	SubmitConversationMessage(context.Context, string, string) (store.Message, error)
 	StartQueuedRun(context.Context, string) error
 	CancelRun(context.Context, string) error
-	ReRunStage(context.Context, string, string) (store.Attempt, error)
+	ReRunStage(context.Context, string, string, event.Actor) (store.Attempt, error)
 	SubmitHumanReview(context.Context, string, string, orchestrator.HumanReviewSubmission) (report.Report, error)
 	QueueState(context.Context) (orchestrator.QueueState, error)
 }

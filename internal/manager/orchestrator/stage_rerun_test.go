@@ -18,6 +18,8 @@ import (
 	"github.com/agent-parley/parley/internal/shared/report"
 )
 
+var stageReRunOperatorActor = event.Actor{Kind: event.ActorKindOperator, ID: "operator"}
+
 func TestReRunStageCreatesNewAttemptFromTargetOverFrozenSnapshot(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
@@ -50,7 +52,7 @@ func TestReRunStageCreatesNewAttemptFromTargetOverFrozenSnapshot(t *testing.T) {
 		t.Fatalf("count attempts before: %v", err)
 	}
 
-	attempt, err := engine.ReRunStage(ctx, wr.Run.ID, wr.ImplementationStage.ID)
+	attempt, err := engine.ReRunStage(ctx, wr.Run.ID, wr.ImplementationStage.ID, stageReRunOperatorActor)
 	if err != nil {
 		t.Fatalf("ReRunStage() error = %v", err)
 	}
@@ -94,7 +96,7 @@ func TestReRunStageCreatesNewAttemptFromTargetOverFrozenSnapshot(t *testing.T) {
 	if rerunEvent.Type == "" {
 		t.Fatalf("missing run.stage_rerun_started in events %#v", eventTypes(events))
 	}
-	if rerunEvent.Actor.Kind != event.ActorKindOperator {
+	if rerunEvent.Actor != stageReRunOperatorActor {
 		t.Fatalf("rerun actor = %#v, want operator", rerunEvent.Actor)
 	}
 	if rerunEvent.AttemptID != attempt.ID || rerunEvent.Data["requested_stage_id"] != wr.ImplementationStage.ID || rerunEvent.Data["target_workflow_stage_id"] != "implementation" || rerunEvent.Data["target_stage_type"] != contract.StageTypeImplementation {
@@ -141,7 +143,7 @@ func TestReRunStageStartsAtValidationTargetWhenPrerequisitesExist(t *testing.T) 
 	}
 	runner.reset()
 
-	attempt, err := engine.ReRunStage(ctx, wr.Run.ID, "validation")
+	attempt, err := engine.ReRunStage(ctx, wr.Run.ID, "validation", stageReRunOperatorActor)
 	if err != nil {
 		t.Fatalf("ReRunStage validation error = %v", err)
 	}
@@ -184,7 +186,7 @@ func TestReRunStageRejectsInvalidTargetsFailClosed(t *testing.T) {
 	for _, target := range []string{"idea_refinement", "commit_feature_branch", "pr_creation", "memory_update", "stop_report", "missing_stage"} {
 		t.Run(target, func(t *testing.T) {
 			beforeAttempts, beforeStatus, beforeEvents := rerunMutationSnapshot(t, st, wr.Run.ID)
-			_, err := engine.ReRunStage(ctx, wr.Run.ID, target)
+			_, err := engine.ReRunStage(ctx, wr.Run.ID, target, stageReRunOperatorActor)
 			if !errors.Is(err, ErrStageReRunInvalidTarget) {
 				t.Fatalf("ReRunStage(%s) error = %v, want ErrStageReRunInvalidTarget", target, err)
 			}
@@ -209,7 +211,7 @@ func TestReRunStageRequiresFrozenSnapshotFailClosed(t *testing.T) {
 	engine := newRecordingEngine(t, st, &recordingRerunRunner{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
 	beforeAttempts, beforeStatus, beforeEvents := rerunMutationSnapshot(t, st, wr.Run.ID)
 
-	_, err = engine.ReRunStage(ctx, wr.Run.ID, "implementation")
+	_, err = engine.ReRunStage(ctx, wr.Run.ID, "implementation", stageReRunOperatorActor)
 	if !errors.Is(err, ErrStageReRunFrozenSnapshot) {
 		t.Fatalf("ReRunStage missing snapshot error = %v, want ErrStageReRunFrozenSnapshot", err)
 	}
@@ -241,7 +243,7 @@ func TestReRunStageRejectsTargetsWithoutCompletedPrerequisitesFailClosed(t *test
 	for _, target := range []string{"validation", "change_review_agent"} {
 		t.Run(target, func(t *testing.T) {
 			beforeAttempts, beforeStatus, beforeEvents := rerunMutationSnapshot(t, st, wr.Run.ID)
-			_, err := engine.ReRunStage(ctx, wr.Run.ID, target)
+			_, err := engine.ReRunStage(ctx, wr.Run.ID, target, stageReRunOperatorActor)
 			if !errors.Is(err, ErrStageReRunPrerequisiteGap) {
 				t.Fatalf("ReRunStage(%s) error = %v, want ErrStageReRunPrerequisiteGap", target, err)
 			}
@@ -268,7 +270,7 @@ func TestReRunStageRejectsNonTerminalRunStatesFailClosed(t *testing.T) {
 			engine := newRecordingEngine(t, st, &recordingRerunRunner{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
 			beforeAttempts, beforeStatus, beforeEvents := rerunMutationSnapshot(t, st, wr.Run.ID)
 
-			_, err = engine.ReRunStage(ctx, wr.Run.ID, "implementation")
+			_, err = engine.ReRunStage(ctx, wr.Run.ID, "implementation", stageReRunOperatorActor)
 			if !errors.Is(err, ErrStageReRunRunNotTerminal) {
 				t.Fatalf("ReRunStage status %s error = %v, want ErrStageReRunRunNotTerminal", status, err)
 			}
@@ -308,7 +310,7 @@ func TestReRunStageDeliveryUsesExistingBranchAndDoesNotCreatePRDuplicate(t *test
 		t.Fatalf("first commit missing branch: %#v", firstCommit.Payload)
 	}
 
-	attempt, err := engine.ReRunStage(ctx, runID, "implementation")
+	attempt, err := engine.ReRunStage(ctx, runID, "implementation", stageReRunOperatorActor)
 	if err != nil {
 		t.Fatalf("ReRunStage() error = %v", err)
 	}
