@@ -672,6 +672,68 @@ func TestHandleRunDetailRendersStoryReviewDrillIn(t *testing.T) {
 	assertNotContains(t, body, "name=\"verdict\"")
 }
 
+func TestHandleRunDetailRendersReRunAffordanceOnlyForTerminalComputeStages(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "Stage action controls", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := st.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusCompleted); err != nil {
+		t.Fatalf("complete run: %v", err)
+	}
+	stages, err := st.ListStages(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	idsByType := map[string]string{}
+	for _, stage := range stages {
+		if _, ok := idsByType[stage.StageType]; !ok {
+			idsByType[stage.StageType] = stage.ID
+		}
+	}
+
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/projects/default/runs/"+wr.Run.ID, nil)
+	srv.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET terminal run status = %d want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, stageType := range []string{contract.StageTypeImplementation, contract.StageTypeValidation, contract.StageTypeReview} {
+		stageID := idsByType[stageType]
+		if stageID == "" {
+			t.Fatalf("missing %s stage in %#v", stageType, idsByType)
+		}
+		path := "/projects/default/runs/" + wr.Run.ID + "/stages/" + stageID + "/rerun"
+		assertContains(t, body, path)
+	}
+	assertContains(t, body, "Re-run from here")
+	assertContains(t, body, "data-bind:csrf")
+	for _, stageType := range []string{contract.StageTypeIdeaRefinement, contract.StageTypeCommit, contract.StageTypePRCreation, contract.StageTypeMemoryUpdate, contract.StageTypeStopReport} {
+		stageID := idsByType[stageType]
+		if stageID == "" {
+			t.Fatalf("missing %s stage in %#v", stageType, idsByType)
+		}
+		path := "/projects/default/runs/" + wr.Run.ID + "/stages/" + stageID + "/rerun"
+		assertNotContains(t, body, path)
+	}
+
+	if err := st.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusRunning); err != nil {
+		t.Fatalf("mark run running: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/projects/default/runs/"+wr.Run.ID, nil)
+	srv.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET running run status = %d want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body = rec.Body.String()
+	assertNotContains(t, body, "Re-run from here")
+	assertNotContains(t, body, "/rerun")
+}
+
 func TestHandleRunDetailRendersAwaitingHumanVerdictForm(t *testing.T) {
 	ctx := context.Background()
 	st := openRouteTestStore(t)
@@ -744,14 +806,46 @@ func TestHandleReRunStageReturnsHTMLFragment(t *testing.T) {
 		t.Fatalf("complete run: %v", err)
 	}
 	controller := &fakeRunController{state: defaultRouteQueueState()}
+	var reRunAttempt store.Attempt
 	controller.reRunStageFunc = func(_ context.Context, runID, stageID string) (store.Attempt, error) {
 		if runID != wr.Run.ID || stageID != wr.ImplementationStage.ID {
 			t.Fatalf("ReRunStage run=%s stage=%s", runID, stageID)
 		}
+		attempt, stages, err := st.CreateAttemptForRun(ctx, runID, workflow.DefaultTemplate())
+		if err != nil {
+			t.Fatalf("create rerun attempt: %v", err)
+		}
+		var targetStage store.Stage
+		for _, stage := range stages {
+			if stage.StageType == contract.StageTypeImplementation {
+				targetStage = stage
+				break
+			}
+		}
+		if targetStage.ID == "" {
+			t.Fatalf("new attempt stages missing implementation: %#v", stages)
+		}
 		if err := st.UpdateRunStatus(ctx, runID, store.RunStatusRunning); err != nil {
 			t.Fatalf("update run: %v", err)
 		}
-		return store.Attempt{ID: "attempt_rerun", RunID: runID}, nil
+		if _, err := st.AppendEvent(ctx, event.Event{
+			SchemaVersion: event.SchemaVersion,
+			ProjectID:     wr.Run.ProjectID,
+			RunID:         runID,
+			TaskID:        wr.Task.ID,
+			AttemptID:     attempt.ID,
+			Type:          "run.stage_rerun_started",
+			Actor:         event.Actor{Kind: event.ActorKindOperator, ID: "operator"},
+			Summary:       "stage re-run started",
+			Data: map[string]any{
+				"target_stage_id":   targetStage.ID,
+				"target_stage_type": targetStage.StageType,
+			},
+		}); err != nil {
+			t.Fatalf("append rerun event: %v", err)
+		}
+		reRunAttempt = attempt
+		return attempt, nil
 	}
 
 	srv := newRouteTestServer(t, st, controller)
@@ -766,6 +860,13 @@ func TestHandleReRunStageReturnsHTMLFragment(t *testing.T) {
 	body := rec.Body.String()
 	assertContains(t, body, "id=\"run-summary\"")
 	assertContains(t, body, "id=\"story-panel\"")
+	wantAttemptLabel := reRunAttempt.ID
+	if len(wantAttemptLabel) > 14 {
+		wantAttemptLabel = wantAttemptLabel[:14]
+	}
+	assertContains(t, body, "Attempt "+wantAttemptLabel)
+	assertContains(t, body, "run.stage_rerun_started")
+	assertContains(t, body, "stage re-run started")
 	assertNotContains(t, body, "application/json")
 }
 

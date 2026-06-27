@@ -180,6 +180,58 @@ func TestNewRunDataAndRunViewMapBundleFields(t *testing.T) {
 	}
 }
 
+func TestNewRunViewMarksStageReRunControlsForTerminalComputeStagesOnly(t *testing.T) {
+	stages := []store.Stage{
+		{ID: "idea", AttemptID: "attempt-1", StageType: contract.StageTypeIdeaRefinement},
+		{ID: "implementation", AttemptID: "attempt-1", StageType: contract.StageTypeImplementation},
+		{ID: "validation", AttemptID: "attempt-1", StageType: contract.StageTypeValidation},
+		{ID: "review", AttemptID: "attempt-1", StageType: contract.StageTypeReview},
+		{ID: "commit", AttemptID: "attempt-1", StageType: contract.StageTypeCommit},
+		{ID: "pr", AttemptID: "attempt-1", StageType: contract.StageTypePRCreation},
+		{ID: "memory", AttemptID: "attempt-1", StageType: contract.StageTypeMemoryUpdate},
+		{ID: "stop", AttemptID: "attempt-1", StageType: contract.StageTypeStopReport},
+	}
+	bundle := store.RunBundle{Run: store.Run{ID: "run-rerun", Status: store.RunStatusCompleted}, Stages: stages}
+
+	view := NewRunView(bundle)
+
+	got := map[string]bool{}
+	for _, group := range view.StageGroups {
+		got[group.Stage.ID] = group.CanReRun
+	}
+	want := map[string]bool{
+		"idea":           false,
+		"implementation": true,
+		"validation":     true,
+		"review":         true,
+		"commit":         false,
+		"pr":             false,
+		"memory":         false,
+		"stop":           false,
+	}
+	for stageID, wantCanReRun := range want {
+		if got[stageID] != wantCanReRun {
+			t.Fatalf("CanReRun[%s] = %v, want %v (all: %#v)", stageID, got[stageID], wantCanReRun, got)
+		}
+	}
+
+	bundle.Run.Status = store.RunStatusRunning
+	running := NewRunView(bundle)
+	for _, group := range running.StageGroups {
+		if group.CanReRun {
+			t.Fatalf("running run stage %s CanReRun = true, want false", group.Stage.ID)
+		}
+	}
+
+	bundle.Run.Status = store.RunStatusNeedsInput
+	needsInput := NewRunView(bundle)
+	for _, group := range needsInput.StageGroups {
+		if group.CanReRun {
+			t.Fatalf("needs_input run stage %s CanReRun = true, want false", group.Stage.ID)
+		}
+	}
+}
+
 func TestNewRunViewSurfacesPendingHumanReview(t *testing.T) {
 	bundle := store.RunBundle{
 		Run:     store.Run{ID: "run-review", TaskID: "task-review", Status: store.RunStatusAwaitingHuman},
