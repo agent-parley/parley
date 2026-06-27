@@ -858,6 +858,56 @@ func TestUpdateRunStatusFromAndAppendSystemEventIsAtomic(t *testing.T) {
 	}
 }
 
+func TestUpdateRunStatusAndAppendRunEventIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRun(ctx, "fail atomically")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	ev, changed, err := st.UpdateRunStatusIfOpenAndAppendEvent(ctx, wr.Run.ID, RunStatusFailed, event.Event{Type: "run.failed", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "failed", Data: map[string]any{"terminal_status": RunStatusFailed}})
+	if err != nil {
+		t.Fatalf("transition with run event: %v", err)
+	}
+	if !changed || ev.Sequence != 1 || ev.RunID != wr.Run.ID {
+		t.Fatalf("event=%+v changed=%v, want run event sequence 1 with changed=true", ev, changed)
+	}
+	run, err := st.GetRun(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Status != RunStatusFailed {
+		t.Fatalf("status = %s, want failed", run.Status)
+	}
+	events, err := st.ListEvents(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if len(events) != 1 || events[0].Type != "run.failed" {
+		t.Fatalf("events = %#v, want exactly one run.failed", events)
+	}
+
+	_, changed, err = st.UpdateRunStatusIfOpenAndAppendEvent(ctx, wr.Run.ID, RunStatusCompleted, event.Event{Type: "run.completed", Actor: event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, Summary: "should not persist"})
+	if err != nil {
+		t.Fatalf("unchanged transition: %v", err)
+	}
+	if changed {
+		t.Fatal("changed=true for terminal run transition")
+	}
+	events, err = st.ListEvents(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("list events after unchanged transition: %v", err)
+	}
+	if len(events) != 1 || events[0].Type != "run.failed" {
+		t.Fatalf("events after unchanged transition = %#v, want still one run.failed", events)
+	}
+}
+
 func TestProjectRepositoryTaskAndRunInputErrorPaths(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(ctx, t.TempDir())

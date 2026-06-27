@@ -1918,6 +1918,51 @@ func (s *Store) UpdateRunStatusFromAndAppendSystemEvent(ctx context.Context, run
 	return ev, true, nil
 }
 
+func (s *Store) UpdateRunStatusIfOpenAndAppendEvent(ctx context.Context, runID, toStatus string, ev event.Event) (event.Event, bool, error) {
+	return s.updateRunStatusAndAppendEvent(ctx, runID, toStatus, ev, `status NOT IN (?, ?, ?, ?, ?)`, RunStatusCompleted, RunStatusFailed, RunStatusInvalid, RunStatusNeedsInput, RunStatusCancelled)
+}
+
+func (s *Store) UpdateRunStatusFromAndAppendEvent(ctx context.Context, runID, fromStatus, toStatus string, ev event.Event) (event.Event, bool, error) {
+	return s.updateRunStatusAndAppendEvent(ctx, runID, toStatus, ev, `status = ?`, fromStatus)
+}
+
+func (s *Store) updateRunStatusAndAppendEvent(ctx context.Context, runID, toStatus string, ev event.Event, condition string, conditionArgs ...any) (event.Event, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ev.RunID != "" && ev.RunID != runID {
+		return event.Event{}, false, fmt.Errorf("event run_id %q does not match status run_id %q", ev.RunID, runID)
+	}
+	ev.RunID = runID
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return event.Event{}, false, fmt.Errorf("begin status/event transaction: %w", err)
+	}
+	defer rollback(tx)
+	args := append([]any{toStatus, nowRFC3339(), runID}, conditionArgs...)
+	res, err := tx.ExecContext(ctx, `UPDATE runs SET status = ?, updated_at = ? WHERE id = ? AND `+condition, args...)
+	if err != nil {
+		return event.Event{}, false, fmt.Errorf("update run status to %s: %w", toStatus, err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return event.Event{}, false, fmt.Errorf("read rows affected: %w", err)
+	}
+	if changed == 0 {
+		if err := tx.Commit(); err != nil {
+			return event.Event{}, false, fmt.Errorf("commit unchanged status/event transaction: %w", err)
+		}
+		return event.Event{}, false, nil
+	}
+	ev, err = s.appendEventTx(ctx, tx, ev)
+	if err != nil {
+		return event.Event{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return event.Event{}, false, fmt.Errorf("commit status/event transaction: %w", err)
+	}
+	return ev, true, nil
+}
+
 func (s *Store) appendEventTx(ctx context.Context, tx *sql.Tx, ev event.Event) (event.Event, error) {
 	if ev.SchemaVersion == 0 {
 		ev.SchemaVersion = event.SchemaVersion

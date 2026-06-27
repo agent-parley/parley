@@ -400,14 +400,14 @@ func (e *Engine) CancelRun(ctx context.Context, runID string) error {
 }
 
 func (e *Engine) cancelQueuedRunLocked(ctx context.Context, wr store.WorkflowRun) error {
-	changed, err := e.store.UpdateRunStatusFrom(ctx, wr.Run.ID, store.RunStatusPending, store.RunStatusCancelled)
+	persisted, changed, err := e.store.UpdateRunStatusFromAndAppendEvent(ctx, wr.Run.ID, store.RunStatusPending, store.RunStatusCancelled, runEvent(wr, "run.cancelled", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "queued run cancelled", map[string]any{"terminal_status": store.RunStatusCancelled}))
 	if err != nil {
 		return err
 	}
 	if !changed {
 		return ErrRunNotPending
 	}
-	_, err = e.emit(ctx, runEvent(wr, "run.cancelled", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "queued run cancelled", map[string]any{"terminal_status": store.RunStatusCancelled}))
+	_, err = e.publishEvent(ctx, persisted)
 	return err
 }
 
@@ -450,7 +450,11 @@ func (e *Engine) failInterruptedRunning(ctx context.Context) error {
 			joined = append(joined, err)
 			continue
 		}
-		changed, err := e.store.UpdateRunStatusFrom(ctx, run.ID, store.RunStatusRunning, store.RunStatusFailed)
+		persisted, changed, err := e.store.UpdateRunStatusFromAndAppendEvent(ctx, run.ID, store.RunStatusRunning, store.RunStatusFailed, runEvent(wr, "run.failed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "run failed during manager restart recovery", map[string]any{
+			"terminal_status": store.RunStatusFailed,
+			"reason":          "manager_restarted",
+			"retryable":       true,
+		}))
 		if err != nil {
 			joined = append(joined, err)
 			continue
@@ -458,12 +462,7 @@ func (e *Engine) failInterruptedRunning(ctx context.Context) error {
 		if !changed {
 			continue
 		}
-		_, err = e.emit(ctx, runEvent(wr, "run.failed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "run failed during manager restart recovery", map[string]any{
-			"terminal_status": store.RunStatusFailed,
-			"reason":          "manager_restarted",
-			"retryable":       true,
-		}))
-		if err != nil {
+		if _, err := e.publishEvent(ctx, persisted); err != nil {
 			joined = append(joined, err)
 		}
 	}
@@ -767,7 +766,12 @@ func (e *Engine) HandleRunnerDown(ctx context.Context, runnerID, reason string) 
 			}
 			continue
 		}
-		changed, err := e.store.UpdateRunStatusIfOpen(ctx, runID, store.RunStatusFailed)
+		persisted, changed, err := e.store.UpdateRunStatusIfOpenAndAppendEvent(ctx, runID, store.RunStatusFailed, runEvent(wr, "run.failed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "runner disconnected", map[string]any{
+			"terminal_status": store.RunStatusFailed,
+			"reason":          "runner_disconnected",
+			"runner_id":       runnerID,
+			"signal":          reason,
+		}))
 		if err != nil {
 			joined = append(joined, err)
 			continue
@@ -775,13 +779,7 @@ func (e *Engine) HandleRunnerDown(ctx context.Context, runnerID, reason string) 
 		if !changed {
 			continue
 		}
-		_, err = e.emit(ctx, runEvent(wr, "run.failed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "runner disconnected", map[string]any{
-			"terminal_status": store.RunStatusFailed,
-			"reason":          "runner_disconnected",
-			"runner_id":       runnerID,
-			"signal":          reason,
-		}))
-		if err != nil {
+		if _, err := e.publishEvent(ctx, persisted); err != nil {
 			joined = append(joined, err)
 		}
 	}
@@ -1594,19 +1592,19 @@ func (e *Engine) finishRunFromStopReport(ctx context.Context, wr store.WorkflowR
 	if rep.Status != report.StatusCompleted {
 		return e.stopRun(ctx, wr, rep.Status, rep.Summary)
 	}
-	changed, err := e.store.UpdateRunStatusIfOpen(ctx, wr.Run.ID, store.RunStatusCompleted)
+	persisted, changed, err := e.store.UpdateRunStatusIfOpenAndAppendEvent(ctx, wr.Run.ID, store.RunStatusCompleted, runEvent(wr, "run.completed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "workflow reached stop/report", map[string]any{
+		"terminal_status":  store.RunStatusCompleted,
+		"branch":           payloadString(rep.Payload, "branch"),
+		"commit_sha":       payloadString(rep.Payload, "commit_sha"),
+		"diff_artifact_id": payloadString(rep.Payload, "diff_artifact_id"),
+	}))
 	if err != nil {
 		return err
 	}
 	if !changed {
 		return nil
 	}
-	_, err = e.emit(ctx, runEvent(wr, "run.completed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "workflow reached stop/report", map[string]any{
-		"terminal_status":  store.RunStatusCompleted,
-		"branch":           payloadString(rep.Payload, "branch"),
-		"commit_sha":       payloadString(rep.Payload, "commit_sha"),
-		"diff_artifact_id": payloadString(rep.Payload, "diff_artifact_id"),
-	}))
+	_, err = e.publishEvent(ctx, persisted)
 	return err
 }
 
@@ -1627,31 +1625,31 @@ func (e *Engine) stopRun(ctx context.Context, wr store.WorkflowRun, status, summ
 		runStatus = store.RunStatusNeedsInput
 		eventType = "run.abandoned"
 	}
-	changed, err := e.store.UpdateRunStatusIfOpen(ctx, wr.Run.ID, runStatus)
-	if err != nil {
-		return err
-	}
-	if !changed {
-		return nil
-	}
 	data := map[string]any{"terminal_status": runStatus}
 	if reason, ok := e.runnerDownReason(wr.Run.ID); ok && runStatus == store.RunStatusFailed {
 		data["reason"] = reason
 		summary = "runner disconnected"
 	}
-	_, err = e.emit(ctx, runEvent(wr, eventType, event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, summary, data))
-	return err
-}
-
-func (e *Engine) cancelRunTerminal(ctx context.Context, wr store.WorkflowRun, summary string) error {
-	changed, err := e.store.UpdateRunStatusIfOpen(ctx, wr.Run.ID, store.RunStatusCancelled)
+	persisted, changed, err := e.store.UpdateRunStatusIfOpenAndAppendEvent(ctx, wr.Run.ID, runStatus, runEvent(wr, eventType, event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, summary, data))
 	if err != nil {
 		return err
 	}
 	if !changed {
 		return nil
 	}
-	_, err = e.emit(ctx, runEvent(wr, "run.cancelled", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, summary, map[string]any{"terminal_status": store.RunStatusCancelled}))
+	_, err = e.publishEvent(ctx, persisted)
+	return err
+}
+
+func (e *Engine) cancelRunTerminal(ctx context.Context, wr store.WorkflowRun, summary string) error {
+	persisted, changed, err := e.store.UpdateRunStatusIfOpenAndAppendEvent(ctx, wr.Run.ID, store.RunStatusCancelled, runEvent(wr, "run.cancelled", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, summary, map[string]any{"terminal_status": store.RunStatusCancelled}))
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	_, err = e.publishEvent(ctx, persisted)
 	return err
 }
 
@@ -1660,6 +1658,10 @@ func (e *Engine) emit(ctx context.Context, ev event.Event) (event.Event, error) 
 	if err != nil {
 		return event.Event{}, err
 	}
+	return e.publishEvent(ctx, persisted)
+}
+
+func (e *Engine) publishEvent(ctx context.Context, persisted event.Event) (event.Event, error) {
 	if persisted.RunID == "" {
 		e.broadcast.Broadcast("", persisted, "")
 		return persisted, nil
