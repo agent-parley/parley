@@ -1035,6 +1035,87 @@ func TestConversationReRunStageActionFromAgentStartsNewAttempt(t *testing.T) {
 	}
 }
 
+func TestConversationReRunStageRejectsRunOutsideProjectScope(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	conversation, err := st.EnsureProjectConversation(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	otherProjectID := "other_project"
+	if _, err := st.EnsureProject(ctx, store.ProjectSpec{ID: otherProjectID, Name: "Other project", RepositoryPath: t.TempDir()}); err != nil {
+		t.Fatalf("ensure other project: %v", err)
+	}
+	template := stageRerunTemplate("conversation_rerun_scope", false)
+	if err := st.CreateWorkflowTemplate(ctx, template); err != nil {
+		t.Fatalf("create template: %v", err)
+	}
+	otherWR, err := st.CreateWorkflowRunForProjectInput(ctx, otherProjectID, contract.TaskInput{Idea: "other project rerun", WorkflowTemplateID: template.ID})
+	if err != nil {
+		t.Fatalf("create other project run: %v", err)
+	}
+	if err := st.SaveWorkflowSnapshot(ctx, otherWR.Run.ID, map[string]any{"workflow_template_snapshot": template}); err != nil {
+		t.Fatalf("save other project snapshot: %v", err)
+	}
+	if err := st.UpdateRunStatus(ctx, otherWR.Run.ID, store.RunStatusCompleted); err != nil {
+		t.Fatalf("complete other project run: %v", err)
+	}
+	engine := newRecordingEngine(t, st, &recordingRerunRunner{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 100}})
+
+	beforeAttempts, beforeStatus, beforeEvents := rerunMutationSnapshot(t, st, otherWR.Run.ID)
+	_, err = engine.executeConversationAction(ctx, store.DefaultProjectID, conversation.ID, conversationAction{Type: conversationActionReRunStage, RunID: otherWR.Run.ID, Stage: "implementation"})
+	if !errors.Is(err, ErrConversationRunNotReadable) {
+		t.Fatalf("executeConversationAction() error = %v, want ErrConversationRunNotReadable", err)
+	}
+	for _, sentinel := range []error{ErrStageReRunRunNotTerminal, ErrStageReRunInvalidTarget, ErrStageReRunPrerequisiteGap} {
+		if errors.Is(err, sentinel) {
+			t.Fatalf("executeConversationAction() error = %v, want read-scope rejection, not %v", err, sentinel)
+		}
+	}
+	assertNoRerunMutation(t, st, otherWR.Run.ID, beforeAttempts, beforeStatus, beforeEvents)
+}
+
+func TestConversationReRunStageRejectsConversationOutsideProjectScope(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	otherProjectID := "other_project"
+	if _, err := st.EnsureProject(ctx, store.ProjectSpec{ID: otherProjectID, Name: "Other project", RepositoryPath: t.TempDir()}); err != nil {
+		t.Fatalf("ensure other project: %v", err)
+	}
+	otherConversation, err := st.EnsureProjectConversation(ctx, otherProjectID)
+	if err != nil {
+		t.Fatalf("ensure other project conversation: %v", err)
+	}
+	template := stageRerunTemplate("conversation_rerun_conversation_scope", false)
+	if err := st.CreateWorkflowTemplate(ctx, template); err != nil {
+		t.Fatalf("create template: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "default project rerun", WorkflowTemplateID: template.ID})
+	if err != nil {
+		t.Fatalf("create default project run: %v", err)
+	}
+	if err := st.SaveWorkflowSnapshot(ctx, wr.Run.ID, map[string]any{"workflow_template_snapshot": template}); err != nil {
+		t.Fatalf("save default project snapshot: %v", err)
+	}
+	if err := st.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusCompleted); err != nil {
+		t.Fatalf("complete default project run: %v", err)
+	}
+	engine := newRecordingEngine(t, st, &recordingRerunRunner{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 100}})
+
+	beforeAttempts, beforeStatus, beforeEvents := rerunMutationSnapshot(t, st, wr.Run.ID)
+	_, err = engine.executeConversationAction(ctx, store.DefaultProjectID, otherConversation.ID, conversationAction{Type: conversationActionReRunStage, RunID: wr.Run.ID, Stage: "implementation"})
+	if !errors.Is(err, ErrConversationRunNotReadable) {
+		t.Fatalf("executeConversationAction() error = %v, want ErrConversationRunNotReadable", err)
+	}
+	assertNoRerunMutation(t, st, wr.Run.ID, beforeAttempts, beforeStatus, beforeEvents)
+}
+
 func TestConversationReRunStageActionReusesEngineValidationFailClosed(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())

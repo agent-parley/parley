@@ -20,6 +20,8 @@ const (
 	conversationActionReRunStage    = "re-run-stage"
 )
 
+var ErrConversationRunNotReadable = errors.New("conversation run is not readable")
+
 // SubmitConversationMessage persists one user message and queues a managed
 // agent turn for that message. The turn is intentionally not a workflow run: it
 // is a per-message AgentAdapter dispatch that rehydrates from persisted Messages
@@ -259,14 +261,14 @@ func (e *Engine) executeConversationAction(ctx context.Context, projectID, conve
 			return store.WorkflowRun{}, err
 		}
 		if wr.Run.ProjectID != projectID {
-			return store.WorkflowRun{}, fmt.Errorf("run %q is not readable from project %q", action.RunID, projectID)
+			return store.WorkflowRun{}, fmt.Errorf("%w: run %q is not readable from project %q", ErrConversationRunNotReadable, action.RunID, projectID)
 		}
 		conversation, err := e.store.GetConversation(ctx, conversationID)
 		if err != nil {
 			return store.WorkflowRun{}, err
 		}
 		if conversation.ProjectID != projectID {
-			return store.WorkflowRun{}, fmt.Errorf("conversation %q is not in project %q", conversationID, projectID)
+			return store.WorkflowRun{}, fmt.Errorf("%w: conversation %q is not in project %q", ErrConversationRunNotReadable, conversationID, projectID)
 		}
 		if _, err := e.ReRunStage(ctx, action.RunID, action.Stage); err != nil {
 			return store.WorkflowRun{}, err
