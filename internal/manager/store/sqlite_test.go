@@ -426,6 +426,96 @@ func TestProjectWorkflowTemplatePolicyPersistsAndRoundTrips(t *testing.T) {
 	}
 }
 
+func TestProjectWorkflowTemplatePolicyRejectsNonFloorTemplates(t *testing.T) {
+	ctx := context.Background()
+
+	cases := []struct {
+		name       string
+		attempt    ProjectWorkflowTemplatePolicy
+		wantErrFor string
+	}{
+		{
+			name: "default",
+			attempt: ProjectWorkflowTemplatePolicy{
+				DefaultTemplateID:  workflow.DirectCommitID,
+				SmallFixTemplateID: workflow.QuickFixDeliveryID,
+			},
+			wantErrFor: "default workflow template \"" + workflow.DirectCommitID + "\" is not selectable by the conversational agent",
+		},
+		{
+			name: "small-fix",
+			attempt: ProjectWorkflowTemplatePolicy{
+				DefaultTemplateID:  workflow.BalancedPRDeliveryID,
+				SmallFixTemplateID: workflow.AutonomousPRDeliveryID,
+			},
+			wantErrFor: "small-fix workflow template \"" + workflow.AutonomousPRDeliveryID + "\" is not selectable by the conversational agent",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, err := Open(ctx, t.TempDir())
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			defer st.Close()
+
+			baseline := ProjectWorkflowTemplatePolicy{DefaultTemplateID: workflow.BalancedPRDeliveryID, SmallFixTemplateID: workflow.QuickFixDeliveryID}
+			if _, err := st.UpdateProjectWorkflowTemplatePolicy(ctx, DefaultProjectID, baseline); err != nil {
+				t.Fatalf("seed floor-meeting workflow template policy: %v", err)
+			}
+
+			if _, err := st.UpdateProjectWorkflowTemplatePolicy(ctx, DefaultProjectID, tc.attempt); err == nil {
+				t.Fatal("update workflow template policy accepted non-floor template")
+			} else if !strings.Contains(err.Error(), tc.wantErrFor) || !strings.Contains(err.Error(), "lacks a human gate before the target branch") {
+				t.Fatalf("non-floor policy error = %v, want human-gate floor error for %s", err, tc.wantErrFor)
+			}
+
+			project, err := st.GetProject(ctx, DefaultProjectID)
+			if err != nil {
+				t.Fatalf("get project after rejected policy: %v", err)
+			}
+			if project.WorkflowTemplateDefaultID != baseline.DefaultTemplateID || project.WorkflowTemplateSmallFixID != baseline.SmallFixTemplateID {
+				t.Fatalf("rejected policy updated row to %q/%q, want %q/%q", project.WorkflowTemplateDefaultID, project.WorkflowTemplateSmallFixID, baseline.DefaultTemplateID, baseline.SmallFixTemplateID)
+			}
+		})
+	}
+}
+
+func TestProjectWorkflowTemplatePolicyAcceptsFloorMeetingTemplates(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	updated, err := st.UpdateProjectWorkflowTemplatePolicy(ctx, DefaultProjectID, ProjectWorkflowTemplatePolicy{DefaultTemplateID: workflow.BalancedPRDeliveryID, SmallFixTemplateID: workflow.QuickFixDeliveryID})
+	if err != nil {
+		t.Fatalf("update floor-meeting workflow template policy: %v", err)
+	}
+	if updated.WorkflowTemplateDefaultID != workflow.BalancedPRDeliveryID || updated.WorkflowTemplateSmallFixID != workflow.QuickFixDeliveryID {
+		t.Fatalf("updated workflow template policy = %q/%q, want %q/%q", updated.WorkflowTemplateDefaultID, updated.WorkflowTemplateSmallFixID, workflow.BalancedPRDeliveryID, workflow.QuickFixDeliveryID)
+	}
+}
+
+func TestProjectWorkflowTemplatePolicyMissingTemplateKeepsExistenceError(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	_, err = st.UpdateProjectWorkflowTemplatePolicy(ctx, DefaultProjectID, ProjectWorkflowTemplatePolicy{DefaultTemplateID: "missing_template"})
+	if err == nil {
+		t.Fatal("update workflow template policy accepted missing template")
+	}
+	if !errors.Is(err, sql.ErrNoRows) || !strings.Contains(err.Error(), "default workflow template \"missing_template\":") {
+		t.Fatalf("missing template policy error = %v, want default existence error wrapping sql.ErrNoRows", err)
+	}
+}
+
 func TestProjectNotificationPreferencesDefaultOnAndAppState(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

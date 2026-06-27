@@ -116,14 +116,25 @@ func (s *Store) UpdateProjectWorkflowTemplatePolicy(ctx context.Context, project
 
 func (s *Store) validateProjectWorkflowTemplatePolicy(ctx context.Context, policy ProjectWorkflowTemplatePolicy) error {
 	if policy.DefaultTemplateID != "" {
-		if _, err := s.GetWorkflowTemplate(ctx, policy.DefaultTemplateID); err != nil {
-			return fmt.Errorf("default workflow template %q: %w", policy.DefaultTemplateID, err)
+		if err := s.validateProjectWorkflowTemplatePolicyEntry(ctx, "default", policy.DefaultTemplateID); err != nil {
+			return err
 		}
 	}
 	if policy.SmallFixTemplateID != "" {
-		if _, err := s.GetWorkflowTemplate(ctx, policy.SmallFixTemplateID); err != nil {
-			return fmt.Errorf("small-fix workflow template %q: %w", policy.SmallFixTemplateID, err)
+		if err := s.validateProjectWorkflowTemplatePolicyEntry(ctx, "small-fix", policy.SmallFixTemplateID); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+func (s *Store) validateProjectWorkflowTemplatePolicyEntry(ctx context.Context, label, templateID string) error {
+	template, err := s.GetWorkflowTemplate(ctx, templateID)
+	if err != nil {
+		return fmt.Errorf("%s workflow template %q: %w", label, templateID, err)
+	}
+	if !workflow.MeetsHumanGateFloor(template) {
+		return fmt.Errorf("%s workflow template %q is not selectable by the conversational agent: it lacks a human gate before the target branch", label, template.ID)
 	}
 	return nil
 }
