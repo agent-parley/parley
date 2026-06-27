@@ -56,6 +56,28 @@ func TestPredefinedTemplatesValidateAndExposeFiveDeliveryPatterns(t *testing.T) 
 	}
 }
 
+func TestPredefinedTemplatesHumanGateFloorClassification(t *testing.T) {
+	want := map[string]bool{
+		BalancedPRDeliveryID:   true,
+		CarefulReviewID:        true,
+		QuickFixDeliveryID:     true,
+		DirectCommitID:         false,
+		AutonomousPRDeliveryID: false,
+	}
+	seen := map[string]bool{}
+	for _, template := range PredefinedTemplates() {
+		seen[template.ID] = true
+		if got := MeetsHumanGateFloor(template); got != want[template.ID] {
+			t.Fatalf("MeetsHumanGateFloor(%s) = %v, want %v", template.ID, got, want[template.ID])
+		}
+	}
+	for id := range want {
+		if !seen[id] {
+			t.Fatalf("predefined template %s was not classified", id)
+		}
+	}
+}
+
 func TestQuickFixDeliveryIsSlimPRGatedAndOptIn(t *testing.T) {
 	template := quickFixDelivery()
 	if err := ValidateTemplate(template); err != nil {

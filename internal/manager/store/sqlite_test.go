@@ -340,6 +340,13 @@ func TestProjectRulesPreferencesMigrationAddsColumnsToExistingProjects(t *testin
 	if project.ProjectRules != "" || project.ProjectPreferences != "" {
 		t.Fatalf("migrated project rules/preferences = %q/%q, want empty defaults", project.ProjectRules, project.ProjectPreferences)
 	}
+	policy, err := st.GetProjectWorkflowTemplatePolicy(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get migrated workflow template policy: %v", err)
+	}
+	if policy.DefaultTemplateID != workflow.DefaultTemplateID || policy.SmallFixTemplateID != "" {
+		t.Fatalf("migrated workflow template policy = %+v, want Balanced default and no small-fix", policy)
+	}
 	if !project.NotificationOnlyWhenNeeded || !project.NotificationWhenFinished {
 		t.Fatalf("migrated notification prefs = %+v, want default on", project)
 	}
@@ -349,6 +356,73 @@ func TestProjectRulesPreferencesMigrationAddsColumnsToExistingProjects(t *testin
 	}
 	if updated.ProjectRules != "Migrated DB accepts rules.\n" {
 		t.Fatalf("updated migrated project rules = %q", updated.ProjectRules)
+	}
+}
+
+func TestProjectWorkflowTemplatePolicyPersistsAndRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	policy, err := st.GetProjectWorkflowTemplatePolicy(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get default workflow template policy: %v", err)
+	}
+	if policy.DefaultTemplateID != workflow.DefaultTemplateID || policy.SmallFixTemplateID != "" {
+		t.Fatalf("default workflow template policy = %+v, want default %s and no small-fix", policy, workflow.DefaultTemplateID)
+	}
+
+	updated, err := st.UpdateProjectWorkflowTemplatePolicy(ctx, DefaultProjectID, ProjectWorkflowTemplatePolicy{DefaultTemplateID: workflow.CarefulReviewID, SmallFixTemplateID: workflow.QuickFixDeliveryID})
+	if err != nil {
+		t.Fatalf("update workflow template policy: %v", err)
+	}
+	if updated.WorkflowTemplateDefaultID != workflow.CarefulReviewID || updated.WorkflowTemplateSmallFixID != workflow.QuickFixDeliveryID {
+		t.Fatalf("updated project workflow template policy columns = %q/%q", updated.WorkflowTemplateDefaultID, updated.WorkflowTemplateSmallFixID)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	st, err = Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer st.Close()
+	persisted, err := st.GetProjectWorkflowTemplatePolicy(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get persisted workflow template policy: %v", err)
+	}
+	if persisted.DefaultTemplateID != workflow.CarefulReviewID || persisted.SmallFixTemplateID != workflow.QuickFixDeliveryID {
+		t.Fatalf("persisted workflow template policy = %+v", persisted)
+	}
+
+	if _, err := st.EnsureProject(ctx, DefaultProjectSpec(dataDir)); err != nil {
+		t.Fatalf("ensure project after workflow template policy update: %v", err)
+	}
+	roundTrip, err := st.GetProjectWorkflowTemplatePolicy(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get round-trip workflow template policy: %v", err)
+	}
+	if roundTrip != persisted {
+		t.Fatalf("ensure project erased workflow template policy: got %+v want %+v", roundTrip, persisted)
+	}
+
+	cleared, err := st.UpdateProjectWorkflowTemplatePolicy(ctx, DefaultProjectID, ProjectWorkflowTemplatePolicy{})
+	if err != nil {
+		t.Fatalf("clear workflow template policy: %v", err)
+	}
+	if cleared.WorkflowTemplateDefaultID != "" || cleared.WorkflowTemplateSmallFixID != "" {
+		t.Fatalf("cleared raw workflow template policy = %q/%q, want empty storage", cleared.WorkflowTemplateDefaultID, cleared.WorkflowTemplateSmallFixID)
+	}
+	fallback, err := st.GetProjectWorkflowTemplatePolicy(ctx, DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get fallback workflow template policy: %v", err)
+	}
+	if fallback.DefaultTemplateID != workflow.DefaultTemplateID || fallback.SmallFixTemplateID != "" {
+		t.Fatalf("fallback workflow template policy = %+v", fallback)
 	}
 }
 

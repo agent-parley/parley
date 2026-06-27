@@ -95,6 +95,8 @@ type Project struct {
 	Description                string
 	ProjectRules               string
 	ProjectPreferences         string
+	WorkflowTemplateDefaultID  string
+	WorkflowTemplateSmallFixID string
 	NotificationOnlyWhenNeeded bool
 	NotificationWhenFinished   bool
 	WorkspacePath              string
@@ -335,6 +337,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureProjectRulesPreferencesSchema(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureProjectWorkflowTemplatePolicySchema(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureProjectNotificationPreferencesSchema(ctx); err != nil {
 		return err
 	}
@@ -424,6 +429,24 @@ func (s *Store) ensureProjectRulesPreferencesSchema(ctx context.Context) error {
 	if _, ok := cols["project_preferences"]; !ok {
 		if _, err := s.db.ExecContext(ctx, `ALTER TABLE projects ADD COLUMN project_preferences TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("add project preferences column: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureProjectWorkflowTemplatePolicySchema(ctx context.Context) error {
+	cols, err := s.tableColumns(ctx, "projects")
+	if err != nil {
+		return err
+	}
+	if _, ok := cols["workflow_template_default_id"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE projects ADD COLUMN workflow_template_default_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add workflow template default column: %w", err)
+		}
+	}
+	if _, ok := cols["workflow_template_small_fix_id"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE projects ADD COLUMN workflow_template_small_fix_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add workflow template small-fix column: %w", err)
 		}
 	}
 	return nil
@@ -556,8 +579,8 @@ func (s *Store) normalizeProjectSpec(spec ProjectSpec) ProjectSpec {
 func (s *Store) GetProject(ctx context.Context, projectID string) (Project, error) {
 	var project Project
 	var auto, notifyNeeded, notifyFinished int
-	err := s.db.QueryRowContext(ctx, `SELECT p.id, p.name, p.description, p.project_rules, p.project_preferences, p.notification_only_when_needed, p.notification_when_finished, w.path, p.queue_auto_when_ready, p.queue_max_concurrent, p.queue_backlog_cap, p.created_at, p.updated_at
-FROM projects p JOIN workspaces w ON w.project_id = p.id WHERE p.id = ?`, projectID).Scan(&project.ID, &project.Name, &project.Description, &project.ProjectRules, &project.ProjectPreferences, &notifyNeeded, &notifyFinished, &project.WorkspacePath, &auto, &project.QueueMaxConcurrent, &project.QueueBacklogCap, &project.CreatedAt, &project.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT p.id, p.name, p.description, p.project_rules, p.project_preferences, p.workflow_template_default_id, p.workflow_template_small_fix_id, p.notification_only_when_needed, p.notification_when_finished, w.path, p.queue_auto_when_ready, p.queue_max_concurrent, p.queue_backlog_cap, p.created_at, p.updated_at
+FROM projects p JOIN workspaces w ON w.project_id = p.id WHERE p.id = ?`, projectID).Scan(&project.ID, &project.Name, &project.Description, &project.ProjectRules, &project.ProjectPreferences, &project.WorkflowTemplateDefaultID, &project.WorkflowTemplateSmallFixID, &notifyNeeded, &notifyFinished, &project.WorkspacePath, &auto, &project.QueueMaxConcurrent, &project.QueueBacklogCap, &project.CreatedAt, &project.UpdatedAt)
 	if err != nil {
 		return Project{}, fmt.Errorf("get project %s: %w", projectID, err)
 	}
@@ -568,7 +591,7 @@ FROM projects p JOIN workspaces w ON w.project_id = p.id WHERE p.id = ?`, projec
 }
 
 func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT p.id, p.name, p.description, p.project_rules, p.project_preferences, p.notification_only_when_needed, p.notification_when_finished, w.path, p.queue_auto_when_ready, p.queue_max_concurrent, p.queue_backlog_cap, p.created_at, p.updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT p.id, p.name, p.description, p.project_rules, p.project_preferences, p.workflow_template_default_id, p.workflow_template_small_fix_id, p.notification_only_when_needed, p.notification_when_finished, w.path, p.queue_auto_when_ready, p.queue_max_concurrent, p.queue_backlog_cap, p.created_at, p.updated_at
 FROM projects p JOIN workspaces w ON w.project_id = p.id ORDER BY p.created_at DESC, p.id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list projects: %w", err)
@@ -578,7 +601,7 @@ FROM projects p JOIN workspaces w ON w.project_id = p.id ORDER BY p.created_at D
 	for rows.Next() {
 		var project Project
 		var auto, notifyNeeded, notifyFinished int
-		if err := rows.Scan(&project.ID, &project.Name, &project.Description, &project.ProjectRules, &project.ProjectPreferences, &notifyNeeded, &notifyFinished, &project.WorkspacePath, &auto, &project.QueueMaxConcurrent, &project.QueueBacklogCap, &project.CreatedAt, &project.UpdatedAt); err != nil {
+		if err := rows.Scan(&project.ID, &project.Name, &project.Description, &project.ProjectRules, &project.ProjectPreferences, &project.WorkflowTemplateDefaultID, &project.WorkflowTemplateSmallFixID, &notifyNeeded, &notifyFinished, &project.WorkspacePath, &auto, &project.QueueMaxConcurrent, &project.QueueBacklogCap, &project.CreatedAt, &project.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan project: %w", err)
 		}
 		project.NotificationOnlyWhenNeeded = notifyNeeded != 0

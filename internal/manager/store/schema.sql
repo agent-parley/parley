@@ -4,6 +4,8 @@ CREATE TABLE IF NOT EXISTS projects (
   description TEXT NOT NULL DEFAULT '',
   project_rules TEXT NOT NULL DEFAULT '',
   project_preferences TEXT NOT NULL DEFAULT '',
+  workflow_template_default_id TEXT NOT NULL DEFAULT '',
+  workflow_template_small_fix_id TEXT NOT NULL DEFAULT '',
   notification_only_when_needed INTEGER NOT NULL DEFAULT 1,
   notification_when_finished INTEGER NOT NULL DEFAULT 1,
   queue_auto_when_ready INTEGER NOT NULL DEFAULT 1,

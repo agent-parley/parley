@@ -91,6 +91,66 @@ func TestSubmitConversationMessageDispatchesFreshAgentTurnAndPersistsReply(t *te
 	}
 }
 
+func TestConversationDispatchInputAdvertisesFloorMeetingTemplates(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	project, err := st.EnsureProject(ctx, store.ProjectSpec{ID: store.DefaultProjectID, Name: "Default project", RepositoryPath: t.TempDir()})
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	if _, err := st.UpdateProjectWorkflowTemplatePolicy(ctx, project.ID, store.ProjectWorkflowTemplatePolicy{DefaultTemplateID: workflow.CarefulReviewID, SmallFixTemplateID: workflow.QuickFixDeliveryID}); err != nil {
+		t.Fatalf("update workflow template policy: %v", err)
+	}
+	conversation, err := st.EnsureProjectConversation(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	message, err := st.AddMessage(ctx, conversation.ID, store.MessageRoleUser, "Fix a typo")
+	if err != nil {
+		t.Fatalf("add message: %v", err)
+	}
+	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{ConversationAdapter: "chat-agent"})
+	registerEngineTeardown(t, engine, st)
+
+	input, err := engine.conversationDispatchInput(ctx, project, conversation, message.ID)
+	if err != nil {
+		t.Fatalf("conversationDispatchInput() error = %v", err)
+	}
+	selection, ok := input["workflow_template_selection"].(map[string]any)
+	if !ok {
+		t.Fatalf("workflow_template_selection = %#v, want object", input["workflow_template_selection"])
+	}
+	if selection["default_template_id"] != workflow.CarefulReviewID || selection["small_fix_template_id"] != workflow.QuickFixDeliveryID {
+		t.Fatalf("workflow template selection policy = %#v", selection)
+	}
+	selectable, ok := selection["selectable_templates"].([]map[string]any)
+	if !ok {
+		t.Fatalf("selectable_templates = %#v, want []map", selection["selectable_templates"])
+	}
+	seen := map[string][]string{}
+	for _, item := range selectable {
+		id, _ := item["id"].(string)
+		sources, _ := item["sources"].([]string)
+		seen[id] = sources
+	}
+	for _, id := range []string{workflow.BalancedPRDeliveryID, workflow.CarefulReviewID, workflow.QuickFixDeliveryID} {
+		if _, ok := seen[id]; !ok {
+			t.Fatalf("selectable templates missing %s: %#v", id, selectable)
+		}
+	}
+	for _, id := range []string{workflow.DirectCommitID, workflow.AutonomousPRDeliveryID} {
+		if _, ok := seen[id]; ok {
+			t.Fatalf("non-floor template %s was advertised: %#v", id, selectable)
+		}
+	}
+	if !stringSliceContains(seen[workflow.CarefulReviewID], "default") || !stringSliceContains(seen[workflow.QuickFixDeliveryID], "small_fix") {
+		t.Fatalf("selection sources = %#v, want default Careful and small-fix Quick Fix", seen)
+	}
+}
+
 func TestConversationTurnsForOneConversationAreSerializedFIFO(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
@@ -545,13 +605,13 @@ func TestValidateConversationActionsAcceptsCreateTask(t *testing.T) {
 	}
 
 	singular, err := validateConversationActions(map[string]any{
-		"action": map[string]any{"type": conversationActionCreateTask, "idea": brief},
+		"action": map[string]any{"type": conversationActionCreateTask, "idea": brief, "template": workflow.QuickFixDeliveryID},
 	}, []string{conversationActionCreateTask})
 	if err != nil {
 		t.Fatalf("validateConversationActions() singular error = %v", err)
 	}
-	if singular == nil || singular.Idea != brief {
-		t.Fatalf("singular action = %#v, want verbatim brief", singular)
+	if singular == nil || singular.Idea != brief || singular.Template != workflow.QuickFixDeliveryID {
+		t.Fatalf("singular action = %#v, want verbatim brief and template", singular)
 	}
 }
 
@@ -667,6 +727,7 @@ func TestValidateConversationActionsRejectsNonAllowListedAndMalformed(t *testing
 		{name: "missing idea", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask}}}},
 		{name: "too many actions", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask, "idea": brief}, map[string]any{"type": conversationActionCreateTask, "idea": brief}}}},
 		{name: "unsupported field", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask, "idea": brief, "workflow_template_id": workflow.DirectCommitID}}}},
+		{name: "non-string template", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask, "idea": brief, "template": 42}}}},
 		{name: "non-sectioned brief", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask, "idea": "Just build it."}}}},
 		{name: "malformed actions", payload: map[string]any{"actions": "create-Task"}},
 	}
@@ -704,8 +765,8 @@ func TestConversationCreateTaskActionCreatesDirectBalancedRunLinkedToConversatio
 		t.Fatalf("agent reply = %#v", messages[len(messages)-2])
 	}
 	last := messages[len(messages)-1]
-	if last.Role != store.MessageRoleAssistant || !strings.Contains(last.Body, "awaiting `plan_review_human`") {
-		t.Fatalf("last message = %#v, want task-created plan-review note", last)
+	if last.Role != store.MessageRoleAssistant || !strings.Contains(last.Body, "workflow template `balanced_pr_delivery`") {
+		t.Fatalf("last message = %#v, want task-created template note", last)
 	}
 	runs, err := st.ListRunsForProject(ctx, store.DefaultProjectID)
 	if err != nil {
@@ -730,6 +791,160 @@ func TestConversationCreateTaskActionCreatesDirectBalancedRunLinkedToConversatio
 	}
 	if wr.Task.ConversationID != conversation.ID {
 		t.Fatalf("task conversation_id = %q, want %q", wr.Task.ConversationID, conversation.ID)
+	}
+}
+
+func TestConversationCreateTaskActionHonorsFloorMeetingTemplateChoice(t *testing.T) {
+	for _, templateID := range []string{workflow.BalancedPRDeliveryID, workflow.CarefulReviewID, workflow.QuickFixDeliveryID} {
+		t.Run(templateID, func(t *testing.T) {
+			ctx := context.Background()
+			st, err := store.Open(ctx, t.TempDir())
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{
+				ConversationAdapter: "chat-agent",
+				QueuePolicy:         &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 100},
+			})
+			registerEngineTeardown(t, engine, st)
+			conversation, err := st.EnsureProjectConversation(ctx, store.DefaultProjectID)
+			if err != nil {
+				t.Fatalf("ensure conversation: %v", err)
+			}
+
+			wr, err := engine.executeConversationAction(ctx, store.DefaultProjectID, conversation.ID, conversationAction{Type: conversationActionCreateTask, Idea: sectionedConversationBrief(), Template: templateID})
+			if err != nil {
+				t.Fatalf("executeConversationAction() error = %v", err)
+			}
+			if wr.Run.WorkflowTemplateID != templateID {
+				t.Fatalf("workflow template = %q, want %q", wr.Run.WorkflowTemplateID, templateID)
+			}
+			if wr.Task.ConversationID != conversation.ID {
+				t.Fatalf("task conversation_id = %q, want %q", wr.Task.ConversationID, conversation.ID)
+			}
+		})
+	}
+}
+
+func TestConversationCreateTaskActionRejectsNonFloorTemplateChoice(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{
+		ConversationAdapter: "chat-agent",
+		QueuePolicy:         &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 100},
+	})
+	registerEngineTeardown(t, engine, st)
+	conversation, err := st.EnsureProjectConversation(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+
+	_, err = engine.executeConversationAction(ctx, store.DefaultProjectID, conversation.ID, conversationAction{Type: conversationActionCreateTask, Idea: sectionedConversationBrief(), Template: workflow.DirectCommitID})
+	if err == nil || !strings.Contains(err.Error(), "lacks a human gate before the target branch") {
+		t.Fatalf("executeConversationAction() error = %v, want human-gate rejection", err)
+	}
+	runs, err := st.ListRunsForProject(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("runs = %#v, want no created run", runs)
+	}
+}
+
+func TestConversationCreateTaskActionUsesConfiguredDefaultTemplate(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := st.UpdateProjectWorkflowTemplatePolicy(ctx, store.DefaultProjectID, store.ProjectWorkflowTemplatePolicy{DefaultTemplateID: workflow.CarefulReviewID}); err != nil {
+		t.Fatalf("update workflow template policy: %v", err)
+	}
+	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{
+		ConversationAdapter: "chat-agent",
+		QueuePolicy:         &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 100},
+	})
+	registerEngineTeardown(t, engine, st)
+	conversation, err := st.EnsureProjectConversation(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+
+	wr, err := engine.executeConversationAction(ctx, store.DefaultProjectID, conversation.ID, conversationAction{Type: conversationActionCreateTask, Idea: sectionedConversationBrief()})
+	if err != nil {
+		t.Fatalf("executeConversationAction() error = %v", err)
+	}
+	if wr.Run.WorkflowTemplateID != workflow.CarefulReviewID {
+		t.Fatalf("workflow template = %q, want configured default %q", wr.Run.WorkflowTemplateID, workflow.CarefulReviewID)
+	}
+}
+
+func TestConversationCreateTaskActionRejectsConfiguredNonFloorDefault(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := st.UpdateProjectWorkflowTemplatePolicy(ctx, store.DefaultProjectID, store.ProjectWorkflowTemplatePolicy{DefaultTemplateID: workflow.DirectCommitID}); err != nil {
+		t.Fatalf("update workflow template policy: %v", err)
+	}
+	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{
+		ConversationAdapter: "chat-agent",
+		QueuePolicy:         &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 100},
+	})
+	registerEngineTeardown(t, engine, st)
+	conversation, err := st.EnsureProjectConversation(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+
+	_, err = engine.executeConversationAction(ctx, store.DefaultProjectID, conversation.ID, conversationAction{Type: conversationActionCreateTask, Idea: sectionedConversationBrief()})
+	if err == nil || !strings.Contains(err.Error(), "not selectable") {
+		t.Fatalf("executeConversationAction() error = %v, want configured default rejection", err)
+	}
+}
+
+func TestConversationCreateTaskActionFromAgentSmallFixTemplateStartsQuickFixRun(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := st.UpdateProjectWorkflowTemplatePolicy(ctx, store.DefaultProjectID, store.ProjectWorkflowTemplatePolicy{SmallFixTemplateID: workflow.QuickFixDeliveryID}); err != nil {
+		t.Fatalf("update workflow template policy: %v", err)
+	}
+	brief := sectionedConversationBriefWithMarkdown()
+	runner := &conversationTestRunner{dispatches: make(chan contract.Dispatch, 1), payload: map[string]any{
+		"reply_markdown": "I have enough to create a small-fix Task.",
+		"actions":        []any{map[string]any{"type": conversationActionCreateTask, "idea": brief, "template": workflow.QuickFixDeliveryID}},
+	}}
+	engine := newRecordingEngine(t, st, runner, EngineOptions{
+		ConversationAdapter: "chat-agent",
+		QueuePolicy:         &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 100},
+	})
+	conversation, err := st.EnsureProjectConversation(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	if _, err := engine.SubmitConversationMessage(ctx, store.DefaultProjectID, "Please make a trivial fix"); err != nil {
+		t.Fatalf("SubmitConversationMessage() error = %v", err)
+	}
+	_ = receiveDispatch(t, runner.dispatches)
+	messages := waitForConversationMessages(t, st, conversation.ID, 3)
+	last := messages[len(messages)-1]
+	if last.Role != store.MessageRoleAssistant || !strings.Contains(last.Body, "workflow template `quick_fix_delivery`") {
+		t.Fatalf("last message = %#v, want quick-fix task-created note", last)
+	}
+	runs, err := st.ListRunsForProject(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	if len(runs) != 1 || runs[0].WorkflowTemplateID != workflow.QuickFixDeliveryID {
+		t.Fatalf("runs = %#v, want one Quick Fix run", runs)
 	}
 }
 
@@ -801,6 +1016,15 @@ func conversationBriefSections(sections ...[2]string) string {
 		parts = append(parts, "## "+section[0]+"\n"+section[1])
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 type managedConversationRunner struct {
