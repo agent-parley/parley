@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -55,9 +56,7 @@ func TestSubmitConversationMessageDispatchesFreshAgentTurnAndPersistsReply(t *te
 	if got := disp.Input["input_mode"]; got != contract.AdapterInputModeConversation {
 		t.Fatalf("input_mode = %v, want conversation", got)
 	}
-	if actions, ok := disp.Input["allowed_actions"].([]string); !ok || len(actions) != 1 || actions[0] != conversationActionCreateTask {
-		t.Fatalf("allowed_actions = %#v, want create-Task allow-list", disp.Input["allowed_actions"])
-	}
+	assertAllowedConversationActions(t, disp.Input["allowed_actions"])
 	repository, ok := disp.Input["repository"].(map[string]any)
 	if !ok || repository["mode"] != "read_only" || repository["mount_path"] != "/project/repo" {
 		t.Fatalf("repository input = %#v, want read-only /project/repo", disp.Input["repository"])
@@ -488,9 +487,7 @@ func TestConversationDispatchInputIncludesReadOnlyOrchestrationState(t *testing.
 	if err != nil {
 		t.Fatalf("conversationDispatchInput() error = %v", err)
 	}
-	if actions, ok := input["allowed_actions"].([]string); !ok || len(actions) != 1 || actions[0] != conversationActionCreateTask {
-		t.Fatalf("allowed_actions = %#v, want create-Task allow-list", input["allowed_actions"])
-	}
+	assertAllowedConversationActions(t, input["allowed_actions"])
 	state, ok := input["orchestration_state"].(conversationOrchestrationState)
 	if !ok {
 		t.Fatalf("orchestration_state = %#v, want structured state", input["orchestration_state"])
@@ -564,9 +561,7 @@ func TestConversationReadOrchestrationNoActionReplyDoesNotCreateWork(t *testing.
 		t.Fatalf("SubmitConversationMessage() error = %v", err)
 	}
 	disp := receiveDispatch(t, runner.dispatches)
-	if actions, ok := disp.Input["allowed_actions"].([]string); !ok || len(actions) != 1 || actions[0] != conversationActionCreateTask {
-		t.Fatalf("allowed_actions = %#v, want create-Task allow-list", disp.Input["allowed_actions"])
-	}
+	assertAllowedConversationActions(t, disp.Input["allowed_actions"])
 	if _, ok := disp.Input["orchestration_state"].(conversationOrchestrationState); !ok {
 		t.Fatalf("orchestration_state = %#v, want structured state", disp.Input["orchestration_state"])
 	}
@@ -612,6 +607,29 @@ func TestValidateConversationActionsAcceptsCreateTask(t *testing.T) {
 	}
 	if singular == nil || singular.Idea != brief || singular.Template != workflow.QuickFixDeliveryID {
 		t.Fatalf("singular action = %#v, want verbatim brief and template", singular)
+	}
+}
+
+func TestValidateConversationActionsAcceptsReRunStage(t *testing.T) {
+	action, err := validateConversationActions(map[string]any{
+		"reply_markdown": "Re-running validation.",
+		"actions":        []any{map[string]any{"type": conversationActionReRunStage, "run_id": " run_123 ", "stage": " validation "}},
+	}, []string{conversationActionCreateTask, conversationActionReRunStage})
+	if err != nil {
+		t.Fatalf("validateConversationActions() error = %v", err)
+	}
+	if action == nil || action.Type != conversationActionReRunStage || action.RunID != "run_123" || action.Stage != "validation" {
+		t.Fatalf("action = %#v, want re-run-stage with trimmed run/stage", action)
+	}
+
+	singular, err := validateConversationActions(map[string]any{
+		"action": map[string]any{"type": conversationActionReRunStage, "run_id": "run_456", "stage": "change_review_agent"},
+	}, []string{conversationActionReRunStage})
+	if err != nil {
+		t.Fatalf("validateConversationActions() singular error = %v", err)
+	}
+	if singular == nil || singular.RunID != "run_456" || singular.Stage != "change_review_agent" {
+		t.Fatalf("singular action = %#v, want re-run-stage run/stage", singular)
 	}
 }
 
@@ -718,7 +736,7 @@ func TestValidateConversationBriefRejectsRequiredSectionViolations(t *testing.T)
 
 func TestValidateConversationActionsRejectsNonAllowListedAndMalformed(t *testing.T) {
 	brief := sectionedConversationBrief()
-	allowed := []string{conversationActionCreateTask}
+	allowed := []string{conversationActionCreateTask, conversationActionReRunStage}
 	cases := []struct {
 		name    string
 		payload map[string]any
@@ -726,9 +744,13 @@ func TestValidateConversationActionsRejectsNonAllowListedAndMalformed(t *testing
 		{name: "unknown action", payload: map[string]any{"actions": []any{map[string]any{"type": "rerun-stage", "idea": brief}}}},
 		{name: "missing idea", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask}}}},
 		{name: "too many actions", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask, "idea": brief}, map[string]any{"type": conversationActionCreateTask, "idea": brief}}}},
-		{name: "unsupported field", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask, "idea": brief, "workflow_template_id": workflow.DirectCommitID}}}},
+		{name: "unsupported create field", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask, "idea": brief, "workflow_template_id": workflow.DirectCommitID}}}},
 		{name: "non-string template", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask, "idea": brief, "template": 42}}}},
 		{name: "non-sectioned brief", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionCreateTask, "idea": "Just build it."}}}},
+		{name: "missing rerun run", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionReRunStage, "stage": "validation"}}}},
+		{name: "missing rerun stage", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionReRunStage, "run_id": "run_123"}}}},
+		{name: "non-string rerun run", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionReRunStage, "run_id": 123, "stage": "validation"}}}},
+		{name: "unsupported rerun field", payload: map[string]any{"actions": []any{map[string]any{"type": conversationActionReRunStage, "run_id": "run_123", "stage": "validation", "idea": brief}}}},
 		{name: "malformed actions", payload: map[string]any{"actions": "create-Task"}},
 	}
 	for _, tc := range cases {
@@ -948,6 +970,112 @@ func TestConversationCreateTaskActionFromAgentSmallFixTemplateStartsQuickFixRun(
 	}
 }
 
+func TestConversationReRunStageActionFromAgentStartsNewAttempt(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	conversation, err := st.EnsureProjectConversation(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	template := stageRerunTemplate("conversation_rerun", false)
+	if err := st.CreateWorkflowTemplate(ctx, template); err != nil {
+		t.Fatalf("create template: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "rerun from chat", WorkflowTemplateID: template.ID, ConversationID: conversation.ID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := st.SaveWorkflowSnapshot(ctx, wr.Run.ID, map[string]any{"workflow_template_snapshot": template}); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+	if err := st.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusCompleted); err != nil {
+		t.Fatalf("complete run: %v", err)
+	}
+	beforeAttempts, err := st.CountAttemptsForRun(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("count attempts before: %v", err)
+	}
+	runner := &conversationStageReRunRunner{dispatches: make(chan contract.Dispatch, 8), payload: map[string]any{
+		"reply_markdown": "Re-running implementation for that run.",
+		"actions":        []any{map[string]any{"type": conversationActionReRunStage, "run_id": wr.Run.ID, "stage": "implementation"}},
+	}}
+	engine := newRecordingEngine(t, st, runner, EngineOptions{
+		ConversationAdapter: "chat-agent",
+		QueuePolicy:         &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 100},
+	})
+
+	if _, err := engine.SubmitConversationMessage(ctx, store.DefaultProjectID, "Please re-run implementation for the last run"); err != nil {
+		t.Fatalf("SubmitConversationMessage() error = %v", err)
+	}
+	disp := receiveDispatch(t, runner.dispatches)
+	if disp.StageType != contract.StageTypeConversation {
+		t.Fatalf("first dispatch stage type = %q, want conversation", disp.StageType)
+	}
+	messages := waitForConversationMessages(t, st, conversation.ID, 3)
+	if messages[len(messages)-2].Body != "Re-running implementation for that run." {
+		t.Fatalf("agent reply = %#v", messages[len(messages)-2])
+	}
+	last := messages[len(messages)-1]
+	if last.Role != store.MessageRoleAssistant || !strings.Contains(last.Body, "Started re-running Run `"+wr.Run.ID+"`") || !strings.Contains(last.Body, "frozen workflow graph") {
+		t.Fatalf("last message = %#v, want re-run-started note", last)
+	}
+	waitForRunStatus(t, st, wr.Run.ID, store.RunStatusCompleted)
+	afterAttempts, err := st.CountAttemptsForRun(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("count attempts after: %v", err)
+	}
+	if afterAttempts != beforeAttempts+1 {
+		t.Fatalf("attempt count = %d, want %d", afterAttempts, beforeAttempts+1)
+	}
+	if !runner.sawStageType(contract.StageTypeImplementation) || !runner.sawStageType(contract.StageTypeValidation) {
+		t.Fatalf("dispatch stage types = %#v, want implementation and validation", runner.stageTypes())
+	}
+}
+
+func TestConversationReRunStageActionReusesEngineValidationFailClosed(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	conversation, err := st.EnsureProjectConversation(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	template := stageRerunTemplate("conversation_rerun_invalid", false)
+	if err := st.CreateWorkflowTemplate(ctx, template); err != nil {
+		t.Fatalf("create template: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "invalid rerun", WorkflowTemplateID: template.ID, ConversationID: conversation.ID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := st.SaveWorkflowSnapshot(ctx, wr.Run.ID, map[string]any{"workflow_template_snapshot": template}); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+	engine := newRecordingEngine(t, st, &recordingRerunRunner{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 100}})
+
+	beforeAttempts, beforeStatus, beforeEvents := rerunMutationSnapshot(t, st, wr.Run.ID)
+	_, err = engine.executeConversationAction(ctx, store.DefaultProjectID, conversation.ID, conversationAction{Type: conversationActionReRunStage, RunID: wr.Run.ID, Stage: "implementation"})
+	if !errors.Is(err, ErrStageReRunRunNotTerminal) {
+		t.Fatalf("executeConversationAction() error = %v, want ErrStageReRunRunNotTerminal", err)
+	}
+	assertNoRerunMutation(t, st, wr.Run.ID, beforeAttempts, beforeStatus, beforeEvents)
+
+	if err := st.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusCompleted); err != nil {
+		t.Fatalf("complete run: %v", err)
+	}
+	beforeAttempts, beforeStatus, beforeEvents = rerunMutationSnapshot(t, st, wr.Run.ID)
+	_, err = engine.executeConversationAction(ctx, store.DefaultProjectID, conversation.ID, conversationAction{Type: conversationActionReRunStage, RunID: wr.Run.ID, Stage: "stop_report"})
+	if !errors.Is(err, ErrStageReRunInvalidTarget) {
+		t.Fatalf("executeConversationAction() error = %v, want ErrStageReRunInvalidTarget", err)
+	}
+	assertNoRerunMutation(t, st, wr.Run.ID, beforeAttempts, beforeStatus, beforeEvents)
+}
+
 func TestConversationRejectsInvalidActionAndCreatesNothing(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -1016,6 +1144,23 @@ func conversationBriefSections(sections ...[2]string) string {
 		parts = append(parts, "## "+section[0]+"\n"+section[1])
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+func assertAllowedConversationActions(t *testing.T, raw any) {
+	t.Helper()
+	actions, ok := raw.([]string)
+	if !ok {
+		t.Fatalf("allowed_actions = %#v, want string allow-list", raw)
+	}
+	want := []string{conversationActionCreateTask, conversationActionReRunStage}
+	if len(actions) != len(want) {
+		t.Fatalf("allowed_actions = %#v, want %#v", actions, want)
+	}
+	for i := range want {
+		if actions[i] != want[i] {
+			t.Fatalf("allowed_actions = %#v, want %#v", actions, want)
+		}
+	}
 }
 
 func stringSliceContains(values []string, want string) bool {
@@ -1159,6 +1304,64 @@ func (r *conversationTestRunner) Dispatch(ctx context.Context, disp contract.Dis
 
 func (r *conversationTestRunner) CancelAttempt(context.Context, string, string, string) error {
 	return nil
+}
+
+type conversationStageReRunRunner struct {
+	dispatches chan contract.Dispatch
+	payload    map[string]any
+
+	mu    sync.Mutex
+	disps []contract.Dispatch
+}
+
+func (r *conversationStageReRunRunner) Dispatch(ctx context.Context, disp contract.Dispatch) (report.Report, error) {
+	r.mu.Lock()
+	r.disps = append(r.disps, disp)
+	r.mu.Unlock()
+	select {
+	case r.dispatches <- disp:
+	case <-ctx.Done():
+		return report.Report{}, ctx.Err()
+	}
+	if disp.StageType == contract.StageTypeConversation {
+		return report.Report{
+			SchemaVersion: report.SchemaVersion,
+			RunID:         disp.RunID,
+			TaskID:        disp.TaskID,
+			AttemptID:     disp.AttemptID,
+			StageID:       disp.StageID,
+			StageType:     disp.StageType,
+			Actor:         report.Actor{Kind: report.ActorKindAgent, ID: disp.Adapter},
+			Status:        report.StatusCompleted,
+			Summary:       "conversation reply",
+			Payload:       r.payload,
+			Errors:        []string{},
+		}, nil
+	}
+	return validAdapterReport(disp, "conversation re-run dispatch completed"), nil
+}
+
+func (r *conversationStageReRunRunner) CancelAttempt(context.Context, string, string, string) error {
+	return nil
+}
+
+func (r *conversationStageReRunRunner) stageTypes() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.disps))
+	for i, disp := range r.disps {
+		out[i] = disp.StageType
+	}
+	return out
+}
+
+func (r *conversationStageReRunRunner) sawStageType(stageType string) bool {
+	for _, got := range r.stageTypes() {
+		if got == stageType {
+			return true
+		}
+	}
+	return false
 }
 
 type capturingConversationBroadcaster struct {

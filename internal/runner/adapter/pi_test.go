@@ -211,7 +211,7 @@ func TestPiPrepareConversationUsesReadOnlyCommittedSnapshotAndWorkspace(t *testi
 		"trigger_message_id":           "msg_123",
 		"orchestration_state_summary":  "- Most recent included run: run_123 is completed.\n- Latest report on that run: stage review status changes_requested verdict changes_requested — review rejected stale cache handling.",
 		"orchestration_state_markdown": "# Parley Orchestration State Snapshot\n\nRun `run_123` review verdict `changes_requested`: review rejected stale cache handling.\n",
-		"allowed_actions":              []string{"create-Task"},
+		"allowed_actions":              []string{"create-Task", "re-run-stage"},
 		"workflow_template_selection": map[string]any{
 			"default_template_id":   "balanced_pr_delivery",
 			"small_fix_template_id": "quick_fix_delivery",
@@ -263,13 +263,13 @@ func TestPiPrepareConversationUsesReadOnlyCommittedSnapshotAndWorkspace(t *testi
 		t.Fatalf("orchestration-state.md missing run evidence:\n%s", stateMarkdown)
 	}
 	workerInput := readTestFile(t, prepared.WorkerInputPath)
-	for _, want := range []string{"Conversational Planning Agent", "dormant cache", "Repository tools: read, list, grep", "Orchestration state", "orchestration-state.md", "review rejected stale cache handling", "payload.reply_markdown", "Allowed actions", "create-Task", "Workflow template selection", "quick_fix_delivery", "Open assumptions"} {
+	for _, want := range []string{"Conversational Planning Agent", "dormant cache", "Repository tools: read, list, grep", "Orchestration state", "orchestration-state.md", "review rejected stale cache handling", "payload.reply_markdown", "Allowed actions", "create-Task", "re-run-stage", "terminal runs", "frozen workflow gates", "Workflow template selection", "quick_fix_delivery", "Open assumptions"} {
 		if !strings.Contains(workerInput, want) {
 			t.Fatalf("conversation worker input missing %q:\n%s", want, workerInput)
 		}
 	}
 	prompt := prepared.Invocation.Command[len(prepared.Invocation.Command)-1]
-	if !strings.Contains(prompt, prepared.ContainerWorkerInputPath) || !strings.Contains(prompt, prepared.ContainerReportPath) || !strings.Contains(prompt, "orchestration-state") || !strings.Contains(prompt, "payload.reply_markdown") || !strings.Contains(prompt, "create-Task") {
+	if !strings.Contains(prompt, prepared.ContainerWorkerInputPath) || !strings.Contains(prompt, prepared.ContainerReportPath) || !strings.Contains(prompt, "orchestration-state") || !strings.Contains(prompt, "payload.reply_markdown") || !strings.Contains(prompt, "create-Task") || !strings.Contains(prompt, "re-run-stage") {
 		t.Fatalf("conversation prompt missing input/report paths or reply contract: %#v", prepared.Invocation.Command)
 	}
 }

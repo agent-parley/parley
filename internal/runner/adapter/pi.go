@@ -854,7 +854,7 @@ func capturePiDiff(ctx context.Context, prepared PiPreparedRun, sink runnerio.Si
 
 func initialPrompt(disp contract.Dispatch, workerInputPath, reportPath string) string {
 	if isConversationDispatch(disp) {
-		return "Read " + workerInputPath + ", inspect /project/repo only through read/list/grep-style read-only evidence, read the mounted orchestration-state snapshot when project/run status matters, answer the latest user message, optionally emit only an allow-listed create-Task action with an optional selectable template when the conversation has converged, and write " + reportPath + " with payload.reply_markdown when finished."
+		return "Read " + workerInputPath + ", inspect /project/repo only through read/list/grep-style read-only evidence, read the mounted orchestration-state snapshot when project/run status matters, answer the latest user message, optionally emit exactly one allow-listed create-Task or re-run-stage action when appropriate, and write " + reportPath + " with payload.reply_markdown when finished."
 	}
 	if isPlanningDispatch(disp) {
 		return "Read " + workerInputPath + ", inspect /project/repo as read-only evidence, produce the single-shot task plan requested there in payload.task_plan_markdown, and write " + reportPath + " when finished."
@@ -942,11 +942,13 @@ func appendConversationWorkerContract(b *strings.Builder, disp contract.Dispatch
 	b.WriteString("### Authority boundary\n\n")
 	b.WriteString("- You may answer repo/project questions and discuss designs.\n")
 	b.WriteString("- You do not call the engine, mutate run state, or create Tasks directly. The harness may execute only the allow-listed action envelope you return.\n")
-	b.WriteString("- v1 state-changing authority is exactly `create-Task`; do not emit any other action type, more than one action, or fields other than `type`, `idea`, and optional `template`.\n")
-	b.WriteString("- When the conversation has not converged, reply normally and omit `payload.actions`.\n")
-	b.WriteString("- When the conversation has converged and should become work, write a sectioned brief with exactly these Markdown section headings in this order: `Goal`, `In scope`, `Out of scope`, `Key decisions`, `Open assumptions`; emit one `create-Task` action whose `idea` is that brief verbatim.\n")
+	b.WriteString("- v1 state-changing authority is exactly the action types listed in `allowed_actions`; do not emit any other action type, more than one action, or unsupported fields.\n")
+	b.WriteString("- When the conversation has not converged on a state-changing request, reply normally and omit `payload.actions`.\n")
+	b.WriteString("- When the conversation has converged and should become new work, write a sectioned brief with exactly these Markdown section headings in this order: `Goal`, `In scope`, `Out of scope`, `Key decisions`, `Open assumptions`; emit one `create-Task` action whose `idea` is that brief verbatim.\n")
 	b.WriteString("- The harness will create the Task with `RefinementLevel=Direct`, this conversation ID, and the configured default workflow template unless you set optional `template` to one of the selectable template IDs below. Do not choose a refinement level.\n")
 	b.WriteString("- Use the configured `small_fix_template_id` only when the user explicitly asks for a trivial/small fix; otherwise omit `template` and let the default apply.\n")
+	b.WriteString("- When the user asks to redo prior work and the orchestration snapshot shows the target Run, you may emit one `re-run-stage` action with exactly `type`, `run_id`, and `stage`. Use it only for terminal runs (`completed`, `failed`, `invalid`, `cancelled`) and compute-stage targets (`implementation`, `validation`, or `review` workflow stages). Do not target `commit`, `pr_creation`, `stop_report`, pending/running runs, or runs awaiting human/input; reply with the safe next step instead.\n")
+	b.WriteString("- A `re-run-stage` action re-enters the run's frozen workflow graph from the chosen stage and still travels through normal gates; never present it as bypassing review, validation, or approval.\n")
 	b.WriteString("- Never edit, commit, push, or otherwise write to `/project/repo`; it is read-only repository evidence.\n")
 	b.WriteString("- Use `/project/workspace` only for private notes/artifacts if helpful; your final answer must be in `payload.reply_markdown`.\n\n")
 	b.WriteString("### Tool policy\n\n")
@@ -1054,11 +1056,15 @@ func appendConversationRequiredReport(b *strings.Builder, reportPath string) {
 	b.WriteString("```json\n")
 	b.WriteString("{\n  \"status\": \"completed\",\n  \"summary\": \"short reply summary\",\n  \"payload\": {\n    \"reply_markdown\": \"the assistant reply to persist as a Conversation Message\"\n  },\n  \"errors\": []\n}\n")
 	b.WriteString("```\n\n")
-	b.WriteString("or, only when the conversation has converged into work:\n\n")
+	b.WriteString("or, only when the conversation has converged into new work:\n\n")
 	b.WriteString("```json\n")
 	b.WriteString("{\n  \"status\": \"completed\",\n  \"summary\": \"creating task\",\n  \"payload\": {\n    \"reply_markdown\": \"I have enough to create a gated Task.\",\n    \"actions\": [\n      {\n        \"type\": \"create-Task\",\n        \"idea\": \"## Goal\\n...\\n\\n## In scope\\n...\\n\\n## Out of scope\\n...\\n\\n## Key decisions\\n...\\n\\n## Open assumptions\\n...\"\n      }\n    ]\n  },\n  \"errors\": []\n}\n")
 	b.WriteString("```\n\n")
-	b.WriteString("Allowed status values: `completed`, `failed`, `needs_input`, `invalid`. If status is `failed` or `invalid`, `errors` must be non-empty. If you include `payload.actions`, it must contain exactly one object from `allowed_actions`; v1 allows only `create-Task` with a non-empty sectioned-brief `idea` using exactly the required Markdown headings and an optional string `template` from `workflow_template_selection.selectable_templates`. Omit `template` for the default. Do not include top-level action fields.\n")
+	b.WriteString("or, only when the user wants a visible terminal Run re-run from a valid compute stage:\n\n")
+	b.WriteString("```json\n")
+	b.WriteString("{\n  \"status\": \"completed\",\n  \"summary\": \"starting stage re-run\",\n  \"payload\": {\n    \"reply_markdown\": \"I will re-run Run `run_123` from `validation`; it will continue through the frozen workflow gates.\",\n    \"actions\": [\n      {\n        \"type\": \"re-run-stage\",\n        \"run_id\": \"run_123\",\n        \"stage\": \"validation\"\n      }\n    ]\n  },\n  \"errors\": []\n}\n")
+	b.WriteString("```\n\n")
+	b.WriteString("Allowed status values: `completed`, `failed`, `needs_input`, `invalid`. If status is `failed` or `invalid`, `errors` must be non-empty. If you include `payload.actions`, it must contain exactly one object from `allowed_actions`. `create-Task` requires a non-empty sectioned-brief `idea` using exactly the required Markdown headings and may include optional string `template` from `workflow_template_selection.selectable_templates`; omit `template` for the default. `re-run-stage` requires string `run_id` and string `stage` only; use a run and compute-stage ID from the orchestration snapshot, and rely on the harness to reject invalid target/state fail-closed. Do not include top-level action fields.\n")
 }
 
 func appendDefaultRequiredReport(b *strings.Builder, reportPath string) {
