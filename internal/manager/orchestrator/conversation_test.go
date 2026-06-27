@@ -911,8 +911,8 @@ func TestConversationCreateTaskActionRejectsConfiguredNonFloorDefault(t *testing
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	if _, err := st.UpdateProjectWorkflowTemplatePolicy(ctx, store.DefaultProjectID, store.ProjectWorkflowTemplatePolicy{DefaultTemplateID: workflow.DirectCommitID}); err != nil {
-		t.Fatalf("update workflow template policy: %v", err)
+	if _, err := st.DB().ExecContext(ctx, `UPDATE projects SET workflow_template_default_id = ? WHERE id = ?`, workflow.DirectCommitID, store.DefaultProjectID); err != nil {
+		t.Fatalf("seed non-floor workflow template policy directly: %v", err)
 	}
 	engine := NewEngineWithOptions(st, nil, fakeFragmentRenderer{}, fakeBroadcaster{}, EngineOptions{
 		ConversationAdapter: "chat-agent",
