@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -212,6 +213,85 @@ func TestConversationWarmSessionReusedAcrossTurnsUntilIdleTTLEvicts(t *testing.T
 	}
 	if len(history) != 3 || history[0]["body"] != "first" || history[1]["body"] != "first reply" || history[2]["body"] != "second" {
 		t.Fatalf("history = %#v, want cold resume from persisted transcript", history)
+	}
+}
+
+func TestConversationSessionsReturnToBaselineAfterIdleEvictionChurn(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	const conversations = 8
+	runner := &managedConversationRunner{dispatches: make(chan contract.Dispatch, conversations), evictions: make(chan string, conversations)}
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, newEventRecorder(), EngineOptions{ConversationAdapter: "chat-agent", ConversationBudget: conversations, ConversationIdleTTL: 20 * time.Millisecond})
+	registerEngineTeardown(t, engine, st)
+
+	for i := range conversations {
+		projectID := fmt.Sprintf("project_%d", i)
+		project, err := st.EnsureProject(ctx, store.ProjectSpec{ID: projectID, Name: fmt.Sprintf("Project %d", i), RepositoryPath: t.TempDir()})
+		if err != nil {
+			t.Fatalf("ensure project %d: %v", i, err)
+		}
+		if _, err := engine.SubmitConversationMessage(ctx, project.ID, fmt.Sprintf("message %d", i)); err != nil {
+			t.Fatalf("submit conversation %d: %v", i, err)
+		}
+		disp := receiveDispatch(t, runner.dispatches)
+		if disp.WarmSessionKey == "" {
+			t.Fatalf("warm session key for conversation %d empty", i)
+		}
+		conversation, err := st.EnsureProjectConversation(ctx, project.ID)
+		if err != nil {
+			t.Fatalf("ensure conversation %d: %v", i, err)
+		}
+		waitForConversationMessages(t, st, conversation.ID, 2)
+	}
+	for range conversations {
+		_ = receiveEviction(t, runner.evictions)
+	}
+	waitForConversationSessionCount(t, engine, 0)
+}
+
+func TestPruneDormantConversationSessionRequiresFullyDormant(t *testing.T) {
+	tests := []struct {
+		name       string
+		mutate     func(*Engine, *conversationSession)
+		wantPruned bool
+	}{
+		{name: "dormant", wantPruned: true},
+		{name: "running", mutate: func(_ *Engine, session *conversationSession) { session.running = true }},
+		{name: "queued", mutate: func(_ *Engine, session *conversationSession) {
+			session.queue = []conversationTurn{{conversationID: session.conversationID}}
+		}},
+		{name: "warm", mutate: func(_ *Engine, session *conversationSession) { session.warm = true }},
+		{name: "ready flag", mutate: func(_ *Engine, session *conversationSession) { session.ready = true }},
+		{name: "ready list", mutate: func(e *Engine, session *conversationSession) { e.conversationReady = []string{session.conversationID} }},
+		{name: "stale pointer", mutate: func(e *Engine, session *conversationSession) {
+			e.conversationSessions[session.conversationID] = &conversationSession{conversationID: session.conversationID, projectID: session.projectID}
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := &Engine{conversationSessions: map[string]*conversationSession{}}
+			session := &conversationSession{conversationID: "conversation-1", projectID: "project-1"}
+			engine.conversationSessions[session.conversationID] = session
+			if tc.mutate != nil {
+				tc.mutate(engine, session)
+			}
+
+			engine.conversationMu.Lock()
+			pruned := engine.pruneDormantConversationSessionLocked(session)
+			_, exists := engine.conversationSessions[session.conversationID]
+			engine.conversationMu.Unlock()
+
+			if pruned != tc.wantPruned {
+				t.Fatalf("pruned = %v, want %v", pruned, tc.wantPruned)
+			}
+			if exists == tc.wantPruned {
+				t.Fatalf("conversationSessions exists = %v, want %v", exists, !tc.wantPruned)
+			}
+		})
 	}
 }
 
@@ -907,6 +987,23 @@ func receiveEviction(t *testing.T, ch <-chan string) string {
 	case <-time.After(testWaitTimeout):
 		t.Fatal("timed out waiting for warm session eviction")
 		return ""
+	}
+}
+
+func waitForConversationSessionCount(t *testing.T, engine *Engine, want int) {
+	t.Helper()
+	deadline := time.Now().Add(testWaitTimeout)
+	for {
+		engine.conversationMu.Lock()
+		got := len(engine.conversationSessions)
+		engine.conversationMu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("conversationSessions size = %d, want %d", got, want)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

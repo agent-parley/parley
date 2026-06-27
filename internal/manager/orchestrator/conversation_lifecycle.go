@@ -397,6 +397,33 @@ func (e *Engine) evictConversationWarmSession(ctx context.Context, session *conv
 		_ = evicter.EvictWarmSession(ctx, session.conversationID)
 	}
 	_ = e.emitConversationLifecycleEvent(ctx, session.projectID, session.conversationID, "", "conversation.session_evicted", "conversation warm session evicted", map[string]any{"reason": reason})
+	e.pruneDormantConversationSession(session)
+}
+
+func (e *Engine) pruneDormantConversationSession(session *conversationSession) bool {
+	e.conversationMu.Lock()
+	defer e.conversationMu.Unlock()
+	return e.pruneDormantConversationSessionLocked(session)
+}
+
+func (e *Engine) pruneDormantConversationSessionLocked(session *conversationSession) bool {
+	if session == nil || e.conversationSessions[session.conversationID] != session {
+		return false
+	}
+	if session.running || len(session.queue) > 0 || session.warm || session.ready || e.conversationReadyContainsLocked(session.conversationID) {
+		return false
+	}
+	delete(e.conversationSessions, session.conversationID)
+	return true
+}
+
+func (e *Engine) conversationReadyContainsLocked(conversationID string) bool {
+	for _, id := range e.conversationReady {
+		if id == conversationID {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) emitConversationLifecycleEvent(ctx context.Context, projectID, conversationID, triggerMessageID, typ, summary string, data map[string]any) error {
