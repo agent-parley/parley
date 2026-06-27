@@ -16,7 +16,7 @@
           <summary>
             <span class="timeline-marker"><span class="status-dot {{statusClass .Stage.Status}}" aria-hidden="true"></span></span>
             <span class="stage-copy">
-              <span class="stage-title-line"><strong>{{.Label}}</strong><span class="pill {{statusClass .Stage.Status}}">{{statusLabel .Stage.Status}}</span><small>{{.Performer}}</small></span>
+              <span class="stage-title-line"><strong>{{.Label}}</strong><span class="pill {{statusClass .Stage.Status}}">{{statusLabel .Stage.Status}}</span>{{if .Stage.AttemptID}}<small>Attempt {{short .Stage.AttemptID}}</small>{{end}}<small>{{.Performer}}</small></span>
               <span class="stage-outcome">{{.Summary}}</span>
             </span>
             <span class="view-more">events</span>
@@ -33,6 +33,12 @@
             </ol>
             {{else}}
             <p class="empty-state">No events recorded for this stage yet.</p>
+            {{end}}
+            {{if .CanReRun}}
+            <form class="stage-rerun-form" method="post" action="/projects/{{$.Project.ID}}/runs/{{$.Run.ID}}/stages/{{.Stage.ID}}/rerun" data-on:submit="@post('/projects/{{$.Project.ID}}/runs/{{$.Run.ID}}/stages/{{.Stage.ID}}/rerun', {contentType: 'form'})">
+              <input type="hidden" name="_csrf" value="{{$.CSRF}}" data-bind:csrf>
+              <button type="submit" class="secondary">Re-run from here</button>
+            </form>
             {{end}}
           </div>
         </details>

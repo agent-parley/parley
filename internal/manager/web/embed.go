@@ -285,6 +285,7 @@ type StageGroupView struct {
 	Performer string
 	Summary   string
 	Expanded  bool
+	CanReRun  bool
 	Events    []EventView
 }
 
@@ -487,7 +488,7 @@ func NewRunView(bundle store.RunBundle) RunView {
 			view.DiffPatch = artifactView
 		}
 	}
-	view.StageGroups = stageGroups(bundle.Stages, bundle.Events)
+	view.StageGroups = stageGroups(bundle.Run.Status, bundle.Stages, bundle.Events)
 	view.TaskPlan = taskPlanView(bundle, view.ArtifactViews)
 	view.Outcome = outcomeView(bundle)
 	view.DiffLines = diffLines(view.DiffPatch.Preview)
@@ -568,12 +569,12 @@ func (r *TemplateRenderer) RenderNotificationCenter(data NotificationCenterData)
 	return compactHTML(buf.String()), nil
 }
 
-func stageGroups(stages []store.Stage, events []event.Event) []StageGroupView {
+func stageGroups(runStatus string, stages []store.Stage, events []event.Event) []StageGroupView {
 	groups := make([]StageGroupView, 0, len(stages))
 	for _, stage := range stages {
-		group := StageGroupView{Stage: stage, Label: stageLabel(stage.StageType), Performer: performer(stage)}
+		group := StageGroupView{Stage: stage, Label: stageLabel(stage.StageType), Performer: performer(stage), CanReRun: canReRunStage(runStatus, stage.StageType)}
 		for _, ev := range events {
-			if stageTypeFromEvent(ev) == stage.StageType {
+			if eventBelongsToStage(ev, stage) {
 				group.Events = append(group.Events, newEventView(ev))
 			}
 		}
@@ -582,6 +583,50 @@ func stageGroups(stages []store.Stage, events []event.Event) []StageGroupView {
 		groups = append(groups, group)
 	}
 	return groups
+}
+
+func eventBelongsToStage(ev event.Event, stage store.Stage) bool {
+	hasStageRef := false
+	for _, key := range []string{"stage_id", "pending_stage_id", "target_stage_id"} {
+		stageID := eventString(ev, key)
+		if stageID == "" {
+			continue
+		}
+		hasStageRef = true
+		if stageID == stage.ID {
+			return true
+		}
+	}
+	workflowStageID := eventString(ev, "workflow_stage_id")
+	if workflowStageID != "" {
+		hasStageRef = true
+		if workflowStageID == stage.WorkflowStageID && (ev.AttemptID == "" || ev.AttemptID == stage.AttemptID) {
+			return true
+		}
+	}
+	if hasStageRef {
+		return false
+	}
+	if stageTypeFromEvent(ev) != stage.StageType {
+		return false
+	}
+	return ev.AttemptID == "" || stage.AttemptID == "" || ev.AttemptID == stage.AttemptID
+}
+
+func canReRunStage(runStatus, stageType string) bool {
+	if !stageReRunRunStatusAllowed(runStatus) {
+		return false
+	}
+	switch stageType {
+	case contract.StageTypeImplementation, contract.StageTypeValidation, contract.StageTypeReview:
+		return true
+	default:
+		return false
+	}
+}
+
+func stageReRunRunStatusAllowed(status string) bool {
+	return store.RunStatusIsTerminal(status) && status != store.RunStatusNeedsInput
 }
 
 func newEventView(ev event.Event) EventView {
@@ -690,8 +735,13 @@ func stageTypeFromEvent(ev event.Event) string {
 	if ev.Data == nil {
 		return ""
 	}
-	stageType, _ := ev.Data["stage_type"].(string)
-	return stageType
+	for _, key := range []string{"stage_type", "target_stage_type"} {
+		stageType, _ := ev.Data[key].(string)
+		if stageType != "" {
+			return stageType
+		}
+	}
+	return ""
 }
 
 func eventFamily(eventType string) string {
