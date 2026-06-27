@@ -15,6 +15,7 @@ const (
 	AutonomousPRDeliveryID = "autonomous_pr_delivery"
 	CarefulReviewID        = "careful_review_delivery"
 	DirectCommitID         = "direct_commit_delivery"
+	QuickFixDeliveryID     = "quick_fix_delivery"
 
 	DefaultTemplateID = BalancedPRDeliveryID
 )
@@ -86,6 +87,7 @@ func PredefinedTemplates() []Template {
 		autonomousPRDelivery(),
 		carefulReviewDelivery(),
 		directCommitDelivery(),
+		quickFixDelivery(),
 	}
 }
 
@@ -339,6 +341,22 @@ func directCommitDelivery() Template {
 		"fix_loop":      true,
 		"max_fix_loops": 3,
 		"memory_update": true,
+	})
+}
+
+func quickFixDelivery() Template {
+	stages := []StageTemplate{
+		stage("idea_refinement", StageTypeIdeaRefinement, "Idea refinement", ActorHarness, ""),
+		stage("implementation", StageTypeImplementation, "Implementation", ActorAgent, ""),
+		stage("commit_feature_branch", StageTypeCommit, "Commit to feature branch", ActorHarness, ""),
+		stage("pr_creation", StageTypePRCreation, "PR creation", ActorHarness, ""),
+		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
+	}
+	return predefined(QuickFixDeliveryID, "Quick Fix Delivery", "Slim branch-and-PR workflow for trivial fixes with PR merge as the human gate.", false, stages, defaultEdges(stages), map[string]any{
+		"branch_policy": "feature_branch",
+		"pr_behavior":   "create_pr",
+		"merge_policy":  "human_stop",
+		"fix_loop":      false,
 	})
 }
 

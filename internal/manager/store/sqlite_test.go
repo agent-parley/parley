@@ -217,8 +217,8 @@ func TestWorkflowTemplatesSeedCopyEditAndRejectMidRunEdit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list workflow templates: %v", err)
 	}
-	if len(templates) != 4 {
-		t.Fatalf("template count = %d, want 4", len(templates))
+	if len(templates) != 5 {
+		t.Fatalf("template count = %d, want 5", len(templates))
 	}
 	if templates[0].ID != workflow.BalancedPRDeliveryID || !templates[0].Recommended {
 		t.Fatalf("first template = %+v, want recommended Balanced PR", templates[0])
