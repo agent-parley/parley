@@ -733,6 +733,80 @@ func TestHandleRunsRejectsInvalidRefinementLevel(t *testing.T) {
 	assertNotContains(t, rec.Body.String(), "deep")
 }
 
+func TestHandleReRunStageReturnsHTMLFragment(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	wr, err := st.CreateWorkflowRun(ctx, "rerun via endpoint")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := st.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusCompleted); err != nil {
+		t.Fatalf("complete run: %v", err)
+	}
+	controller := &fakeRunController{state: defaultRouteQueueState()}
+	controller.reRunStageFunc = func(_ context.Context, runID, stageID string) (store.Attempt, error) {
+		if runID != wr.Run.ID || stageID != wr.ImplementationStage.ID {
+			t.Fatalf("ReRunStage run=%s stage=%s", runID, stageID)
+		}
+		if err := st.UpdateRunStatus(ctx, runID, store.RunStatusRunning); err != nil {
+			t.Fatalf("update run: %v", err)
+		}
+		return store.Attempt{ID: "attempt_rerun", RunID: runID}, nil
+	}
+
+	srv := newRouteTestServer(t, st, controller)
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/projects/default/runs/"+wr.Run.ID+"/stages/"+wr.ImplementationStage.ID+"/rerun", cookie, url.Values{"_csrf": {csrf}})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST rerun status = %d want %d body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "text/html") {
+		t.Fatalf("Content-Type = %q, want html", got)
+	}
+	body := rec.Body.String()
+	assertContains(t, body, "id=\"run-summary\"")
+	assertContains(t, body, "id=\"story-panel\"")
+	assertNotContains(t, body, "application/json")
+}
+
+func TestHandleReRunStageInvalidRequestDoesNotMutate(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	wr, err := st.CreateWorkflowRun(ctx, "bad rerun endpoint")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := st.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusCompleted); err != nil {
+		t.Fatalf("complete run: %v", err)
+	}
+	beforeAttempts, err := st.CountAttemptsForRun(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("count attempts: %v", err)
+	}
+	controller := &fakeRunController{state: defaultRouteQueueState()}
+	controller.reRunStageFunc = func(context.Context, string, string) (store.Attempt, error) {
+		return store.Attempt{}, orchestrator.ErrStageReRunInvalidTarget
+	}
+
+	srv := newRouteTestServer(t, st, controller)
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/projects/default/runs/"+wr.Run.ID+"/stages/commit_feature_branch/rerun", cookie, url.Values{"_csrf": {csrf}})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST invalid rerun status = %d want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	afterAttempts, err := st.CountAttemptsForRun(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("count attempts after: %v", err)
+	}
+	run, err := st.GetRun(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if afterAttempts != beforeAttempts || run.Status != store.RunStatusCompleted {
+		t.Fatalf("endpoint mutated attempts/status = %d/%s, want %d/%s", afterAttempts, run.Status, beforeAttempts, store.RunStatusCompleted)
+	}
+}
+
 func TestHandleHumanReviewVerdictReturnsHTMLFragment(t *testing.T) {
 	ctx := context.Background()
 	st := openRouteTestStore(t)
@@ -980,6 +1054,7 @@ type fakeRunController struct {
 	submitConversationMessageFunc func(context.Context, string, string) (store.Message, error)
 	startQueuedRunFunc            func(context.Context, string) error
 	cancelRunFunc                 func(context.Context, string) error
+	reRunStageFunc                func(context.Context, string, string) (store.Attempt, error)
 	humanReviewFunc               func(context.Context, string, string, orchestrator.HumanReviewSubmission) (report.Report, error)
 }
 
@@ -1019,6 +1094,13 @@ func (f *fakeRunController) CancelRun(ctx context.Context, runID string) error {
 		return f.cancelRunFunc(ctx, runID)
 	}
 	return errors.New("unexpected CancelRun call")
+}
+
+func (f *fakeRunController) ReRunStage(ctx context.Context, runID, stageID string) (store.Attempt, error) {
+	if f.reRunStageFunc != nil {
+		return f.reRunStageFunc(ctx, runID, stageID)
+	}
+	return store.Attempt{}, errors.New("unexpected ReRunStage call")
 }
 
 func (f *fakeRunController) SubmitHumanReview(ctx context.Context, runID, stageID string, submission orchestrator.HumanReviewSubmission) (report.Report, error) {

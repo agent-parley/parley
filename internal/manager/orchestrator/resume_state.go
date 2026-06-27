@@ -12,11 +12,12 @@ import (
 )
 
 type executionState struct {
-	lastReport           report.Report
-	lastValidationReport report.Report
-	lastDeliveryReport   report.Report
-	snapshot             workerSnapshot
-	snapshotErr          error
+	lastReport               report.Report
+	lastImplementationReport report.Report
+	lastValidationReport     report.Report
+	lastDeliveryReport       report.Report
+	snapshot                 workerSnapshot
+	snapshotErr              error
 }
 
 const worktreeLostOnResumeSummary = "worktree lost on restart - cannot commit; re-run implementation"
@@ -52,6 +53,9 @@ func (e *Engine) reconstructExecutionState(ctx context.Context, wr store.Workflo
 		}
 		if ok {
 			state.lastReport = rep
+			if runtimeStage.Template.Type == workflow.StageTypeImplementation {
+				state.lastImplementationReport = rep
+			}
 			if runtimeStage.Template.Type == workflow.StageTypeValidation {
 				state.lastValidationReport = rep
 			}

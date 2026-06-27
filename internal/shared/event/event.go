@@ -6,6 +6,7 @@ const SchemaVersion = 1
 
 const (
 	ActorKindUser             = "user"
+	ActorKindOperator         = "operator"
 	ActorKindHarness          = "harness"
 	ActorKindWorkflowEngine   = "workflow_engine"
 	ActorKindAdapter          = "adapter"

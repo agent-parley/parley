@@ -89,6 +89,10 @@ func (s *Server) handleProjectPath(w http.ResponseWriter, r *http.Request) {
 		s.handleStartQueuedRun(w, r, projectID, runID)
 		return
 	}
+	if len(parts) == 6 && parts[3] == "stages" && parts[5] == "rerun" {
+		s.handleReRunStage(w, r, projectID, runID, parts[4])
+		return
+	}
 	if len(parts) == 6 && parts[3] == "human-stages" && parts[5] == "verdict" {
 		s.handleHumanReviewVerdict(w, r, projectID, runID, parts[4])
 		return
@@ -764,6 +768,10 @@ func (s *Server) handleRunPath(w http.ResponseWriter, r *http.Request) {
 		s.handleStartQueuedRun(w, r, projectID, runID)
 		return
 	}
+	if len(parts) == 4 && parts[1] == "stages" && parts[3] == "rerun" {
+		s.handleReRunStage(w, r, projectID, runID, parts[2])
+		return
+	}
 	if len(parts) == 4 && parts[1] == "human-stages" && parts[3] == "verdict" {
 		s.handleHumanReviewVerdict(w, r, projectID, runID, parts[2])
 		return
@@ -836,6 +844,43 @@ func (s *Server) handleStartQueuedRun(w http.ResponseWriter, r *http.Request, pr
 		return
 	}
 	http.Redirect(w, r, projectRunPath(projectID, runID), http.StatusSeeOther)
+}
+
+func (s *Server) handleReRunStage(w http.ResponseWriter, r *http.Request, projectID, runID, stageID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.runBelongsToProject(r, projectID, runID) {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := s.engine.ReRunStage(r.Context(), runID, stageID); err != nil {
+		if errors.Is(err, orchestrator.ErrStageReRunInvalidTarget) || errors.Is(err, orchestrator.ErrStageReRunPrerequisiteGap) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, orchestrator.ErrStageReRunRunNotTerminal) || errors.Is(err, orchestrator.ErrStageReRunFrozenSnapshot) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	bundle, err := s.store.RunBundle(r.Context(), runID)
+	if err != nil || bundle.Run.ProjectID != projectID {
+		http.Error(w, "run not found", http.StatusInternalServerError)
+		return
+	}
+	fragment, err := s.renderer.RenderRunFragments(bundle)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(fragment)))
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte(fragment))
 }
 
 func (s *Server) handleHumanReviewVerdict(w http.ResponseWriter, r *http.Request, projectID, runID, stageID string) {

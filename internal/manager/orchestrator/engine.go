@@ -827,7 +827,21 @@ func (e *Engine) executeRunErr(ctx context.Context, runID string) error {
 	return e.executeRunFrom(ctx, runID, "")
 }
 
+type executeRunOptions struct {
+	resumeAfterWorkflowStageID string
+	startWorkflowStageID       string
+	seedState                  *executionState
+}
+
 func (e *Engine) executeRunFrom(ctx context.Context, runID, resumeAfterWorkflowStageID string) error {
+	return e.executeRunWithOptions(ctx, runID, executeRunOptions{resumeAfterWorkflowStageID: resumeAfterWorkflowStageID})
+}
+
+func (e *Engine) executeRunFromStage(ctx context.Context, runID, startWorkflowStageID string, seed executionState) error {
+	return e.executeRunWithOptions(ctx, runID, executeRunOptions{startWorkflowStageID: startWorkflowStageID, seedState: &seed})
+}
+
+func (e *Engine) executeRunWithOptions(ctx context.Context, runID string, opts executeRunOptions) error {
 	wr, err := e.store.GetWorkflowRun(context.Background(), runID)
 	if err != nil {
 		return err
@@ -835,7 +849,10 @@ func (e *Engine) executeRunFrom(ctx context.Context, runID, resumeAfterWorkflowS
 	if wr.Run.Status != store.RunStatusRunning {
 		return nil
 	}
-	if resumeAfterWorkflowStageID == "" {
+	if opts.resumeAfterWorkflowStageID != "" && opts.startWorkflowStageID != "" {
+		return fmt.Errorf("cannot resume after and start at workflow stages in one execution")
+	}
+	if opts.resumeAfterWorkflowStageID == "" && opts.startWorkflowStageID == "" {
 		started, err := e.hasRunEventType(context.Background(), runID, "run.started")
 		if err != nil {
 			return err
@@ -858,13 +875,27 @@ func (e *Engine) executeRunFrom(ctx context.Context, runID, resumeAfterWorkflowS
 	var lastDeliveryReport report.Report
 	var snapshot workerSnapshot
 	var snapshotErr error
+	if opts.seedState != nil {
+		lastReport = opts.seedState.lastReport
+		lastValidationReport = opts.seedState.lastValidationReport
+		lastDeliveryReport = opts.seedState.lastDeliveryReport
+		snapshot = opts.seedState.snapshot
+		snapshotErr = opts.seedState.snapshotErr
+	}
 
-	if resumeAfterWorkflowStageID != "" {
-		resumeStage, ok := runtime.ByID[resumeAfterWorkflowStageID]
-		if !ok {
-			return fmt.Errorf("resume workflow stage %q not found in frozen snapshot", resumeAfterWorkflowStageID)
+	if opts.startWorkflowStageID != "" {
+		if _, ok := runtime.ByID[opts.startWorkflowStageID]; !ok {
+			return fmt.Errorf("start workflow stage %q not found in frozen snapshot", opts.startWorkflowStageID)
 		}
-		state, err := e.reconstructExecutionState(context.Background(), wr, runtime, resumeAfterWorkflowStageID)
+		currentID = opts.startWorkflowStageID
+	}
+
+	if opts.resumeAfterWorkflowStageID != "" {
+		resumeStage, ok := runtime.ByID[opts.resumeAfterWorkflowStageID]
+		if !ok {
+			return fmt.Errorf("resume workflow stage %q not found in frozen snapshot", opts.resumeAfterWorkflowStageID)
+		}
+		state, err := e.reconstructExecutionState(context.Background(), wr, runtime, opts.resumeAfterWorkflowStageID)
 		if err != nil {
 			return err
 		}
@@ -873,9 +904,9 @@ func (e *Engine) executeRunFrom(ctx context.Context, runID, resumeAfterWorkflowS
 		lastDeliveryReport = state.lastDeliveryReport
 		snapshot = state.snapshot
 		snapshotErr = state.snapshotErr
-		nextID, ok := runtime.Graph.Next(resumeAfterWorkflowStageID, routingOutcome(resumeStage.Template, lastReport))
+		nextID, ok := runtime.Graph.Next(opts.resumeAfterWorkflowStageID, routingOutcome(resumeStage.Template, lastReport))
 		if !ok {
-			return e.stopRun(context.Background(), wr, lastReport.Status, "workflow stopped after "+resumeAfterWorkflowStageID)
+			return e.stopRun(context.Background(), wr, lastReport.Status, "workflow stopped after "+opts.resumeAfterWorkflowStageID)
 		}
 		if isFixLoopTransition(runtime, resumeStage.Template, lastReport, nextID) {
 			newWR, newRuntime, err := e.startFixLoopAttempt(context.Background(), wr, runtime, resumeStage, lastReport, nextID)

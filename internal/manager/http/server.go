@@ -20,6 +20,7 @@ type RunController interface {
 	SubmitConversationMessage(context.Context, string, string) (store.Message, error)
 	StartQueuedRun(context.Context, string) error
 	CancelRun(context.Context, string) error
+	ReRunStage(context.Context, string, string) (store.Attempt, error)
 	SubmitHumanReview(context.Context, string, string, orchestrator.HumanReviewSubmission) (report.Report, error)
 	QueueState(context.Context) (orchestrator.QueueState, error)
 }

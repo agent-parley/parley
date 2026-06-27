@@ -214,8 +214,11 @@ func (r *Runner) acquireWarmSessionLock(key string) *warmSessionLockLease {
 }
 
 func (l *warmSessionLockLease) Unlock() {
-	l.lock.mu.Unlock()
+	// Drop the reference before releasing the per-key mutex. Otherwise a waiting
+	// evict can acquire the mutex, finish, and observe another lease's stale ref
+	// before that lease has had a chance to decrement it.
 	l.runner.releaseWarmSessionLock(l.key, l.lock)
+	l.lock.mu.Unlock()
 }
 
 func (r *Runner) releaseWarmSessionLock(key string, lock *warmSessionLock) {
