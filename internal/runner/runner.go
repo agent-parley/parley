@@ -120,15 +120,21 @@ func (r *Runner) handleDispatch(ctx context.Context, msg protocol.Message) error
 	r.mu.Unlock()
 
 	go func() {
-		defer func() {
-			r.mu.Lock()
-			delete(r.active, key)
-			if disp.WarmSessionKey != "" {
-				if session := r.warm[disp.WarmSessionKey]; session != nil {
-					session.active = false
+		var idleOnce sync.Once
+		markDispatchIdle := func() {
+			idleOnce.Do(func() {
+				r.mu.Lock()
+				delete(r.active, key)
+				if disp.WarmSessionKey != "" {
+					if session := r.warm[disp.WarmSessionKey]; session != nil {
+						session.active = false
+					}
 				}
-			}
-			r.mu.Unlock()
+				r.mu.Unlock()
+			})
+		}
+		defer func() {
+			markDispatchIdle()
 			if warmLock != nil {
 				warmLock.Unlock()
 			}
@@ -146,6 +152,9 @@ func (r *Runner) handleDispatch(ctx context.Context, msg protocol.Message) error
 		if rep.Status == report.StatusFailed || rep.Status == report.StatusInvalid {
 			terminal = "failed"
 		}
+		// A manager can evict a warm session as soon as it receives the
+		// terminal result, so publish the idle state before the result is sent.
+		markDispatchIdle()
 		_ = r.send(context.Background(), protocol.TypeReport, rep)
 		_ = r.send(context.Background(), protocol.TypeResult, protocol.ResultPayload{RunID: disp.RunID, TaskID: disp.TaskID, AttemptID: disp.AttemptID, TerminalStatus: terminal})
 	}()
