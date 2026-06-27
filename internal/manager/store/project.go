@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/agent-parley/parley/internal/manager/workflow"
 )
 
 const (
@@ -60,6 +62,70 @@ func (s *Store) PromoteProjectPreferencesFromRepository(ctx context.Context, pro
 		return Project{}, err
 	}
 	return s.UpdateProjectPreferences(ctx, projectID, content)
+}
+
+type ProjectWorkflowTemplatePolicy struct {
+	DefaultTemplateID  string
+	SmallFixTemplateID string
+}
+
+func NormalizeProjectWorkflowTemplatePolicy(policy ProjectWorkflowTemplatePolicy) ProjectWorkflowTemplatePolicy {
+	policy.DefaultTemplateID = strings.TrimSpace(policy.DefaultTemplateID)
+	policy.SmallFixTemplateID = strings.TrimSpace(policy.SmallFixTemplateID)
+	if policy.DefaultTemplateID == "" {
+		policy.DefaultTemplateID = workflow.DefaultTemplateID
+	}
+	return policy
+}
+
+func (s *Store) GetProjectWorkflowTemplatePolicy(ctx context.Context, projectID string) (ProjectWorkflowTemplatePolicy, error) {
+	project, err := s.GetProject(ctx, normalizeProjectID(projectID))
+	if err != nil {
+		return ProjectWorkflowTemplatePolicy{}, err
+	}
+	return NormalizeProjectWorkflowTemplatePolicy(ProjectWorkflowTemplatePolicy{
+		DefaultTemplateID:  project.WorkflowTemplateDefaultID,
+		SmallFixTemplateID: project.WorkflowTemplateSmallFixID,
+	}), nil
+}
+
+func (s *Store) UpdateProjectWorkflowTemplatePolicy(ctx context.Context, projectID string, policy ProjectWorkflowTemplatePolicy) (Project, error) {
+	projectID = normalizeProjectID(projectID)
+	stored := ProjectWorkflowTemplatePolicy{
+		DefaultTemplateID:  strings.TrimSpace(policy.DefaultTemplateID),
+		SmallFixTemplateID: strings.TrimSpace(policy.SmallFixTemplateID),
+	}
+	if err := s.validateProjectWorkflowTemplatePolicy(ctx, stored); err != nil {
+		return Project{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.ExecContext(ctx, `UPDATE projects SET workflow_template_default_id = ?, workflow_template_small_fix_id = ?, updated_at = ? WHERE id = ?`, stored.DefaultTemplateID, stored.SmallFixTemplateID, nowRFC3339(), projectID)
+	if err != nil {
+		return Project{}, fmt.Errorf("update workflow template policy: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return Project{}, fmt.Errorf("update workflow template policy rows affected: %w", err)
+	}
+	if changed == 0 {
+		return Project{}, fmt.Errorf("get project %s: %w", projectID, sql.ErrNoRows)
+	}
+	return s.GetProject(ctx, projectID)
+}
+
+func (s *Store) validateProjectWorkflowTemplatePolicy(ctx context.Context, policy ProjectWorkflowTemplatePolicy) error {
+	if policy.DefaultTemplateID != "" {
+		if _, err := s.GetWorkflowTemplate(ctx, policy.DefaultTemplateID); err != nil {
+			return fmt.Errorf("default workflow template %q: %w", policy.DefaultTemplateID, err)
+		}
+	}
+	if policy.SmallFixTemplateID != "" {
+		if _, err := s.GetWorkflowTemplate(ctx, policy.SmallFixTemplateID); err != nil {
+			return fmt.Errorf("small-fix workflow template %q: %w", policy.SmallFixTemplateID, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) updateProjectText(ctx context.Context, projectID, column, content string) (Project, error) {

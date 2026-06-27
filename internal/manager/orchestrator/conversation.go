@@ -65,6 +65,10 @@ func (e *Engine) conversationDispatchInput(ctx context.Context, project store.Pr
 	if err != nil {
 		return nil, err
 	}
+	workflowTemplateSelection, err := e.conversationWorkflowTemplateSelection(ctx, project.ID)
+	if err != nil {
+		return nil, err
+	}
 	input := map[string]any{
 		"input_mode":                   contract.AdapterInputModeConversation,
 		"agent_role":                   conversationalPlanningAgentRole,
@@ -75,6 +79,7 @@ func (e *Engine) conversationDispatchInput(ctx context.Context, project store.Pr
 		"orchestration_state":          orchestrationState,
 		"orchestration_state_summary":  orchestrationSummary,
 		"orchestration_state_markdown": orchestrationMarkdown,
+		"workflow_template_selection":  workflowTemplateSelection,
 		"project": map[string]any{
 			"id":          project.ID,
 			"name":        project.Name,
@@ -119,6 +124,72 @@ func conversationHistoryThrough(messages []store.Message, triggerMessageID strin
 		}
 	}
 	return history
+}
+
+func (e *Engine) conversationWorkflowTemplateSelection(ctx context.Context, projectID string) (map[string]any, error) {
+	policy, err := e.store.GetProjectWorkflowTemplatePolicy(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	entries := map[string]map[string]any{}
+	order := []string{}
+	addTemplate := func(template workflow.Template, source string) {
+		template = workflow.NormalizeTemplate(template)
+		if !workflow.MeetsHumanGateFloor(template) {
+			return
+		}
+		entry, ok := entries[template.ID]
+		if !ok {
+			entry = map[string]any{
+				"id":          template.ID,
+				"name":        template.Name,
+				"description": template.Description,
+				"sources":     []string{},
+			}
+			entries[template.ID] = entry
+			order = append(order, template.ID)
+		}
+		sources := entry["sources"].([]string)
+		for _, existing := range sources {
+			if existing == source {
+				return
+			}
+		}
+		entry["sources"] = append(sources, source)
+	}
+	defaultTemplate, err := e.store.GetWorkflowTemplate(ctx, policy.DefaultTemplateID)
+	if err != nil {
+		return nil, err
+	}
+	addTemplate(defaultTemplate, "default")
+	if policy.SmallFixTemplateID != "" {
+		smallFixTemplate, err := e.store.GetWorkflowTemplate(ctx, policy.SmallFixTemplateID)
+		if err != nil {
+			return nil, err
+		}
+		addTemplate(smallFixTemplate, "small_fix")
+	}
+	templates, err := e.store.ListWorkflowTemplates(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, template := range templates {
+		if template.Predefined {
+			addTemplate(template, "predefined_floor")
+		}
+	}
+	selectable := make([]map[string]any, 0, len(order))
+	for _, id := range order {
+		selectable = append(selectable, entries[id])
+	}
+	selection := map[string]any{
+		"default_template_id":  policy.DefaultTemplateID,
+		"selectable_templates": selectable,
+	}
+	if policy.SmallFixTemplateID != "" {
+		selection["small_fix_template_id"] = policy.SmallFixTemplateID
+	}
+	return selection, nil
 }
 
 func (e *Engine) dispatchConversationReply(ctx context.Context, projectID, conversationID, triggerMessageID string, input map[string]any) {
@@ -167,10 +238,14 @@ func (e *Engine) persistConversationAssistantMessage(ctx context.Context, projec
 func (e *Engine) executeConversationAction(ctx context.Context, projectID, conversationID string, action conversationAction) (store.WorkflowRun, error) {
 	switch action.Type {
 	case conversationActionCreateTask:
+		templateID, err := e.resolveConversationWorkflowTemplate(ctx, projectID, action.Template)
+		if err != nil {
+			return store.WorkflowRun{}, err
+		}
 		runID, err := e.StartProjectRunInput(ctx, projectID, contract.TaskInput{
 			Idea:               action.Idea,
 			RefinementLevel:    contract.RefinementLevelDirect,
-			WorkflowTemplateID: workflow.BalancedPRDeliveryID,
+			WorkflowTemplateID: templateID,
 			ConversationID:     conversationID,
 		})
 		if err != nil {
@@ -182,14 +257,39 @@ func (e *Engine) executeConversationAction(ctx context.Context, projectID, conve
 	}
 }
 
+func (e *Engine) resolveConversationWorkflowTemplate(ctx context.Context, projectID, requestedTemplateID string) (string, error) {
+	templateID := strings.TrimSpace(requestedTemplateID)
+	if templateID == "" {
+		policy, err := e.store.GetProjectWorkflowTemplatePolicy(ctx, projectID)
+		if err != nil {
+			return "", err
+		}
+		templateID = policy.DefaultTemplateID
+	}
+	if templateID == "" {
+		templateID = workflow.DefaultTemplateID
+	}
+	template, err := e.store.GetWorkflowTemplate(ctx, templateID)
+	if err != nil {
+		return "", fmt.Errorf("resolve conversation workflow template %q: %w", templateID, err)
+	}
+	// ADR 0087 defers the explicit per-turn confirmation mechanism for ungated
+	// templates; v1 fails closed instead of silently falling back.
+	if !workflow.MeetsHumanGateFloor(template) {
+		return "", fmt.Errorf("workflow template %q is not selectable by the conversational agent: it lacks a human gate before the target branch", template.ID)
+	}
+	return template.ID, nil
+}
+
 type conversationTurnResult struct {
 	Reply  string
 	Action *conversationAction
 }
 
 type conversationAction struct {
-	Type string
-	Idea string
+	Type     string
+	Idea     string
+	Template string
 }
 
 func (e *Engine) runConversationAgentTurn(ctx context.Context, projectID string, input map[string]any) (conversationTurnResult, error) {
@@ -316,7 +416,7 @@ func parseConversationAction(raw any, allowed []string) (conversationAction, err
 		return conversationAction{}, fmt.Errorf("conversation action envelope must be an object")
 	}
 	for key := range envelope {
-		if key != "type" && key != "idea" {
+		if key != "type" && key != "idea" && key != "template" {
 			return conversationAction{}, fmt.Errorf("conversation action %q contains unsupported field %q", actionType(envelope), key)
 		}
 	}
@@ -333,10 +433,18 @@ func parseConversationAction(raw any, allowed []string) (conversationAction, err
 		if !ok || strings.TrimSpace(idea) == "" {
 			return conversationAction{}, fmt.Errorf("create-Task action requires non-empty idea")
 		}
+		templateID := ""
+		if rawTemplate, ok := envelope["template"]; ok && rawTemplate != nil {
+			value, ok := rawTemplate.(string)
+			if !ok {
+				return conversationAction{}, fmt.Errorf("create-Task action template must be a string")
+			}
+			templateID = strings.TrimSpace(value)
+		}
 		if err := validateConversationBrief(idea); err != nil {
 			return conversationAction{}, err
 		}
-		return conversationAction{Type: typ, Idea: idea}, nil
+		return conversationAction{Type: typ, Idea: idea, Template: templateID}, nil
 	default:
 		return conversationAction{}, fmt.Errorf("unsupported conversation action %q", typ)
 	}
@@ -416,7 +524,7 @@ func conversationActionAllowed(action string, allowed []string) bool {
 }
 
 func conversationTaskCreatedMessage(wr store.WorkflowRun) string {
-	return fmt.Sprintf("Created Task `%s` / Run `%s` from this conversation. It is awaiting `plan_review_human` for human confirmation before any code runs.", wr.Task.ID, wr.Run.ID)
+	return fmt.Sprintf("Created Task `%s` / Run `%s` from this conversation on workflow template `%s`. The harness validated the template's human-gate floor before starting it.", wr.Task.ID, wr.Run.ID, wr.Run.WorkflowTemplateID)
 }
 
 func conversationReplyFromReport(rep report.Report) string {

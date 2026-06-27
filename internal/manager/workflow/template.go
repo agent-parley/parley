@@ -93,6 +93,28 @@ func PredefinedTemplates() []Template {
 
 func DefaultTemplate() Template { return balancedPRDelivery() }
 
+func MeetsHumanGateFloor(template Template) bool {
+	template = NormalizeTemplate(template)
+	for _, stage := range template.Stages {
+		if stage.Type == StageTypeReview && stage.Actor == ActorHuman {
+			return true
+		}
+	}
+	if settingString(template.Settings, "pr_behavior") != "create_pr" {
+		return false
+	}
+	return mergePolicyRequiresHumanGate(settingString(template.Settings, "merge_policy"))
+}
+
+func mergePolicyRequiresHumanGate(policy string) bool {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "human", "human_stop", "human_merge", "manual", "manual_stop", "manual_merge", "no_auto_merge", "none", "disabled":
+		return true
+	default:
+		return false
+	}
+}
+
 func NormalizeTemplate(template Template) Template {
 	template.ID = strings.TrimSpace(template.ID)
 	template.Name = strings.TrimSpace(template.Name)
