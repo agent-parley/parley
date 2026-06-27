@@ -123,7 +123,7 @@ func (e *Engine) conversationOrchestrationState(ctx context.Context, projectID, 
 	state := conversationOrchestrationState{
 		ProjectID:             projectID,
 		ConversationID:        conversationID,
-		Scope:                 "read_only orchestration snapshot: conversation-linked tasks plus recent project runs; state changes require the allow-listed create-Task action",
+		Scope:                 "read_only orchestration snapshot: conversation-linked tasks plus recent project runs; state changes require allow-listed harness actions (create-Task or re-run-stage)",
 		TotalProjectRuns:      len(projectRuns),
 		ConversationTaskCount: len(conversationTasks),
 		ConversationTasks:     taskStates(conversationTasks),

@@ -17,7 +17,10 @@ import (
 const (
 	conversationalPlanningAgentRole = "conversational_planning_agent"
 	conversationActionCreateTask    = "create-Task"
+	conversationActionReRunStage    = "re-run-stage"
 )
+
+var ErrConversationRunNotReadable = errors.New("conversation run is not readable")
 
 // SubmitConversationMessage persists one user message and queues a managed
 // agent turn for that message. The turn is intentionally not a workflow run: it
@@ -99,7 +102,7 @@ func (e *Engine) conversationDispatchInput(ctx context.Context, project store.Pr
 			"repository": []string{"read", "list", "grep"},
 			"workspace":  []string{"read", "write"},
 		},
-		"allowed_actions": []string{conversationActionCreateTask},
+		"allowed_actions": []string{conversationActionCreateTask, conversationActionReRunStage},
 	}
 	if strings.TrimSpace(project.ProjectRules) != "" {
 		input["project_rules"] = project.ProjectRules
@@ -208,10 +211,10 @@ func (e *Engine) dispatchConversationReply(ctx context.Context, projectID, conve
 	}
 	wr, err := e.executeConversationAction(ctx, projectID, conversationID, *result.Action)
 	if err != nil {
-		_, _ = e.persistConversationAssistantMessage(ctx, projectID, conversationID, triggerMessageID, "The conversational agent could not create a Task: "+err.Error(), event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "conversation action failed")
+		_, _ = e.persistConversationAssistantMessage(ctx, projectID, conversationID, triggerMessageID, "The conversational agent action `"+result.Action.Type+"` could not be executed: "+err.Error(), event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "conversation action failed")
 		return
 	}
-	_, _ = e.persistConversationAssistantMessage(ctx, projectID, conversationID, triggerMessageID, conversationTaskCreatedMessage(wr), event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "conversation task created")
+	_, _ = e.persistConversationAssistantMessage(ctx, projectID, conversationID, triggerMessageID, conversationActionSucceededMessage(wr, *result.Action), event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "conversation action completed")
 }
 
 func (e *Engine) persistConversationAssistantMessage(ctx context.Context, projectID, conversationID, triggerMessageID, body string, actor event.Actor, summary string) (store.Message, error) {
@@ -252,6 +255,25 @@ func (e *Engine) executeConversationAction(ctx context.Context, projectID, conve
 			return store.WorkflowRun{}, err
 		}
 		return e.store.GetWorkflowRun(ctx, runID)
+	case conversationActionReRunStage:
+		wr, err := e.store.GetWorkflowRun(ctx, action.RunID)
+		if err != nil {
+			return store.WorkflowRun{}, err
+		}
+		if wr.Run.ProjectID != projectID {
+			return store.WorkflowRun{}, fmt.Errorf("%w: run %q is not readable from project %q", ErrConversationRunNotReadable, action.RunID, projectID)
+		}
+		conversation, err := e.store.GetConversation(ctx, conversationID)
+		if err != nil {
+			return store.WorkflowRun{}, err
+		}
+		if conversation.ProjectID != projectID {
+			return store.WorkflowRun{}, fmt.Errorf("%w: conversation %q is not in project %q", ErrConversationRunNotReadable, conversationID, projectID)
+		}
+		if _, err := e.ReRunStage(ctx, action.RunID, action.Stage); err != nil {
+			return store.WorkflowRun{}, err
+		}
+		return e.store.GetWorkflowRun(ctx, action.RunID)
 	default:
 		return store.WorkflowRun{}, fmt.Errorf("unsupported conversation action %q", action.Type)
 	}
@@ -290,6 +312,8 @@ type conversationAction struct {
 	Type     string
 	Idea     string
 	Template string
+	RunID    string
+	Stage    string
 }
 
 func (e *Engine) runConversationAgentTurn(ctx context.Context, projectID string, input map[string]any) (conversationTurnResult, error) {
@@ -415,11 +439,6 @@ func parseConversationAction(raw any, allowed []string) (conversationAction, err
 	if !ok {
 		return conversationAction{}, fmt.Errorf("conversation action envelope must be an object")
 	}
-	for key := range envelope {
-		if key != "type" && key != "idea" && key != "template" {
-			return conversationAction{}, fmt.Errorf("conversation action %q contains unsupported field %q", actionType(envelope), key)
-		}
-	}
 	typ := actionType(envelope)
 	if typ == "" {
 		return conversationAction{}, fmt.Errorf("conversation action missing type")
@@ -429,25 +448,58 @@ func parseConversationAction(raw any, allowed []string) (conversationAction, err
 	}
 	switch typ {
 	case conversationActionCreateTask:
-		idea, ok := envelope["idea"].(string)
-		if !ok || strings.TrimSpace(idea) == "" {
-			return conversationAction{}, fmt.Errorf("create-Task action requires non-empty idea")
-		}
-		templateID := ""
-		if rawTemplate, ok := envelope["template"]; ok && rawTemplate != nil {
-			value, ok := rawTemplate.(string)
-			if !ok {
-				return conversationAction{}, fmt.Errorf("create-Task action template must be a string")
-			}
-			templateID = strings.TrimSpace(value)
-		}
-		if err := validateConversationBrief(idea); err != nil {
-			return conversationAction{}, err
-		}
-		return conversationAction{Type: typ, Idea: idea, Template: templateID}, nil
+		return parseConversationCreateTaskAction(envelope, typ)
+	case conversationActionReRunStage:
+		return parseConversationReRunStageAction(envelope, typ)
 	default:
 		return conversationAction{}, fmt.Errorf("unsupported conversation action %q", typ)
 	}
+}
+
+func parseConversationCreateTaskAction(envelope map[string]any, typ string) (conversationAction, error) {
+	if err := rejectUnsupportedConversationActionFields(envelope, map[string]bool{"type": true, "idea": true, "template": true}); err != nil {
+		return conversationAction{}, err
+	}
+	idea, ok := envelope["idea"].(string)
+	if !ok || strings.TrimSpace(idea) == "" {
+		return conversationAction{}, fmt.Errorf("create-Task action requires non-empty idea")
+	}
+	templateID := ""
+	if rawTemplate, ok := envelope["template"]; ok && rawTemplate != nil {
+		value, ok := rawTemplate.(string)
+		if !ok {
+			return conversationAction{}, fmt.Errorf("create-Task action template must be a string")
+		}
+		templateID = strings.TrimSpace(value)
+	}
+	if err := validateConversationBrief(idea); err != nil {
+		return conversationAction{}, err
+	}
+	return conversationAction{Type: typ, Idea: idea, Template: templateID}, nil
+}
+
+func parseConversationReRunStageAction(envelope map[string]any, typ string) (conversationAction, error) {
+	if err := rejectUnsupportedConversationActionFields(envelope, map[string]bool{"type": true, "run_id": true, "stage": true}); err != nil {
+		return conversationAction{}, err
+	}
+	runID, ok := envelope["run_id"].(string)
+	if !ok || strings.TrimSpace(runID) == "" {
+		return conversationAction{}, fmt.Errorf("re-run-stage action requires non-empty run_id")
+	}
+	stage, ok := envelope["stage"].(string)
+	if !ok || strings.TrimSpace(stage) == "" {
+		return conversationAction{}, fmt.Errorf("re-run-stage action requires non-empty stage")
+	}
+	return conversationAction{Type: typ, RunID: strings.TrimSpace(runID), Stage: strings.TrimSpace(stage)}, nil
+}
+
+func rejectUnsupportedConversationActionFields(envelope map[string]any, allowed map[string]bool) error {
+	for key := range envelope {
+		if !allowed[key] {
+			return fmt.Errorf("conversation action %q contains unsupported field %q", actionType(envelope), key)
+		}
+	}
+	return nil
 }
 
 func validateConversationBrief(brief string) error {
@@ -523,8 +575,23 @@ func conversationActionAllowed(action string, allowed []string) bool {
 	return false
 }
 
+func conversationActionSucceededMessage(wr store.WorkflowRun, action conversationAction) string {
+	switch action.Type {
+	case conversationActionCreateTask:
+		return conversationTaskCreatedMessage(wr)
+	case conversationActionReRunStage:
+		return conversationStageReRunStartedMessage(wr, action)
+	default:
+		return fmt.Sprintf("Completed conversation action `%s` for Run `%s`.", action.Type, wr.Run.ID)
+	}
+}
+
 func conversationTaskCreatedMessage(wr store.WorkflowRun) string {
 	return fmt.Sprintf("Created Task `%s` / Run `%s` from this conversation on workflow template `%s`. The harness validated the template's human-gate floor before starting it.", wr.Task.ID, wr.Run.ID, wr.Run.WorkflowTemplateID)
+}
+
+func conversationStageReRunStartedMessage(wr store.WorkflowRun, action conversationAction) string {
+	return fmt.Sprintf("Started re-running Run `%s` from stage `%s` in new Attempt `%s`. The re-run uses the run's frozen workflow graph and travels through its normal gates; it is not an express lane.", wr.Run.ID, action.Stage, wr.Attempt.ID)
 }
 
 func conversationReplyFromReport(rep report.Report) string {
