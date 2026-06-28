@@ -63,10 +63,11 @@ type ProjectSettingsData struct {
 }
 
 type SystemSettingsData struct {
-	Sinks  ExternalNotificationSinksData
-	Center NotificationCenterData
-	CSRF   string
-	Title  string
+	Sinks            ExternalNotificationSinksData
+	ForgeCredentials ForgeCredentialsData
+	Center           NotificationCenterData
+	CSRF             string
+	Title            string
 }
 
 type ExternalNotificationSinksData struct {
@@ -79,6 +80,24 @@ type ExternalNotificationSinksData struct {
 	CreateGotifyPath     string
 	CreateWebhookPath    string
 	CSRF                 string
+}
+
+type ForgeCredentialsData struct {
+	Credentials      []ForgeCredentialData
+	SecretsAvailable bool
+	SecretsMessage   string
+	Notice           string
+	Status           string
+	CreatePath       string
+	CSRF             string
+}
+
+type ForgeCredentialData struct {
+	ID               string
+	Host             string
+	SecretConfigured bool
+	DeletePath       string
+	UpdatedAt        string
 }
 
 type NotificationSinkData struct {

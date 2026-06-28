@@ -41,11 +41,14 @@ type WorkflowTemplateEditData struct {
 }
 
 type WorkflowTemplateSettingsData struct {
-	BranchPolicy string
-	PRBehavior   string
-	MergePolicy  string
-	FixLoop      bool
-	MaxFixLoops  int
+	BranchPolicy     string
+	PRBehavior       string
+	MergePolicy      string
+	RequiredChecks   string
+	ForgeCredential  string
+	MergeWaitTimeout string
+	FixLoop          bool
+	MaxFixLoops      int
 }
 
 type WorkflowTemplateStageRowData struct {

@@ -105,20 +105,38 @@ func DefaultTemplate() Template { return balancedPRDelivery() }
 
 func MeetsHumanGateFloor(template Template) bool {
 	template = NormalizeTemplate(template)
+	prBehavior := settingString(template.Settings, "pr_behavior")
+	mergePolicy := settingString(template.Settings, "merge_policy")
+	if prBehavior == "create_pr" && MergePolicyAllowsAutoMerge(mergePolicy) {
+		return false
+	}
 	for _, stage := range template.Stages {
 		if stage.Type == StageTypeReview && stage.Actor == ActorHuman {
 			return true
 		}
 	}
-	if settingString(template.Settings, "pr_behavior") != "create_pr" {
+	if prBehavior != "create_pr" {
 		return false
 	}
-	return mergePolicyRequiresHumanGate(settingString(template.Settings, "merge_policy"))
+	return MergePolicyRequiresHumanGate(mergePolicy)
+}
+
+func MergePolicyRequiresHumanGate(policy string) bool {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "human", "human_stop", "human_merge", "manual", "manual_stop", "manual_merge", "no_auto_merge", "none", "disabled":
+		return true
+	default:
+		return false
+	}
 }
 
 func mergePolicyRequiresHumanGate(policy string) bool {
+	return MergePolicyRequiresHumanGate(policy)
+}
+
+func MergePolicyAllowsAutoMerge(policy string) bool {
 	switch strings.ToLower(strings.TrimSpace(policy)) {
-	case "human", "human_stop", "human_merge", "manual", "manual_stop", "manual_merge", "no_auto_merge", "none", "disabled":
+	case "auto", "auto_merge", "automerge", "merge_when_green", "auto_when_green":
 		return true
 	default:
 		return false

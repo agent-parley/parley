@@ -63,7 +63,18 @@
               <option value="human_stop" {{if eq .Settings.MergePolicy "human_stop"}}selected{{end}}>Human stop</option>
               <option value="no_auto_merge" {{if eq .Settings.MergePolicy "no_auto_merge"}}selected{{end}}>No auto-merge</option>
               <option value="manual" {{if eq .Settings.MergePolicy "manual"}}selected{{end}}>Manual</option>
+              <option value="auto_merge" {{if eq .Settings.MergePolicy "auto_merge"}}selected{{end}}>Auto-merge</option>
+              <option value="merge_when_green" {{if eq .Settings.MergePolicy "merge_when_green"}}selected{{end}}>Merge when green</option>
             </select>
+          </label>
+          <label>Required checks
+            <input name="required_checks" value="{{.Settings.RequiredChecks}}" placeholder="ci/test, lint">
+          </label>
+          <label>Forge credential ref
+            <input name="forge_credential" value="{{.Settings.ForgeCredential}}" placeholder="stored credential ID, e.g. fcr_...">
+          </label>
+          <label>Merge wait timeout
+            <input name="merge_wait_timeout" value="{{.Settings.MergeWaitTimeout}}" placeholder="5m (max 30m)">
           </label>
           <label>Max fix loops
             <input type="number" min="0" name="max_fix_loops" value="{{.Settings.MaxFixLoops}}">
