@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/shared/contract"
@@ -30,10 +31,10 @@ func TestAssemblerBuildsSourceLabeledStageFilteredBrief(t *testing.T) {
 	if brief.Name != "Stage brief" || brief.SchemaVersion != SchemaVersion {
 		t.Fatalf("brief identity = %+v", brief)
 	}
-	if got := strings.Join(brief.IndexedSources, ","); got != "task_plan,repo_evidence,project_rules,workflow_snapshot,planning_artifacts,project_preferences" {
+	if got := strings.Join(brief.IndexedSources, ","); got != "task_plan,repo_evidence,project_rules,workflow_snapshot,planning_artifacts,project_memory,project_preferences" {
 		t.Fatalf("indexed sources = %s", got)
 	}
-	for _, label := range []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectPreferences} {
+	for _, label := range []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences} {
 		if !hasSource(brief, label) {
 			t.Fatalf("missing source label %s in %+v", label, brief.Sources)
 		}
@@ -65,15 +66,15 @@ func TestAssemblerBuildsSourceLabeledStageFilteredBrief(t *testing.T) {
 	if queueDefaults := itemByLabel(preferencesSource, "project_queue_defaults"); queueDefaults.Authority != SourceItemAuthorityAuthoritative {
 		t.Fatalf("queue defaults authority = %+v", queueDefaults)
 	}
-	if hasDeferredSource(brief, SourceTaskPlan) || hasDeferredSource(brief, SourcePlanningArtifacts) {
-		t.Fatalf("task_plan/planning_artifacts are live sources, not deferred: %+v", brief.DeferredSources)
+	if hasDeferredSource(brief, SourceTaskPlan) || hasDeferredSource(brief, SourcePlanningArtifacts) || hasDeferredSource(brief, "private_memory") {
+		t.Fatalf("live sources should not be deferred: %+v", brief.DeferredSources)
 	}
 	if hasDeferredSource(brief, "editable_project_rules_preferences_app_state") {
 		t.Fatalf("project rules/preferences app-state is no longer deferred: %+v", brief.DeferredSources)
 	}
 
 	markdown := Markdown(brief)
-	for _, want := range []string{"## Source: task_plan", "## Source: workflow_snapshot", "## Source: repo_evidence", "## Source: project_rules", "## Source: planning_artifacts", "## Source: project_preferences", "Conflict precedence", "candidate_project_rules:.parley/rules.md", "candidate_project_preferences:.parley/preferences.md", "Authority: `candidate`", "Non-authoritative repo suggestion", "No project rules configured in Parley app state", "No approved task plan artifact is available", "No supplemental planning artifacts are available"} {
+	for _, want := range []string{"## Source: task_plan", "## Source: workflow_snapshot", "## Source: repo_evidence", "## Source: project_rules", "## Source: planning_artifacts", "## Source: project_memory", "## Source: project_preferences", "Conflict precedence", "candidate_project_rules:.parley/rules.md", "candidate_project_preferences:.parley/preferences.md", "Authority: `candidate`", "Non-authoritative repo suggestion", "No project rules configured in Parley app state", "No approved task plan artifact is available", "No supplemental planning artifacts are available", "No curated project memory entries are available"} {
 		if !strings.Contains(markdown, want) {
 			t.Fatalf("markdown missing %q:\n%s", want, markdown)
 		}
@@ -140,19 +141,44 @@ func TestProjectPreferencesAppStateIsAuthoritativeAndRepoPreferencesRemainCandid
 	}
 }
 
-func TestAssemblerStageAllowlistOmitsSourcesPerStageType(t *testing.T) {
+func TestAssemblerStageAllowlistFiltersProjectMemoryPerStageType(t *testing.T) {
 	ctx := context.Background()
-	req := briefRequest("", contract.StageTypeValidation)
-	brief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, req)
-	if err != nil {
-		t.Fatalf("Assemble() error = %v", err)
+	for _, tc := range []struct {
+		stageType  string
+		wantMemory bool
+	}{
+		{contract.StageTypeIdeaIntake, true},
+		{contract.StageTypeIdeaRefinement, true},
+		{contract.StageTypeReview, true},
+		{contract.StageTypeImplementation, true},
+		{contract.StageTypeMemoryUpdate, true},
+		{contract.StageTypeValidation, false},
+		{contract.StageTypeCommit, false},
+		{contract.StageTypePRCreation, false},
+		{contract.StageTypePRReady, false},
+		{contract.StageTypeStopReport, false},
+	} {
+		t.Run(tc.stageType, func(t *testing.T) {
+			brief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, briefRequest("", tc.stageType))
+			if err != nil {
+				t.Fatalf("Assemble() error = %v", err)
+			}
+			if gotMemory := hasSource(brief, SourceProjectMemory); gotMemory != tc.wantMemory {
+				t.Fatalf("project_memory presence = %t, want %t: %+v", gotMemory, tc.wantMemory, brief.Sources)
+			}
+		})
 	}
-	if hasSource(brief, SourceProjectPreferences) {
-		t.Fatalf("validation stage unexpectedly received preferences: %+v", brief.Sources)
+
+	validationBrief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, briefRequest("", contract.StageTypeValidation))
+	if err != nil {
+		t.Fatalf("Assemble() validation error = %v", err)
+	}
+	if hasSource(validationBrief, SourceProjectPreferences) {
+		t.Fatalf("validation stage unexpectedly received preferences: %+v", validationBrief.Sources)
 	}
 	for _, label := range []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts} {
-		if !hasSource(brief, label) {
-			t.Fatalf("validation sources missing %s: %+v", label, brief.Sources)
+		if !hasSource(validationBrief, label) {
+			t.Fatalf("validation sources missing %s: %+v", label, validationBrief.Sources)
 		}
 	}
 }
@@ -211,10 +237,176 @@ func TestAssemblerIncludesApprovedTaskPlanAndPlanningArtifacts(t *testing.T) {
 		t.Fatalf("task_plan/planning_artifacts should not be deferred once providers are live: %+v", brief.DeferredSources)
 	}
 	markdown := Markdown(brief)
-	for _, want := range []string{"2. `approved_task_plan` (source: `task_plan`)", "6. `planning_artifacts` (source: `planning_artifacts`)", "## Source: task_plan", "## Source: planning_artifacts", "Implement the approved plan.", "Original user idea."} {
+	for _, want := range []string{"2. `approved_task_plan` (source: `task_plan`)", "6. `planning_artifacts` (source: `planning_artifacts`)", "7. `project_memory` (source: `project_memory`)", "## Source: task_plan", "## Source: planning_artifacts", "## Source: project_memory", "Implement the approved plan.", "Original user idea."} {
 		if !strings.Contains(markdown, want) {
 			t.Fatalf("markdown missing %q:\n%s", want, markdown)
 		}
+	}
+}
+
+func TestProjectMemorySourceIncludesCuratedEntriesWithinBounds(t *testing.T) {
+	ctx := context.Background()
+	req := briefRequest("", contract.StageTypeImplementation)
+	req.ProjectMemoryEntries = []store.ProjectMemoryEntry{
+		{ID: "memory_old", ProjectID: "p1", Kind: store.ProjectMemoryKindLesson, Title: "Old lesson", Body: "validation_mode: broad", SourceRunID: "run0", SourceTaskID: "task0", SourceStageID: "stage0", SourceArtifactID: "artifact0", CuratorStageID: "curator0", SourceSummary: "old source", CreatedAt: "2026-06-07T10:00:00Z", UpdatedAt: "2026-06-07T10:00:00Z"},
+		{ID: "memory_new", ProjectID: "p1", Kind: store.ProjectMemoryKindGotcha, Title: "Validation image needs git", Body: "validation_image: git\nInstall git before inspecting worktree snapshots.", SourceRunID: "run1", SourceTaskID: "task1", SourceStageID: "stage1", SourceArtifactID: "artifact1", CuratorStageID: "curator1", SourceSummary: "implementation report", CreatedAt: "2026-06-07T12:00:00Z", UpdatedAt: "2026-06-07T12:00:00Z"},
+		{ID: "memory_mid", ProjectID: "p1", Kind: store.ProjectMemoryKindRepoFact, Title: "Middle fact", Body: "default_branch: main", SourceRunID: "run1", SourceTaskID: "task1", SourceStageID: "stage2", SourceArtifactID: "artifact2", CuratorStageID: "curator1", SourceSummary: "validation report", CreatedAt: "2026-06-07T11:00:00Z", UpdatedAt: "2026-06-07T11:00:00Z"},
+	}
+	brief, err := NewAssembler(Options{Now: fixedBriefNow, Bounds: Bounds{MaxSourceBytes: 4096, MaxItemBytes: 2048, MaxItemsPerSource: 2}}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	memorySource := sourceByLabel(brief, SourceProjectMemory)
+	if memorySource.PrecedenceRank != 7 || !memorySource.Truncated || len(memorySource.Items) != 2 {
+		t.Fatalf("memory source rank/truncation/items = rank %d truncated %t len %d: %+v", memorySource.PrecedenceRank, memorySource.Truncated, len(memorySource.Items), memorySource)
+	}
+	newest := itemByLabel(memorySource, "project_memory:gotcha:memory_new")
+	if newest.Authority != SourceItemAuthorityInformational || !strings.Contains(newest.AuthorityNote, "precedence rank 7") || !strings.Contains(newest.Text, "Source artifact: `artifact1`") || !strings.Contains(newest.Text, "Install git before inspecting worktree snapshots") {
+		t.Fatalf("newest memory item = %+v", newest)
+	}
+	if itemByLabel(memorySource, "project_memory:lesson:memory_old").Label != "" {
+		t.Fatalf("oldest memory entry should be outside per-source bound: %+v", memorySource.Items)
+	}
+	markdown := Markdown(brief)
+	for _, want := range []string{"## Source: project_memory", "- Precedence rank: 7", "Authority: `informational`", "Validation image needs git", "source item count truncated to 2"} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("markdown missing %q:\n%s", want, markdown)
+		}
+	}
+}
+
+func TestProjectMemoryConflictWithHigherPrecedenceSourceRaisesWarning(t *testing.T) {
+	ctx := context.Background()
+	req := briefRequest("", contract.StageTypeImplementation)
+	req.Project.ProjectRules = "delivery_mode: guarded\n"
+	req.ProjectMemoryEntries = []store.ProjectMemoryEntry{
+		{ID: "memory_conflict", ProjectID: "p1", Kind: store.ProjectMemoryKindDecision, Title: "Old delivery mode", Body: "delivery_mode: fast\nUse the old fast path for local handoffs.", SourceStageID: "stage_old", SourceArtifactID: "artifact_old", CuratorStageID: "curator_old", SourceSummary: "older run", UpdatedAt: "2026-06-07T12:00:00Z"},
+	}
+	brief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	memorySource := sourceByLabel(brief, SourceProjectMemory)
+	if !hasWarningContaining(memorySource.Warnings, "conflicts with higher-precedence project_rules") || !hasWarningContaining(memorySource.Warnings, "not an override") {
+		t.Fatalf("memory conflict warnings = %#v", memorySource.Warnings)
+	}
+	item := itemByLabel(memorySource, "project_memory:decision:memory_conflict")
+	if item.Authority == SourceItemAuthorityAuthoritative {
+		t.Fatalf("project memory conflict must not become authoritative: %+v", item)
+	}
+	markdown := Markdown(brief)
+	if !strings.Contains(markdown, "Warning: project_memory entry") || !strings.Contains(markdown, "Prefer project_rules") {
+		t.Fatalf("markdown missing conflict warning:\n%s", markdown)
+	}
+}
+
+func TestProjectMemoryConflictReusesCollectedSourceText(t *testing.T) {
+	ctx := context.Background()
+	planID := "artifact_plan"
+	contractID := "artifact_contract"
+	stage := store.Stage{ID: "stage_current", ProjectID: "p1", RunID: "run1", TaskID: "task1", AttemptID: "attempt1", StageType: contract.StageTypeImplementation, Adapter: "noop", Status: store.StageStatusPending}
+	reads := map[string]int{}
+	req := Request{
+		Project: store.Project{ID: "p1", Name: "Project", QueueAutoWhenReady: true, QueueMaxConcurrent: 1, QueueBacklogCap: 100},
+		Run:     store.Run{ID: "run1", ProjectID: "p1", TaskID: "task1", Idea: "build", Status: store.RunStatusRunning},
+		Task:    store.Task{ID: "task1", ProjectID: "p1", Idea: "build", Status: store.RunStatusRunning},
+		Attempt: store.Attempt{ID: "attempt1", ProjectID: "p1", RunID: "run1", TaskID: "task1", Status: store.RunStatusRunning},
+		Stages: []store.Stage{
+			{ID: "stage_idea", ProjectID: "p1", RunID: "run1", TaskID: "task1", AttemptID: "attempt1", StageType: contract.StageTypeIdeaRefinement, Status: "completed", TaskPlanArtifactID: planID},
+			stage,
+		},
+		Artifacts: []store.Artifact{
+			{ID: planID, ProjectID: "p1", RunID: "run1", TaskID: "task1", Kind: SourceTaskPlan, MediaType: "text/markdown", CreatedAt: "2026-06-07T12:00:00Z"},
+			{ID: contractID, ProjectID: "p1", RunID: "run1", TaskID: "task1", Kind: "task_contract", MediaType: "text/markdown", CreatedAt: "2026-06-07T12:00:01Z"},
+		},
+		CurrentStage: stage,
+		ProjectMemoryEntries: []store.ProjectMemoryEntry{
+			{ID: "memory_conflict", ProjectID: "p1", Kind: store.ProjectMemoryKindDecision, Title: "Old modes", Body: "delivery_mode: fast\nhandoff_mode: sync", UpdatedAt: "2026-06-07T12:00:00Z"},
+		},
+		ReadArtifact: func(_ context.Context, artifactID string) ([]byte, error) {
+			reads[artifactID]++
+			switch artifactID {
+			case planID:
+				return []byte("delivery_mode: guarded\n"), nil
+			case contractID:
+				return []byte("handoff_mode: async\n"), nil
+			default:
+				return nil, os.ErrNotExist
+			}
+		},
+	}
+	brief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	if reads[planID] != 1 || reads[contractID] != 1 {
+		t.Fatalf("artifact reads = %#v, want one read per source provider", reads)
+	}
+	memorySource := sourceByLabel(brief, SourceProjectMemory)
+	if !hasWarningContaining(memorySource.Warnings, "higher-precedence task_plan") || !hasWarningContaining(memorySource.Warnings, "higher-precedence planning_artifacts") {
+		t.Fatalf("memory conflict warnings = %#v", memorySource.Warnings)
+	}
+}
+
+func TestProjectMemoryConflictReusesCollectedRepoEvidence(t *testing.T) {
+	ctx := context.Background()
+	repo := initBriefRepo(t, ctx, map[string]string{
+		"README.md": "repo_mode: guarded\n",
+		"go.mod":    "module example.test/parley\n",
+	})
+	req := briefRequest(repo, contract.StageTypeImplementation)
+	req.ProjectMemoryEntries = []store.ProjectMemoryEntry{
+		{ID: "memory_conflict", ProjectID: "p1", Kind: store.ProjectMemoryKindDecision, Title: "Old repo mode", Body: "repo_mode: fast", UpdatedAt: "2026-06-07T12:00:00Z"},
+	}
+	readmePath := filepath.Join(repo, "README.md")
+	brief, err := NewAssembler(Options{
+		Now: fixedBriefNow,
+		Allowlist: map[string][]string{
+			contract.StageTypeImplementation: {SourceRepoEvidence, "mutate_repo", SourceProjectMemory},
+		},
+		Providers: []SourceProvider{mutateRepoProvider{path: readmePath}},
+	}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	if _, err := os.Stat(readmePath); !os.IsNotExist(err) {
+		t.Fatalf("mutating provider did not remove README.md: %v", err)
+	}
+	memorySource := sourceByLabel(brief, SourceProjectMemory)
+	if !hasWarningContaining(memorySource.Warnings, "higher-precedence repo_evidence") || !hasWarningContaining(memorySource.Warnings, "Prefer repo_evidence") {
+		t.Fatalf("memory conflict warnings = %#v", memorySource.Warnings)
+	}
+}
+
+func TestProjectMemoryConflictScansWorkflowStageSettings(t *testing.T) {
+	ctx := context.Background()
+	req := briefRequest("", contract.StageTypeImplementation)
+	req.WorkflowStageSettings = map[string]any{"review_depth": "strict"}
+	req.ProjectMemoryEntries = []store.ProjectMemoryEntry{
+		{ID: "memory_conflict", ProjectID: "p1", Kind: store.ProjectMemoryKindDecision, Title: "Old review depth", Body: "review_depth: light", UpdatedAt: "2026-06-07T12:00:00Z"},
+	}
+	brief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	workflowSource := sourceByLabel(brief, SourceWorkflowSnapshot)
+	settings := itemByLabel(workflowSource, "workflow_stage_settings")
+	if settings.Authority != SourceItemAuthorityAuthoritative || !strings.Contains(settings.Text, "review_depth: strict") {
+		t.Fatalf("workflow stage settings item = %+v", settings)
+	}
+	memorySource := sourceByLabel(brief, SourceProjectMemory)
+	if !hasWarningContaining(memorySource.Warnings, "higher-precedence workflow_stage_settings") || !hasWarningContaining(memorySource.Warnings, "Prefer workflow_stage_settings") {
+		t.Fatalf("memory conflict warnings = %#v", memorySource.Warnings)
+	}
+}
+
+func TestShortValueTruncatesOnRuneBoundary(t *testing.T) {
+	got := shortValue(strings.Repeat("é", 120))
+	if !utf8.ValidString(got) {
+		t.Fatalf("shortValue produced invalid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "…") || len([]rune(got)) != 96 {
+		t.Fatalf("shortValue = %q, rune len %d", got, len([]rune(got)))
 	}
 }
 
@@ -268,6 +460,18 @@ func (futureSourceProvider) Collect(context.Context, Request, Bounds) (Source, e
 	return Source{Label: "future_memory", Title: "Future memory", Items: []SourceItem{textItem("note", "registered later")}}, nil
 }
 
+type mutateRepoProvider struct {
+	path string
+}
+
+func (mutateRepoProvider) Label() string { return "mutate_repo" }
+func (p mutateRepoProvider) Collect(context.Context, Request, Bounds) (Source, error) {
+	if err := os.Remove(p.path); err != nil {
+		return Source{}, err
+	}
+	return Source{Label: "mutate_repo", Title: "Mutate repo", Items: []SourceItem{textItem("mutation", "removed selected file")}}, nil
+}
+
 func briefRequest(repoPath, stageType string) Request {
 	stage := store.Stage{ID: "stage_current", ProjectID: "p1", RunID: "run1", TaskID: "task1", AttemptID: "attempt1", StageType: stageType, Adapter: "noop", Status: store.StageStatusPending}
 	stages := []store.Stage{
@@ -305,6 +509,15 @@ func itemByLabel(source Source, label string) SourceItem {
 		}
 	}
 	return SourceItem{}
+}
+
+func hasWarningContaining(warnings []string, want string) bool {
+	for _, warning := range warnings {
+		if strings.Contains(warning, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasDeferredSource(brief StageBrief, label string) bool {

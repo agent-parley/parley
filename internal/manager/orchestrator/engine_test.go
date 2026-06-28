@@ -257,6 +257,52 @@ func TestDispatchStagePersistsStageBriefAndPassesItToRunner(t *testing.T) {
 	t.Fatal("implementation stage not found")
 }
 
+func TestDispatchStageBriefIncludesCuratedProjectMemory(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "include curated memory", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sourceReport := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		StageID:       wr.IdeaIntakeStage.ID,
+		StageType:     wr.IdeaIntakeStage.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: "noop"},
+		Status:        report.StatusCompleted,
+		Summary:       "captured a reusable memory entry",
+		Payload:       map[string]any{},
+		Errors:        []string{},
+	}
+	sourceArtifact, err := st.SaveReportArtifact(ctx, sourceReport)
+	if err != nil {
+		t.Fatalf("save source report: %v", err)
+	}
+	if _, err := st.ApplyProjectMemoryUpdate(ctx, store.ProjectMemoryUpdate{ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, CuratorStageID: wr.MemoryUpdateStage.ID, Entries: []store.ProjectMemoryInput{
+		{Kind: store.ProjectMemoryKindGotcha, Title: "Validation image needs git", Body: "validation_image: git\nValidation image used git before checking worktree snapshots.", SourceStageID: wr.IdeaIntakeStage.ID, SourceArtifactID: sourceArtifact.ID, SourceSummary: "idea intake report"},
+	}}); err != nil {
+		t.Fatalf("apply memory update: %v", err)
+	}
+
+	runner := &capturingRunner{}
+	engine := newRecordingEngine(t, st, runner, EngineOptions{})
+	if _, err := engine.dispatchStage(ctx, wr, wr.ImplementationStage, "capture", contract.StageTypeImplementation, implementationInput(wr, report.Report{})); err != nil {
+		t.Fatalf("dispatchStage() error = %v", err)
+	}
+	briefText, _ := runner.disp.Input["stage_brief_markdown"].(string)
+	for _, want := range []string{"## Source: project_memory", "Validation image needs git", "Source artifact: `" + sourceArtifact.ID + "`", "Curated project memory is precedence rank 7"} {
+		if !strings.Contains(briefText, want) {
+			t.Fatalf("stage brief missing %q:\n%s", want, briefText)
+		}
+	}
+}
+
 func TestDispatchStageRepairsMalformedReportBeforeCompletion(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
@@ -517,6 +563,12 @@ func TestAgentStageDispatchReceivesTemplateActorTargetSettings(t *testing.T) {
 	settings, ok := runner.disp.Input["workflow_stage_settings"].(map[string]any)
 	if !ok || settings["profile"] != "generalist" || settings["intensity"] != "normal" {
 		t.Fatalf("dispatch input settings = %#v", runner.disp.Input["workflow_stage_settings"])
+	}
+	briefText, _ := runner.disp.Input["stage_brief_markdown"].(string)
+	for _, want := range []string{"workflow_stage_settings", "profile: generalist", "intensity: normal"} {
+		if !strings.Contains(briefText, want) {
+			t.Fatalf("stage brief missing %q:\n%s", want, briefText)
+		}
 	}
 }
 

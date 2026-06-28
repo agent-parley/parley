@@ -26,6 +26,7 @@ const (
 	SourceRepoEvidence       = "repo_evidence"
 	SourceProjectRules       = "project_rules"
 	SourcePlanningArtifacts  = "planning_artifacts"
+	SourceProjectMemory      = "project_memory"
 	SourceProjectPreferences = "project_preferences"
 
 	SourceItemAuthorityAuthoritative = "authoritative"
@@ -58,17 +59,20 @@ func DefaultBounds() Bounds {
 }
 
 type Request struct {
-	Project            store.Project                                 `json:"project"`
-	Task               store.Task                                    `json:"task"`
-	Run                store.Run                                     `json:"run"`
-	Attempt            store.Attempt                                 `json:"attempt"`
-	Stages             []store.Stage                                 `json:"stages"`
-	Events             []event.Event                                 `json:"events"`
-	Artifacts          []store.Artifact                              `json:"artifacts"`
-	CurrentStage       store.Stage                                   `json:"current_stage"`
-	RepositoryPath     string                                        `json:"repository_path,omitempty"`
-	RepositoryWarnings []string                                      `json:"repository_warnings,omitempty"`
-	ReadArtifact       func(context.Context, string) ([]byte, error) `json:"-"`
+	Project               store.Project                                 `json:"project"`
+	Task                  store.Task                                    `json:"task"`
+	Run                   store.Run                                     `json:"run"`
+	Attempt               store.Attempt                                 `json:"attempt"`
+	Stages                []store.Stage                                 `json:"stages"`
+	Events                []event.Event                                 `json:"events"`
+	Artifacts             []store.Artifact                              `json:"artifacts"`
+	CurrentStage          store.Stage                                   `json:"current_stage"`
+	RepositoryPath        string                                        `json:"repository_path,omitempty"`
+	RepositoryWarnings    []string                                      `json:"repository_warnings,omitempty"`
+	WorkflowStageSettings map[string]any                                `json:"workflow_stage_settings,omitempty"`
+	ProjectMemoryEntries  []store.ProjectMemoryEntry                    `json:"project_memory_entries,omitempty"`
+	CollectedSources      []Source                                      `json:"-"`
+	ReadArtifact          func(context.Context, string) ([]byte, error) `json:"-"`
 }
 
 type StageBrief struct {
@@ -193,15 +197,22 @@ func (a *Assembler) Assemble(ctx context.Context, req Request) (StageBrief, erro
 		DeferredSources:    deferredSources(),
 		ConflictPrecedence: conflictPrecedence(),
 	}
+	collected := make([]Source, 0, len(allowed))
 	for _, label := range allowed {
+		providerReq := req
+		providerReq.CollectedSources = append([]Source(nil), collected...)
 		provider, ok := a.providers[label]
 		if !ok {
-			brief.Sources = append(brief.Sources, Source{Label: label, Title: label, Included: false, Warnings: []string{"no provider registered for source"}})
+			source := Source{Label: label, Title: label, Included: false, Warnings: []string{"no provider registered for source"}}
+			brief.Sources = append(brief.Sources, source)
+			collected = append(collected, source)
 			continue
 		}
-		source, err := provider.Collect(ctx, req, a.bounds)
+		source, err := provider.Collect(ctx, providerReq, a.bounds)
 		if err != nil {
-			brief.Sources = append(brief.Sources, Source{Label: label, Title: label, PrecedenceRank: precedenceRank(label), Included: true, Warnings: []string{err.Error()}})
+			source = Source{Label: label, Title: label, PrecedenceRank: precedenceRank(label), Included: true, Warnings: []string{err.Error()}}
+			brief.Sources = append(brief.Sources, source)
+			collected = append(collected, source)
 			continue
 		}
 		if source.Label == "" {
@@ -215,6 +226,7 @@ func (a *Assembler) Assemble(ctx context.Context, req Request) (StageBrief, erro
 		}
 		source.Included = true
 		brief.Sources = append(brief.Sources, applyBounds(source, a.bounds))
+		collected = append(collected, source)
 	}
 	return brief, nil
 }
@@ -234,21 +246,22 @@ func defaultProviders() []SourceProvider {
 		RepoEvidenceProvider{},
 		ProjectRulesProvider{},
 		PlanningArtifactsProvider{},
+		ProjectMemoryProvider{},
 		ProjectPreferencesProvider{},
 	}
 }
 
 func defaultAllowlist() map[string][]string {
 	return map[string][]string{
-		contract.StageTypeIdeaIntake:     {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectPreferences},
-		contract.StageTypeIdeaRefinement: {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectPreferences},
-		contract.StageTypeReview:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectPreferences},
-		contract.StageTypeImplementation: {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectPreferences},
+		contract.StageTypeIdeaIntake:     {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectMemory, SourceProjectPreferences},
+		contract.StageTypeIdeaRefinement: {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectMemory, SourceProjectPreferences},
+		contract.StageTypeReview:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences},
+		contract.StageTypeImplementation: {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences},
 		contract.StageTypeValidation:     {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts},
 		contract.StageTypeCommit:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts},
 		contract.StageTypePRCreation:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
 		contract.StageTypePRReady:        {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
-		contract.StageTypeMemoryUpdate:   {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectPreferences},
+		contract.StageTypeMemoryUpdate:   {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectMemory, SourceProjectPreferences},
 		contract.StageTypeStopReport:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
 	}
 }
@@ -262,12 +275,11 @@ func cloneAllowlist(in map[string][]string) map[string][]string {
 }
 
 func builtinSourceLabels() []string {
-	return []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectPreferences}
+	return []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences}
 }
 
 func deferredSources() []DeferredSource {
 	return []DeferredSource{
-		{Label: "private_memory", Reason: "deferred until B6 memory-update stage and curated project memory exists"},
 		{Label: "external_forge_metadata", Reason: "deferred until forge issue/PR metadata source is built"},
 	}
 }
@@ -280,7 +292,7 @@ func conflictPrecedence() []PrecedenceRule {
 		{Rank: 4, Label: "project_rules", Source: SourceProjectRules},
 		{Rank: 5, Label: "workflow_stage_settings", Source: SourceWorkflowSnapshot},
 		{Rank: 6, Label: "planning_artifacts", Source: SourcePlanningArtifacts},
-		{Rank: 7, Label: "project_memory"},
+		{Rank: 7, Label: "project_memory", Source: SourceProjectMemory},
 		{Rank: 8, Label: "project_preferences", Source: SourceProjectPreferences},
 	}
 }
@@ -297,6 +309,8 @@ func precedenceRank(label string) int {
 		return 5
 	case SourcePlanningArtifacts:
 		return 6
+	case SourceProjectMemory:
+		return 7
 	case SourceProjectPreferences:
 		return 8
 	default:
@@ -573,7 +587,13 @@ func (WorkflowSnapshotProvider) Collect(ctx context.Context, req Request, bounds
 		"stages":         stageSnapshots(req.Stages),
 		"attempt_status": req.Attempt.Status,
 	}
+	if len(req.WorkflowStageSettings) > 0 {
+		workflow["workflow_stage_settings"] = req.WorkflowStageSettings
+	}
 	source.Items = append(source.Items, jsonItem("workflow_snapshot", workflow))
+	if len(req.WorkflowStageSettings) > 0 {
+		source.Items = append(source.Items, withAuthority(settingsItem("workflow_stage_settings", req.WorkflowStageSettings), SourceItemAuthorityAuthoritative, "Frozen current-stage workflow template settings; rank 5 per ADR 0026."))
+	}
 
 	priorReports, warnings := collectPriorReports(ctx, req, stageOrder, currentIndex)
 	source.Warnings = append(source.Warnings, warnings...)
@@ -860,6 +880,40 @@ func jsonItem(label string, value any) SourceItem {
 		content = []byte(fmt.Sprint(value))
 	}
 	return SourceItem{Label: label, MediaType: "application/json", Text: string(content), Bytes: len(content)}
+}
+
+func settingsItem(label string, settings map[string]any) SourceItem {
+	keys := make([]string, 0, len(settings))
+	for key := range settings {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, key := range keys {
+		fmt.Fprintf(&b, "%s: %s\n", key, settingTextValue(settings[key]))
+	}
+	return SourceItem{Label: label, MediaType: "text/plain", Text: b.String(), Bytes: b.Len()}
+}
+
+func settingTextValue(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case bool:
+		return fmt.Sprint(typed)
+	case int:
+		return fmt.Sprint(typed)
+	case int64:
+		return fmt.Sprint(typed)
+	case float64:
+		return fmt.Sprint(typed)
+	default:
+		content, err := json.Marshal(typed)
+		if err != nil {
+			return fmt.Sprint(typed)
+		}
+		return string(content)
+	}
 }
 
 func markdownItem(label, text string) SourceItem {
