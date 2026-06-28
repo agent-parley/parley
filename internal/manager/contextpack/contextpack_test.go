@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/shared/contract"
@@ -274,6 +275,116 @@ func TestProjectMemoryConflictWithHigherPrecedenceSourceRaisesWarning(t *testing
 	}
 }
 
+func TestProjectMemoryConflictReusesCollectedSourceText(t *testing.T) {
+	ctx := context.Background()
+	planID := "artifact_plan"
+	contractID := "artifact_contract"
+	stage := store.Stage{ID: "stage_current", ProjectID: "p1", RunID: "run1", TaskID: "task1", AttemptID: "attempt1", StageType: contract.StageTypeImplementation, Adapter: "noop", Status: store.StageStatusPending}
+	reads := map[string]int{}
+	req := Request{
+		Project: store.Project{ID: "p1", Name: "Project", QueueAutoWhenReady: true, QueueMaxConcurrent: 1, QueueBacklogCap: 100},
+		Run:     store.Run{ID: "run1", ProjectID: "p1", TaskID: "task1", Idea: "build", Status: store.RunStatusRunning},
+		Task:    store.Task{ID: "task1", ProjectID: "p1", Idea: "build", Status: store.RunStatusRunning},
+		Attempt: store.Attempt{ID: "attempt1", ProjectID: "p1", RunID: "run1", TaskID: "task1", Status: store.RunStatusRunning},
+		Stages: []store.Stage{
+			{ID: "stage_idea", ProjectID: "p1", RunID: "run1", TaskID: "task1", AttemptID: "attempt1", StageType: contract.StageTypeIdeaRefinement, Status: "completed", TaskPlanArtifactID: planID},
+			stage,
+		},
+		Artifacts: []store.Artifact{
+			{ID: planID, ProjectID: "p1", RunID: "run1", TaskID: "task1", Kind: SourceTaskPlan, MediaType: "text/markdown", CreatedAt: "2026-06-07T12:00:00Z"},
+			{ID: contractID, ProjectID: "p1", RunID: "run1", TaskID: "task1", Kind: "task_contract", MediaType: "text/markdown", CreatedAt: "2026-06-07T12:00:01Z"},
+		},
+		CurrentStage: stage,
+		ProjectMemoryEntries: []store.ProjectMemoryEntry{
+			{ID: "memory_conflict", ProjectID: "p1", Kind: store.ProjectMemoryKindDecision, Title: "Old modes", Body: "delivery_mode: fast\nhandoff_mode: sync", UpdatedAt: "2026-06-07T12:00:00Z"},
+		},
+		ReadArtifact: func(_ context.Context, artifactID string) ([]byte, error) {
+			reads[artifactID]++
+			switch artifactID {
+			case planID:
+				return []byte("delivery_mode: guarded\n"), nil
+			case contractID:
+				return []byte("handoff_mode: async\n"), nil
+			default:
+				return nil, os.ErrNotExist
+			}
+		},
+	}
+	brief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	if reads[planID] != 1 || reads[contractID] != 1 {
+		t.Fatalf("artifact reads = %#v, want one read per source provider", reads)
+	}
+	memorySource := sourceByLabel(brief, SourceProjectMemory)
+	if !hasWarningContaining(memorySource.Warnings, "higher-precedence task_plan") || !hasWarningContaining(memorySource.Warnings, "higher-precedence planning_artifacts") {
+		t.Fatalf("memory conflict warnings = %#v", memorySource.Warnings)
+	}
+}
+
+func TestProjectMemoryConflictReusesCollectedRepoEvidence(t *testing.T) {
+	ctx := context.Background()
+	repo := initBriefRepo(t, ctx, map[string]string{
+		"README.md": "repo_mode: guarded\n",
+		"go.mod":    "module example.test/parley\n",
+	})
+	req := briefRequest(repo, contract.StageTypeImplementation)
+	req.ProjectMemoryEntries = []store.ProjectMemoryEntry{
+		{ID: "memory_conflict", ProjectID: "p1", Kind: store.ProjectMemoryKindDecision, Title: "Old repo mode", Body: "repo_mode: fast", UpdatedAt: "2026-06-07T12:00:00Z"},
+	}
+	readmePath := filepath.Join(repo, "README.md")
+	brief, err := NewAssembler(Options{
+		Now: fixedBriefNow,
+		Allowlist: map[string][]string{
+			contract.StageTypeImplementation: {SourceRepoEvidence, "mutate_repo", SourceProjectMemory},
+		},
+		Providers: []SourceProvider{mutateRepoProvider{path: readmePath}},
+	}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	if _, err := os.Stat(readmePath); !os.IsNotExist(err) {
+		t.Fatalf("mutating provider did not remove README.md: %v", err)
+	}
+	memorySource := sourceByLabel(brief, SourceProjectMemory)
+	if !hasWarningContaining(memorySource.Warnings, "higher-precedence repo_evidence") || !hasWarningContaining(memorySource.Warnings, "Prefer repo_evidence") {
+		t.Fatalf("memory conflict warnings = %#v", memorySource.Warnings)
+	}
+}
+
+func TestProjectMemoryConflictScansWorkflowStageSettings(t *testing.T) {
+	ctx := context.Background()
+	req := briefRequest("", contract.StageTypeImplementation)
+	req.WorkflowStageSettings = map[string]any{"review_depth": "strict"}
+	req.ProjectMemoryEntries = []store.ProjectMemoryEntry{
+		{ID: "memory_conflict", ProjectID: "p1", Kind: store.ProjectMemoryKindDecision, Title: "Old review depth", Body: "review_depth: light", UpdatedAt: "2026-06-07T12:00:00Z"},
+	}
+	brief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	workflowSource := sourceByLabel(brief, SourceWorkflowSnapshot)
+	settings := itemByLabel(workflowSource, "workflow_stage_settings")
+	if settings.Authority != SourceItemAuthorityAuthoritative || !strings.Contains(settings.Text, "review_depth: strict") {
+		t.Fatalf("workflow stage settings item = %+v", settings)
+	}
+	memorySource := sourceByLabel(brief, SourceProjectMemory)
+	if !hasWarningContaining(memorySource.Warnings, "higher-precedence workflow_stage_settings") || !hasWarningContaining(memorySource.Warnings, "Prefer workflow_stage_settings") {
+		t.Fatalf("memory conflict warnings = %#v", memorySource.Warnings)
+	}
+}
+
+func TestShortValueTruncatesOnRuneBoundary(t *testing.T) {
+	got := shortValue(strings.Repeat("é", 120))
+	if !utf8.ValidString(got) {
+		t.Fatalf("shortValue produced invalid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "…") || len([]rune(got)) != 96 {
+		t.Fatalf("shortValue = %q, rune len %d", got, len([]rune(got)))
+	}
+}
+
 func TestAssemblerAppliesPerSourceBounds(t *testing.T) {
 	ctx := context.Background()
 	repo := initBriefRepo(t, ctx, map[string]string{
@@ -322,6 +433,18 @@ type futureSourceProvider struct{}
 func (futureSourceProvider) Label() string { return "future_memory" }
 func (futureSourceProvider) Collect(context.Context, Request, Bounds) (Source, error) {
 	return Source{Label: "future_memory", Title: "Future memory", Items: []SourceItem{textItem("note", "registered later")}}, nil
+}
+
+type mutateRepoProvider struct {
+	path string
+}
+
+func (mutateRepoProvider) Label() string { return "mutate_repo" }
+func (p mutateRepoProvider) Collect(context.Context, Request, Bounds) (Source, error) {
+	if err := os.Remove(p.path); err != nil {
+		return Source{}, err
+	}
+	return Source{Label: "mutate_repo", Title: "Mutate repo", Items: []SourceItem{textItem("mutation", "removed selected file")}}, nil
 }
 
 func briefRequest(repoPath, stageType string) Request {

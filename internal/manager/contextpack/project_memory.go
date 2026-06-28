@@ -21,6 +21,8 @@ func (ProjectMemoryProvider) Collect(ctx context.Context, req Request, bounds Bo
 		Summary:        "Gatekeeper-curated project memory for recall and continuity. Rank 7: it never overrides the approved plan, repo evidence, project rules, workflow stage settings, or planning artifacts.",
 	}
 	entries := append([]store.ProjectMemoryEntry(nil), req.ProjectMemoryEntries...)
+	// Keep the provider deterministic even when tests or future callers inject entries
+	// without going through Store.ListProjectMemoryEntries' ORDER BY.
 	sort.SliceStable(entries, func(i, j int) bool {
 		if entries[i].UpdatedAt != entries[j].UpdatedAt {
 			return entries[i].UpdatedAt > entries[j].UpdatedAt
@@ -103,25 +105,13 @@ func projectMemoryConflictWarnings(ctx context.Context, req Request, bounds Boun
 	if strings.TrimSpace(req.Run.Idea) != "" && req.Run.Idea != req.Task.Idea {
 		addFacts("current_explicit_user_instruction", req.Run.Idea)
 	}
-	if _, artifact, ok := taskPlanArtifact(req); ok && req.ReadArtifact != nil {
-		if content, err := req.ReadArtifact(ctx, artifact.ID); err == nil {
-			addFacts(SourceTaskPlan, string(content))
-		}
+	if len(req.WorkflowStageSettings) > 0 {
+		addFacts("workflow_stage_settings", settingsItem("workflow_stage_settings", req.WorkflowStageSettings).Text)
 	}
-	if strings.TrimSpace(req.Project.ProjectRules) != "" {
-		addFacts(SourceProjectRules, req.Project.ProjectRules)
-	}
-	if req.RepositoryPath != "" {
-		for _, item := range selectedFiles(req.RepositoryPath, bounds) {
-			addFacts(SourceRepoEvidence, item.Text)
-		}
-	}
-	if req.ReadArtifact != nil {
-		for _, artifact := range planningArtifacts(req) {
-			if content, err := req.ReadArtifact(ctx, artifact.ID); err == nil {
-				addFacts(SourcePlanningArtifacts, string(content))
-			}
-		}
+	if len(req.CollectedSources) > 0 {
+		addCollectedConflictFacts(req.CollectedSources, addFacts)
+	} else {
+		addFallbackConflictFacts(ctx, req, bounds, addFacts)
 	}
 	if len(higherFacts) == 0 {
 		return nil
@@ -149,6 +139,66 @@ func projectMemoryConflictWarnings(ctx context.Context, req Request, bounds Boun
 		}
 	}
 	return warnings
+}
+
+func addCollectedConflictFacts(sources []Source, addFacts func(string, string)) {
+	for _, source := range sources {
+		if precedenceRank(source.Label) >= precedenceRank(SourceProjectMemory) {
+			continue
+		}
+		for _, item := range source.Items {
+			sourceLabel, ok := conflictFactSourceLabel(source.Label, item)
+			if !ok {
+				continue
+			}
+			addFacts(sourceLabel, item.Text)
+		}
+	}
+}
+
+func conflictFactSourceLabel(sourceLabel string, item SourceItem) (string, bool) {
+	if strings.TrimSpace(item.Text) == "" {
+		return "", false
+	}
+	switch sourceLabel {
+	case SourceTaskPlan:
+		return SourceTaskPlan, item.Authority == SourceItemAuthorityAuthoritative
+	case SourceRepoEvidence:
+		// Selected repo files can produce false positives for generic keys such as
+		// "type" or "version"; warnings stay informational and capped for v1.
+		return SourceRepoEvidence, strings.HasPrefix(item.Label, "selected_file:")
+	case SourceProjectRules:
+		return SourceProjectRules, item.Label == "project_rules" && item.Authority == SourceItemAuthorityAuthoritative
+	case SourceWorkflowSnapshot:
+		return "workflow_stage_settings", item.Label == "workflow_stage_settings"
+	case SourcePlanningArtifacts:
+		return SourcePlanningArtifacts, item.Authority == SourceItemAuthorityAuthoritative && strings.HasPrefix(item.Label, "planning_artifact:")
+	default:
+		return "", false
+	}
+}
+
+func addFallbackConflictFacts(ctx context.Context, req Request, bounds Bounds, addFacts func(string, string)) {
+	if _, artifact, ok := taskPlanArtifact(req); ok && req.ReadArtifact != nil {
+		if content, err := req.ReadArtifact(ctx, artifact.ID); err == nil {
+			addFacts(SourceTaskPlan, string(content))
+		}
+	}
+	if strings.TrimSpace(req.Project.ProjectRules) != "" {
+		addFacts(SourceProjectRules, req.Project.ProjectRules)
+	}
+	if req.RepositoryPath != "" {
+		for _, item := range selectedFiles(req.RepositoryPath, bounds) {
+			addFacts(SourceRepoEvidence, item.Text)
+		}
+	}
+	if req.ReadArtifact != nil {
+		for _, artifact := range planningArtifacts(req) {
+			if content, err := req.ReadArtifact(ctx, artifact.ID); err == nil {
+				addFacts(SourcePlanningArtifacts, string(content))
+			}
+		}
+	}
 }
 
 func extractKeyValueFacts(text string) []precedenceFact {
@@ -208,10 +258,11 @@ func normalizeFactValue(value string) string {
 
 func shortValue(value string) string {
 	const max = 96
-	if len(value) <= max {
+	runes := []rune(value)
+	if len(runes) <= max {
 		return value
 	}
-	return strings.TrimSpace(value[:max-1]) + "…"
+	return strings.TrimSpace(string(runes[:max-1])) + "…"
 }
 
 func slugLabel(value string) string {

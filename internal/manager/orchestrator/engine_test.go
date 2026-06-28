@@ -564,6 +564,12 @@ func TestAgentStageDispatchReceivesTemplateActorTargetSettings(t *testing.T) {
 	if !ok || settings["profile"] != "generalist" || settings["intensity"] != "normal" {
 		t.Fatalf("dispatch input settings = %#v", runner.disp.Input["workflow_stage_settings"])
 	}
+	briefText, _ := runner.disp.Input["stage_brief_markdown"].(string)
+	for _, want := range []string{"workflow_stage_settings", "profile: generalist", "intensity: normal"} {
+		if !strings.Contains(briefText, want) {
+			t.Fatalf("stage brief missing %q:\n%s", want, briefText)
+		}
+	}
 }
 
 func TestMemoryUpdateStageAppliesCuratedCandidatesWithoutDispatchingWorkflowAgent(t *testing.T) {
