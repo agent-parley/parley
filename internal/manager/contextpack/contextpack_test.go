@@ -31,10 +31,10 @@ func TestAssemblerBuildsSourceLabeledStageFilteredBrief(t *testing.T) {
 	if brief.Name != "Stage brief" || brief.SchemaVersion != SchemaVersion {
 		t.Fatalf("brief identity = %+v", brief)
 	}
-	if got := strings.Join(brief.IndexedSources, ","); got != "task_plan,repo_evidence,project_rules,workflow_snapshot,planning_artifacts,project_memory,project_preferences" {
+	if got := strings.Join(brief.IndexedSources, ","); got != "task_plan,repo_evidence,project_rules,workflow_snapshot,planning_artifacts,project_memory,project_preferences,external_forge_metadata" {
 		t.Fatalf("indexed sources = %s", got)
 	}
-	for _, label := range []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences} {
+	for _, label := range []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences, SourceExternalForgeMetadata} {
 		if !hasSource(brief, label) {
 			t.Fatalf("missing source label %s in %+v", label, brief.Sources)
 		}
@@ -66,7 +66,7 @@ func TestAssemblerBuildsSourceLabeledStageFilteredBrief(t *testing.T) {
 	if queueDefaults := itemByLabel(preferencesSource, "project_queue_defaults"); queueDefaults.Authority != SourceItemAuthorityAuthoritative {
 		t.Fatalf("queue defaults authority = %+v", queueDefaults)
 	}
-	if hasDeferredSource(brief, SourceTaskPlan) || hasDeferredSource(brief, SourcePlanningArtifacts) || hasDeferredSource(brief, "private_memory") {
+	if hasDeferredSource(brief, SourceTaskPlan) || hasDeferredSource(brief, SourcePlanningArtifacts) || hasDeferredSource(brief, "private_memory") || hasDeferredSource(brief, SourceExternalForgeMetadata) {
 		t.Fatalf("live sources should not be deferred: %+v", brief.DeferredSources)
 	}
 	if hasDeferredSource(brief, "editable_project_rules_preferences_app_state") {
@@ -74,7 +74,7 @@ func TestAssemblerBuildsSourceLabeledStageFilteredBrief(t *testing.T) {
 	}
 
 	markdown := Markdown(brief)
-	for _, want := range []string{"## Source: task_plan", "## Source: workflow_snapshot", "## Source: repo_evidence", "## Source: project_rules", "## Source: planning_artifacts", "## Source: project_memory", "## Source: project_preferences", "Conflict precedence", "candidate_project_rules:.parley/rules.md", "candidate_project_preferences:.parley/preferences.md", "Authority: `candidate`", "Non-authoritative repo suggestion", "No project rules configured in Parley app state", "No approved task plan artifact is available", "No supplemental planning artifacts are available", "No curated project memory entries are available"} {
+	for _, want := range []string{"## Source: task_plan", "## Source: workflow_snapshot", "## Source: repo_evidence", "## Source: project_rules", "## Source: planning_artifacts", "## Source: project_memory", "## Source: project_preferences", "## Source: external_forge_metadata", "Conflict precedence", "candidate_project_rules:.parley/rules.md", "candidate_project_preferences:.parley/preferences.md", "Authority: `candidate`", "Non-authoritative repo suggestion", "No project rules configured in Parley app state", "No approved task plan artifact is available", "No supplemental planning artifacts are available", "No curated project memory entries are available", "No linked issue or pull request references were detected"} {
 		if !strings.Contains(markdown, want) {
 			t.Fatalf("markdown missing %q:\n%s", want, markdown)
 		}
@@ -237,7 +237,7 @@ func TestAssemblerIncludesApprovedTaskPlanAndPlanningArtifacts(t *testing.T) {
 		t.Fatalf("task_plan/planning_artifacts should not be deferred once providers are live: %+v", brief.DeferredSources)
 	}
 	markdown := Markdown(brief)
-	for _, want := range []string{"2. `approved_task_plan` (source: `task_plan`)", "6. `planning_artifacts` (source: `planning_artifacts`)", "7. `project_memory` (source: `project_memory`)", "## Source: task_plan", "## Source: planning_artifacts", "## Source: project_memory", "Implement the approved plan.", "Original user idea."} {
+	for _, want := range []string{"2. `approved_task_plan` (source: `task_plan`)", "6. `planning_artifacts` (source: `planning_artifacts`)", "7. `project_memory` (source: `project_memory`)", "9. `external_forge_metadata` (source: `external_forge_metadata`)", "## Source: task_plan", "## Source: planning_artifacts", "## Source: project_memory", "Implement the approved plan.", "Original user idea."} {
 		if !strings.Contains(markdown, want) {
 			t.Fatalf("markdown missing %q:\n%s", want, markdown)
 		}
@@ -433,6 +433,170 @@ func TestAssemblerAppliesPerSourceBounds(t *testing.T) {
 			t.Fatalf("item %s len=%d exceeds source bound", item.Label, len(item.Text))
 		}
 	}
+}
+
+func TestExternalForgeMetadataProviderReadsLinkedIssueAndPR(t *testing.T) {
+	ctx := context.Background()
+	repo := initBriefRepo(t, ctx, map[string]string{"README.md": "# Example\n"})
+	runBriefGit(t, ctx, repo, "remote", "add", "origin", "git@github.com:agent-parley/parley.git")
+	req := briefRequest(repo, contract.StageTypeImplementation)
+	req.Task.Idea = "Implement issue #157 and PR #42"
+	req.Run.Idea = req.Task.Idea
+	client := &recordingForgeMetadataClient{}
+
+	brief, err := NewAssembler(Options{Now: fixedBriefNow, Providers: []SourceProvider{ExternalForgeMetadataProvider{Client: client}}}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	if len(client.refs) != 2 {
+		t.Fatalf("forge refs = %+v, want issue and PR", client.refs)
+	}
+	if client.refs[0].Kind != forgeKindIssue || client.refs[0].Number != 157 || client.refs[0].Owner != "agent-parley" || client.refs[0].Repo != "parley" {
+		t.Fatalf("issue ref = %+v", client.refs[0])
+	}
+	if client.refs[1].Kind != forgeKindPullRequest || client.refs[1].Number != 42 {
+		t.Fatalf("PR ref = %+v", client.refs[1])
+	}
+
+	source := sourceByLabel(brief, SourceExternalForgeMetadata)
+	if source.PrecedenceRank != 9 || source.Title != "External forge metadata" {
+		t.Fatalf("external forge source = %+v", source)
+	}
+	issue := itemByLabel(source, "external_forge_metadata:github:issue:agent-parley/parley#157")
+	if issue.Authority != SourceItemAuthorityInformational || !strings.Contains(issue.AuthorityNote, "lowest-precedence") || !strings.Contains(issue.Text, "# Issue #157: External metadata") || !strings.Contains(issue.Text, "First issue comment") {
+		t.Fatalf("issue metadata item = %+v", issue)
+	}
+	pr := itemByLabel(source, "external_forge_metadata:github:pull_request:agent-parley/parley#42")
+	if pr.Authority != SourceItemAuthorityInformational || !strings.Contains(pr.Text, "# Pull request #42: Linked PR") || !strings.Contains(pr.Text, "PR body") {
+		t.Fatalf("PR metadata item = %+v", pr)
+	}
+	markdown := Markdown(brief)
+	for _, want := range []string{"## Source: external_forge_metadata", "- Precedence rank: 9", "External forge metadata", "Pull request #42"} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("markdown missing %q:\n%s", want, markdown)
+		}
+	}
+}
+
+func TestExternalForgeMetadataProviderAppliesBounds(t *testing.T) {
+	ctx := context.Background()
+	repo := initBriefRepo(t, ctx, map[string]string{"README.md": "# Example\n"})
+	runBriefGit(t, ctx, repo, "remote", "add", "origin", "https://github.com/agent-parley/parley.git")
+	req := briefRequest(repo, contract.StageTypeImplementation)
+	req.Task.Idea = "Implement issue #157"
+	req.Run.Idea = req.Task.Idea
+	client := &recordingForgeMetadataClient{body: strings.Repeat("metadata body ", 80)}
+
+	brief, err := NewAssembler(Options{Now: fixedBriefNow, Bounds: Bounds{MaxSourceBytes: 180, MaxItemBytes: 120, MaxItemsPerSource: 4}, Providers: []SourceProvider{ExternalForgeMetadataProvider{Client: client}}}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	source := sourceByLabel(brief, SourceExternalForgeMetadata)
+	item := itemByLabel(source, "external_forge_metadata:github:issue:agent-parley/parley#157")
+	if !source.Truncated || !item.Truncated || len(item.Text) > 120 || !strings.Contains(item.Text, "truncated by Stage brief bounds") {
+		t.Fatalf("bounded metadata source=%+v item len=%d item=%+v", source, len(item.Text), item)
+	}
+}
+
+func TestExternalForgeMetadataPolicyDisabledDegradesGracefully(t *testing.T) {
+	ctx := context.Background()
+	req := briefRequest("", contract.StageTypeImplementation)
+	req.Task.Idea = "See https://github.com/agent-parley/parley/issues/157"
+	req.Run.Idea = req.Task.Idea
+	client := &recordingForgeMetadataClient{err: ForgeBrokerPolicyError{Message: "forge access disabled by policy"}}
+
+	brief, err := NewAssembler(Options{Now: fixedBriefNow, Providers: []SourceProvider{ExternalForgeMetadataProvider{Client: client}}}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	source := sourceByLabel(brief, SourceExternalForgeMetadata)
+	if !hasWarningContaining(source.Warnings, "forge broker policy error") || !hasWarningContaining(source.Warnings, "forge access disabled by policy") {
+		t.Fatalf("policy warnings = %#v", source.Warnings)
+	}
+	status := itemByLabel(source, "external_forge_metadata_unavailable")
+	if status.Authority != SourceItemAuthorityInformational || !strings.Contains(status.Text, "no issue or pull request metadata could be read") {
+		t.Fatalf("unavailable status item = %+v", status)
+	}
+	markdown := Markdown(brief)
+	if !strings.Contains(markdown, "Warning: forge broker policy error") || !strings.Contains(markdown, "external_forge_metadata_unavailable") {
+		t.Fatalf("markdown missing graceful policy warning:\n%s", markdown)
+	}
+}
+
+func TestForgeMetadataParsersDecodeBrokerJSON(t *testing.T) {
+	githubRaw := `{"number":157,"title":"External metadata","state":"OPEN","body":"Issue body","url":"https://github.com/agent-parley/parley/issues/157","author":{"login":"octocat"},"labels":[{"name":"agent:ready"}],"comments":[{"body":"Comment body","createdAt":"2026-06-28T12:00:00Z","author":{"login":"reviewer"}}]}`
+	githubMetadata, err := parseGitHubMetadata(githubRaw)
+	if err != nil {
+		t.Fatalf("parseGitHubMetadata() error = %v", err)
+	}
+	if githubMetadata.Number != 157 || githubMetadata.Title != "External metadata" || githubMetadata.Author != "octocat" || len(githubMetadata.Labels) != 1 || githubMetadata.Labels[0] != "agent:ready" || len(githubMetadata.Comments) != 1 || githubMetadata.Comments[0].Author != "reviewer" {
+		t.Fatalf("github metadata = %+v", githubMetadata)
+	}
+
+	giteaRaw := `{"index":42,"subject":"Linked PR","status":"open","description":"PR body","html_url":"https://gitea.example.test/team/repo/pulls/42","poster":{"username":"tea-user"},"labels":[{"name":"ready"},"triaged"]}`
+	giteaMetadata, err := parseGenericForgeMetadata(giteaRaw)
+	if err != nil {
+		t.Fatalf("parseGenericForgeMetadata() error = %v", err)
+	}
+	if giteaMetadata.Number != 42 || giteaMetadata.Title != "Linked PR" || giteaMetadata.Author != "tea-user" || giteaMetadata.URL == "" || strings.Join(giteaMetadata.Labels, ",") != "ready,triaged" {
+		t.Fatalf("gitea metadata = %+v", giteaMetadata)
+	}
+}
+
+func TestBrokerForgeMetadataClientHelpers(t *testing.T) {
+	if _, err := (BrokerForgeMetadataClient{}).Fetch(context.Background(), ForgeMetadataReference{Forge: "unknown"}, 128); err == nil || !strings.Contains(err.Error(), "unsupported forge") {
+		t.Fatalf("unsupported forge error = %v", err)
+	}
+	for _, msg := range []string{"broker rejected by policy", "forge access disabled", "disabled by broker"} {
+		if !looksLikeForgePolicyError(msg) {
+			t.Fatalf("looksLikeForgePolicyError(%q) = false", msg)
+		}
+	}
+	if looksLikeForgePolicyError("network timeout") {
+		t.Fatal("network timeout should not be classified as broker policy")
+	}
+
+	slowGH := filepath.Join(t.TempDir(), "gh")
+	if err := os.WriteFile(slowGH, []byte("#!/bin/sh\nexec sleep 1\n"), 0o700); err != nil {
+		t.Fatalf("write slow gh shim: %v", err)
+	}
+	started := time.Now()
+	_, err := (BrokerForgeMetadataClient{GH: slowGH, Timeout: 20 * time.Millisecond}).Fetch(context.Background(), ForgeMetadataReference{Forge: "github", Owner: "agent-parley", Repo: "parley", Kind: forgeKindIssue, Number: 157}, 128)
+	if err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Fatalf("slow broker error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("broker read timeout took %s", elapsed)
+	}
+}
+
+type recordingForgeMetadataClient struct {
+	refs []ForgeMetadataReference
+	body string
+	err  error
+}
+
+func (c *recordingForgeMetadataClient) Fetch(_ context.Context, ref ForgeMetadataReference, maxBytes int) (ForgeMetadata, error) {
+	c.refs = append(c.refs, ref)
+	if maxBytes <= 0 {
+		return ForgeMetadata{}, os.ErrInvalid
+	}
+	if c.err != nil {
+		return ForgeMetadata{}, c.err
+	}
+	body := c.body
+	if body == "" {
+		body = "Brokered metadata body."
+	}
+	metadata := ForgeMetadata{Number: ref.Number, State: "OPEN", Author: "octocat", URL: forgeReferenceURL(ref), Body: body, Labels: []string{"agent:ready"}}
+	if ref.Kind == forgeKindPullRequest {
+		metadata.Title = "Linked PR"
+		metadata.Body = "PR body"
+		return metadata, nil
+	}
+	metadata.Title = "External metadata"
+	metadata.Comments = []ForgeMetadataComment{{Author: "reviewer", CreatedAt: "2026-06-28T12:00:00Z", Body: "First issue comment"}}
+	return metadata, nil
 }
 
 func TestAssemblerCanRegisterFutureSourceWithoutChangingCore(t *testing.T) {
