@@ -15,6 +15,7 @@
       <h1>System Settings</h1>
       <p class="muted">System settings apply globally across projects.</p>
     </header>
+    {{template "agent_profiles.html" .AgentProfiles}}
     {{template "external_notification_sinks.html" .Sinks}}
     {{template "forge_credentials.html" .ForgeCredentials}}
   </main>

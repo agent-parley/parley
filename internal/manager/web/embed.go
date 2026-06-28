@@ -55,6 +55,7 @@ type ProjectSettingsData struct {
 	Project       store.Project
 	Rules         ProjectSettingsSectionData
 	Preferences   ProjectSettingsSectionData
+	AgentProfiles AgentProfileEditorData
 	Memory        ProjectMemoryExportData
 	Notifications NotificationSettingsData
 	Center        NotificationCenterData
@@ -65,6 +66,7 @@ type ProjectSettingsData struct {
 type SystemSettingsData struct {
 	Sinks            ExternalNotificationSinksData
 	ForgeCredentials ForgeCredentialsData
+	AgentProfiles    AgentProfileEditorData
 	Center           NotificationCenterData
 	CSRF             string
 	Title            string
@@ -98,6 +100,36 @@ type ForgeCredentialData struct {
 	SecretConfigured bool
 	DeletePath       string
 	UpdatedAt        string
+}
+
+type AgentProfileEditorData struct {
+	Scope            string
+	Title            string
+	Help             string
+	Profiles         []AgentProfileFormData
+	Create           AgentProfileFormData
+	SavePath         string
+	DefaultProfileID string
+	Notice           string
+	Status           string
+	CSRF             string
+}
+
+type AgentProfileFormData struct {
+	ID                  string
+	FamilyID            string
+	Name                string
+	Description         string
+	Role                string
+	Headless            bool
+	Prompt              string
+	DefaultInstructions string
+	Model               string
+	ContextPolicy       string
+	OutputStyle         string
+	SuggestedStageTypes string
+	Layer               string
+	IsDefault           bool
 }
 
 type NotificationSinkData struct {

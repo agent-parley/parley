@@ -1,0 +1,115 @@
+<section id="agent-profiles-{{.Scope}}" class="card settings-section agent-profile-editor">
+  <div class="settings-section-head">
+    <div>
+      <h2>{{.Title}}</h2>
+      <p class="muted">{{.Help}}</p>
+    </div>
+  </div>
+  {{if .Notice}}
+  <p class="settings-inline-notice warning" role="alert">{{.Notice}}</p>
+  {{end}}
+  {{if .Status}}
+  <p class="settings-status muted" role="status" aria-live="polite">{{.Status}}</p>
+  {{end}}
+  <div class="agent-profile-list">
+    {{range .Profiles}}
+    <form class="agent-profile-card" method="post" action="{{$.SavePath}}" data-on:submit="@post('{{$.SavePath}}', {contentType: 'form'})">
+      <input type="hidden" name="_csrf" value="{{$.CSRF}}" data-bind:csrf>
+      <div class="template-card-head">
+        <div>
+          <h3>{{.Name}} <span class="safety-tag small">{{.Layer}}</span></h3>
+          <p class="muted"><code>{{.ID}}</code>{{if .IsDefault}} · default profile{{end}}</p>
+        </div>
+        <button type="submit">Save profile</button>
+      </div>
+      <div class="agent-profile-grid">
+        <label>Profile ID
+          <input name="profile_id" value="{{.ID}}" readonly>
+        </label>
+        <label>Family
+          <select name="family_id">
+            <option value="pi" {{if eq .FamilyID "pi"}}selected{{end}}>Pi</option>
+          </select>
+        </label>
+        <label>Name
+          <input name="name" required value="{{.Name}}">
+        </label>
+        <label>Role
+          <input name="role" required value="{{.Role}}" placeholder="implementation, review, validation-support">
+        </label>
+        <label>Model
+          <input name="model" value="{{.Model}}" placeholder="Optional model hint">
+        </label>
+        <label>Context policy
+          <input name="context_policy" required value="{{.ContextPolicy}}">
+        </label>
+        <label>Output style
+          <input name="output_style" required value="{{.OutputStyle}}">
+        </label>
+      </div>
+      <label>Description
+        <textarea name="description" rows="2">{{.Description}}</textarea>
+      </label>
+      <label>Role / persona prompt
+        <textarea name="prompt" rows="3">{{.Prompt}}</textarea>
+      </label>
+      <label>Default instructions
+        <textarea name="default_instructions" rows="3">{{.DefaultInstructions}}</textarea>
+      </label>
+      <label>Suggested stage tags
+        <input name="suggested_stage_types" value="{{.SuggestedStageTypes}}" placeholder="implementation, review">
+      </label>
+      <div class="settings-actions single-action">
+        <label class="checkbox-line"><input type="checkbox" name="headless" value="1" {{if .Headless}}checked{{end}}> Headless profile</label>
+        <label class="checkbox-line"><input type="checkbox" name="default_profile" value="1" {{if .IsDefault}}checked{{end}}> Use as default profile</label>
+      </div>
+    </form>
+    {{end}}
+  </div>
+  <form class="agent-profile-card create-profile-card" method="post" action="{{.SavePath}}" data-on:submit="@post('{{.SavePath}}', {contentType: 'form'})">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}" data-bind:csrf>
+    <h3>Create profile</h3>
+    <div class="agent-profile-grid">
+      <label>Profile ID
+        <input name="profile_id" required value="{{.Create.ID}}" placeholder="project_validator">
+      </label>
+      <label>Family
+        <select name="family_id">
+          <option value="pi" selected>Pi</option>
+        </select>
+      </label>
+      <label>Name
+        <input name="name" required value="{{.Create.Name}}" placeholder="Project validator">
+      </label>
+      <label>Role
+        <input name="role" required value="{{.Create.Role}}" placeholder="validation-support">
+      </label>
+      <label>Model
+        <input name="model" value="{{.Create.Model}}" placeholder="Optional model hint">
+      </label>
+      <label>Context policy
+        <input name="context_policy" required value="{{.Create.ContextPolicy}}">
+      </label>
+      <label>Output style
+        <input name="output_style" required value="{{.Create.OutputStyle}}">
+      </label>
+    </div>
+    <label>Description
+      <textarea name="description" rows="2">{{.Create.Description}}</textarea>
+    </label>
+    <label>Role / persona prompt
+      <textarea name="prompt" rows="3">{{.Create.Prompt}}</textarea>
+    </label>
+    <label>Default instructions
+      <textarea name="default_instructions" rows="3">{{.Create.DefaultInstructions}}</textarea>
+    </label>
+    <label>Suggested stage tags
+      <input name="suggested_stage_types" value="{{.Create.SuggestedStageTypes}}" placeholder="implementation, validation">
+    </label>
+    <div class="settings-actions single-action">
+      <label class="checkbox-line"><input type="checkbox" name="headless" value="1" {{if .Create.Headless}}checked{{end}}> Headless profile</label>
+      <label class="checkbox-line"><input type="checkbox" name="default_profile" value="1"> Use as default profile</label>
+    </div>
+    <button type="submit">Create profile</button>
+  </form>
+</section>
