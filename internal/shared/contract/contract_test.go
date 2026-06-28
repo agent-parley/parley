@@ -33,6 +33,37 @@ func TestValidateRefinementLevelAllowsOnlyDirectAndStandardVocabulary(t *testing
 	}
 }
 
+func TestReviewTargetOptionsAreClosedV1Set(t *testing.T) {
+	options := ReviewTargetOptions()
+	want := map[string]string{
+		ReviewTargetPlan:               "Plan",
+		ReviewTargetCodeChanges:        "Code changes",
+		ReviewTargetValidationEvidence: "Validation evidence",
+		ReviewTargetDeliveryResult:     "Delivery result",
+	}
+	if len(options) != len(want) {
+		t.Fatalf("target count = %d, want %d", len(options), len(want))
+	}
+	for _, option := range options {
+		if want[option.ID] != option.Label {
+			t.Fatalf("target option = %+v", option)
+		}
+		if !ValidReviewTarget(option.ID) {
+			t.Fatalf("target %q is not valid", option.ID)
+		}
+		if got := ReviewTargetLabel(option.ID); got != option.Label {
+			t.Fatalf("ReviewTargetLabel(%q) = %q, want %q", option.ID, got, option.Label)
+		}
+		delete(want, option.ID)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing target options: %#v", want)
+	}
+	if ValidReviewTarget("final_review") {
+		t.Fatal("unknown review target accepted")
+	}
+}
+
 func TestReviewProfileDefaultsAreClosedV1Set(t *testing.T) {
 	profiles := ReviewProfileDefaults()
 	if len(profiles) != 4 {

@@ -927,7 +927,7 @@ func (e *Engine) executeRunWithOptions(ctx context.Context, runID string, opts e
 		if !ok {
 			return fmt.Errorf("workflow stage %q not found in frozen snapshot", currentID)
 		}
-		rep, err := e.runWorkflowStage(ctx, wr, runtime, runtimeStage, lastReport, lastValidationReport, snapshot, snapshotErr)
+		rep, err := e.runWorkflowStage(ctx, wr, runtime, runtimeStage, lastReport, lastValidationReport, lastDeliveryReport, snapshot, snapshotErr)
 		if err != nil {
 			return err
 		}
@@ -995,7 +995,7 @@ func (e *Engine) loadRuntimeWorkflow(ctx context.Context, wr store.WorkflowRun) 
 	return newRuntimeWorkflow(template, stages)
 }
 
-func (e *Engine) runWorkflowStage(ctx context.Context, wr store.WorkflowRun, runtime runtimeWorkflow, runtimeStage runtimeStage, lastReport, lastValidationReport report.Report, snapshot workerSnapshot, snapshotErr error) (report.Report, error) {
+func (e *Engine) runWorkflowStage(ctx context.Context, wr store.WorkflowRun, runtime runtimeWorkflow, runtimeStage runtimeStage, lastReport, lastValidationReport, lastDeliveryReport report.Report, snapshot workerSnapshot, snapshotErr error) (report.Report, error) {
 	stage := runtimeStage.Stage
 	templateStage := runtimeStage.Template
 	switch templateStage.Type {
@@ -1007,12 +1007,12 @@ func (e *Engine) runWorkflowStage(ctx context.Context, wr store.WorkflowRun, run
 		return e.dispatchStage(ctx, wr, stage, stage.Adapter, templateStage.Type, e.stageDispatchInput(runtime, templateStage, map[string]any{"idea": wr.Run.Idea}))
 	case workflow.StageTypeReview:
 		if templateStage.Actor == workflow.ActorHuman {
-			return e.runHumanStage(ctx, wr, stage, templateStage, snapshot, snapshotErr)
+			return e.runHumanStage(ctx, wr, stage, templateStage, lastReport, lastValidationReport, lastDeliveryReport, snapshot, snapshotErr)
 		}
-		return e.runReviewStage(ctx, wr, runtime, runtimeStage, lastReport, lastValidationReport, snapshot, snapshotErr)
+		return e.runReviewStage(ctx, wr, runtime, runtimeStage, lastReport, lastValidationReport, lastDeliveryReport, snapshot, snapshotErr)
 	case workflow.StageTypeMemoryUpdate:
 		if templateStage.Actor == workflow.ActorHuman {
-			return e.runHumanStage(ctx, wr, stage, templateStage, snapshot, snapshotErr)
+			return e.runHumanStage(ctx, wr, stage, templateStage, lastReport, lastValidationReport, lastDeliveryReport, snapshot, snapshotErr)
 		}
 		return e.runMemoryUpdateStage(ctx, wr, runtime, runtimeStage, lastReport)
 	case workflow.StageTypeCommit:
@@ -1402,7 +1402,7 @@ func (e *Engine) runPRReadyStage(ctx context.Context, wr store.WorkflowRun, stag
 	return rep, nil
 }
 
-func (e *Engine) runHumanStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, templateStage workflow.StageTemplate, snapshot workerSnapshot, snapshotErr error) (report.Report, error) {
+func (e *Engine) runHumanStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, templateStage workflow.StageTemplate, lastReport, lastValidationReport, lastDeliveryReport report.Report, snapshot workerSnapshot, snapshotErr error) (report.Report, error) {
 	_, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
 	if err != nil {
 		return report.Report{}, err
@@ -1411,7 +1411,7 @@ func (e *Engine) runHumanStage(ctx context.Context, wr store.WorkflowRun, stage 
 	if err := e.startStage(ctx, wr, stage, stage.StageType+" human stage started"); err != nil {
 		return report.Report{}, err
 	}
-	if err := e.suspendForHumanReview(context.Background(), wr, stage, templateStage, briefArtifact, snapshot, snapshotErr); err != nil {
+	if err := e.suspendForHumanReview(context.Background(), wr, stage, templateStage, briefArtifact, lastReport, lastValidationReport, lastDeliveryReport, snapshot, snapshotErr); err != nil {
 		return report.Report{}, err
 	}
 	return report.Report{}, errRunAwaitingHuman
@@ -2126,7 +2126,7 @@ func reportActor(actor report.Actor, stage store.Stage) event.Actor {
 }
 
 func reportCarriesDeliveryPayload(rep report.Report) bool {
-	return payloadString(rep.Payload, "branch") != "" || payloadString(rep.Payload, "commit_sha") != "" || payloadString(rep.Payload, "diff_artifact_id") != ""
+	return reportIsDeliveryResult(rep) || payloadString(rep.Payload, "branch") != "" || payloadString(rep.Payload, "commit_sha") != "" || payloadString(rep.Payload, "diff_artifact_id") != ""
 }
 
 func withDeliveryPayload(rep report.Report, delivery report.Report) report.Report {

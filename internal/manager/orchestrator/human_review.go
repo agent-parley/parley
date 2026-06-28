@@ -210,7 +210,7 @@ func routingOutcome(stage workflow.StageTemplate, rep report.Report) string {
 	return rep.Status
 }
 
-func (e *Engine) suspendForHumanReview(ctx context.Context, wr store.WorkflowRun, stage store.Stage, templateStage workflow.StageTemplate, briefArtifact store.Artifact, snapshot workerSnapshot, snapshotErr error) error {
+func (e *Engine) suspendForHumanReview(ctx context.Context, wr store.WorkflowRun, stage store.Stage, templateStage workflow.StageTemplate, briefArtifact store.Artifact, lastReport, lastValidationReport, lastDeliveryReport report.Report, snapshot workerSnapshot, snapshotErr error) error {
 	packet := map[string]any{
 		"schema_version":           report.SchemaVersion,
 		"run_id":                   wr.Run.ID,
@@ -228,6 +228,9 @@ func (e *Engine) suspendForHumanReview(ctx context.Context, wr store.WorkflowRun
 		"timeout":                  nil,
 		"human_fix_loops_counted":  false,
 		"submission_endpoint_hint": fmt.Sprintf("/runs/%s/human-stages/%s/verdict", wr.Run.ID, stage.ID),
+	}
+	if templateStage.Type == workflow.StageTypeReview {
+		packet["review_target_packet"] = reviewTargetPacket(templateStage, lastReport, lastValidationReport, lastDeliveryReport, snapshot, snapshotErr)
 	}
 	if snapshotPayload := workerSnapshotPayload(snapshot, snapshotErr); len(snapshotPayload) > 0 {
 		packet["implementation_snapshot"] = snapshotPayload

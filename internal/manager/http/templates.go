@@ -170,6 +170,7 @@ func (s *Server) workflowTemplateEditData(r *http.Request, template workflow.Tem
 		Template:      workflow.NormalizeTemplate(template),
 		Settings:      workflowTemplateSettingsData(template.Settings),
 		StageRows:     workflowTemplateStageRows(template),
+		ReviewTargets: contract.ReviewTargetOptions(),
 		SavePath:      "/templates/" + url.PathEscape(template.ID) + "/save",
 		Notifications: notifications,
 		Notice:        notice,

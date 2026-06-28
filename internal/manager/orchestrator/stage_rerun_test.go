@@ -135,7 +135,7 @@ func TestReRunStageStartsAtValidationTargetWhenPrerequisitesExist(t *testing.T) 
 		t.Fatalf("load runtime: %v", err)
 	}
 	implStage := runtime.ByID["implementation"]
-	if _, err := engine.runWorkflowStage(ctx, wr, runtime, implStage, report.Report{}, report.Report{}, workerSnapshot{}, nil); err != nil {
+	if _, err := engine.runWorkflowStage(ctx, wr, runtime, implStage, report.Report{}, report.Report{}, report.Report{}, workerSnapshot{}, nil); err != nil {
 		t.Fatalf("run implementation prerequisite: %v", err)
 	}
 	if err := st.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusFailed); err != nil {

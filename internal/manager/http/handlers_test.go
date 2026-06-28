@@ -295,6 +295,7 @@ func TestWorkflowTemplateAuthoringCopyEditSaveReloadAndRejectsMalformed(t *testi
 	saveForm.Set("order_change_review_agent", "6")
 	saveForm.Set("order_commit_feature_branch", "7")
 	saveForm.Set("order_pr_creation", "8")
+	saveForm.Set("target_change_review_agent", workflow.TargetValidationEvidence)
 	saveForm.Set("instructions_implementation", "Prefer the smallest safe change.")
 	saveForm.Set("fix_loop", "1")
 	saveForm.Set("max_fix_loops", "2")
@@ -313,6 +314,10 @@ func TestWorkflowTemplateAuthoringCopyEditSaveReloadAndRejectsMalformed(t *testi
 	if workflowTemplateStageIndex(saved, "memory_update") < 0 {
 		t.Fatalf("saved template missing enabled memory_update stage: %+v", saved.Stages)
 	}
+	changeReview := saved.Stages[workflowTemplateStageIndex(saved, "change_review_agent")]
+	if changeReview.Target != workflow.TargetValidationEvidence {
+		t.Fatalf("saved review target = %q, want %q", changeReview.Target, workflow.TargetValidationEvidence)
+	}
 	assertWorkflowStageOrder(t, saved, "implementation", "memory_update", "validation")
 	implementation := saved.Stages[workflowTemplateStageIndex(saved, "implementation")]
 	if implementation.Settings["instructions"] != "Prefer the smallest safe change." {
@@ -328,6 +333,8 @@ func TestWorkflowTemplateAuthoringCopyEditSaveReloadAndRejectsMalformed(t *testi
 	editBody := getSettingsBody(t, srv, "/templates/"+templateID+"/edit")
 	assertContains(t, editBody, "Team Balanced Edited")
 	assertContains(t, editBody, "Memory update")
+	assertContains(t, editBody, "Validation evidence")
+	assertContains(t, editBody, "Delivery result")
 
 	badForm := workflowTemplateSaveForm(saved, csrf)
 	badForm.Set("stage_type_implementation", workflow.StageTypeIdeaRefinement)

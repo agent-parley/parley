@@ -404,7 +404,7 @@ func TestReviewArbiterMissingVerdictIsRepaired(t *testing.T) {
 		t.Fatalf("load runtime workflow: %v", err)
 	}
 	reviewStage := runtime.ByID["change_review_agent"]
-	rep, err := engine.runWorkflowStage(ctx, wr, runtime, reviewStage, report.Report{}, report.Report{}, workerSnapshot{}, nil)
+	rep, err := engine.runWorkflowStage(ctx, wr, runtime, reviewStage, report.Report{}, report.Report{}, report.Report{}, workerSnapshot{}, nil)
 	if err != nil {
 		t.Fatalf("run review stage: %v", err)
 	}
@@ -579,7 +579,7 @@ func TestAgentStageDispatchReceivesTemplateActorTargetSettings(t *testing.T) {
 		t.Fatalf("load runtime workflow: %v", err)
 	}
 	review := runtime.ByID["change_review_agent"]
-	if _, err := engine.runWorkflowStage(ctx, wr, runtime, review, report.Report{}, report.Report{}, workerSnapshot{}, nil); err != nil {
+	if _, err := engine.runWorkflowStage(ctx, wr, runtime, review, report.Report{}, report.Report{}, report.Report{}, workerSnapshot{}, nil); err != nil {
 		t.Fatalf("run review stage: %v", err)
 	}
 	if len(runner.disps) != 2 {
@@ -643,7 +643,7 @@ func TestMemoryUpdateStageAppliesCuratedCandidatesWithoutDispatchingWorkflowAgen
 		t.Fatalf("complete source stage: %v", err)
 	}
 	memoryStage := runtime.ByID["memory_update"]
-	rep, err := engine.runWorkflowStage(ctx, wr, runtime, memoryStage, sourceReport, report.Report{}, workerSnapshot{}, nil)
+	rep, err := engine.runWorkflowStage(ctx, wr, runtime, memoryStage, sourceReport, report.Report{}, report.Report{}, workerSnapshot{}, nil)
 	if err != nil {
 		t.Fatalf("run memory update stage: %v", err)
 	}
@@ -775,7 +775,7 @@ func TestReviewChangesRequestedCreatesFixLoopAttempt(t *testing.T) {
 		t.Fatalf("load runtime workflow: %v", err)
 	}
 	reviewStage := runtime.ByID["change_review_agent"]
-	rep, err := engine.runWorkflowStage(ctx, wr, runtime, reviewStage, report.Report{}, report.Report{}, workerSnapshot{}, nil)
+	rep, err := engine.runWorkflowStage(ctx, wr, runtime, reviewStage, report.Report{}, report.Report{}, report.Report{}, workerSnapshot{}, nil)
 	if err != nil {
 		t.Fatalf("run review stage: %v", err)
 	}
@@ -907,7 +907,7 @@ func TestReviewFixLoopExhaustionBlocksThroughNeedsInput(t *testing.T) {
 	}
 	runtime.Template.Settings["max_fix_loops"] = 0
 	reviewStage := runtime.ByID["change_review_agent"]
-	rep, err := engine.runWorkflowStage(ctx, wr, runtime, reviewStage, report.Report{}, report.Report{}, workerSnapshot{}, nil)
+	rep, err := engine.runWorkflowStage(ctx, wr, runtime, reviewStage, report.Report{}, report.Report{}, report.Report{}, workerSnapshot{}, nil)
 	if err != nil {
 		t.Fatalf("run review stage: %v", err)
 	}

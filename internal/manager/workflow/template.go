@@ -38,8 +38,10 @@ const (
 )
 
 const (
-	TargetPlan        = "plan"
-	TargetCodeChanges = "code_changes"
+	TargetPlan               = contract.ReviewTargetPlan
+	TargetCodeChanges        = contract.ReviewTargetCodeChanges
+	TargetValidationEvidence = contract.ReviewTargetValidationEvidence
+	TargetDeliveryResult     = contract.ReviewTargetDeliveryResult
 )
 
 const (
@@ -130,6 +132,7 @@ func NormalizeTemplate(template Template) Template {
 		stage.Actor = strings.TrimSpace(stage.Actor)
 		stage.Target = strings.TrimSpace(stage.Target)
 		if stage.Type == StageTypeReview {
+			stage.Target = contract.NormalizeReviewTarget(stage.Target)
 			stage.Settings = normalizeReviewSettings(stage.Settings)
 		}
 	}
@@ -169,7 +172,7 @@ func ValidateTemplate(template Template) error {
 	stageIDs := map[string]bool{}
 	stageIDOrder := make([]string, 0, len(template.Stages))
 	var startIDs, endIDs []string
-	for _, stage := range template.Stages {
+	for i, stage := range template.Stages {
 		if stage.ID == "" {
 			errs = append(errs, errors.New("stage id is required"))
 			continue
@@ -193,6 +196,9 @@ func ValidateTemplate(template Template) error {
 		}
 		if stage.Type == StageTypeReview {
 			if err := validateReviewStageSettings(stage); err != nil {
+				errs = append(errs, err)
+			}
+			if err := validateReviewTargetPlacement(stage, i, template.Stages); err != nil {
 				errs = append(errs, err)
 			}
 		}
@@ -335,6 +341,9 @@ func normalizeReviewSettings(settings map[string]any) map[string]any {
 }
 
 func validateReviewStageSettings(stage StageTemplate) error {
+	if !contract.ValidReviewTarget(stage.Target) {
+		return fmt.Errorf("stage %q review target must be one of %q, %q, %q, or %q", stage.ID, TargetPlan, TargetCodeChanges, TargetValidationEvidence, TargetDeliveryResult)
+	}
 	config := contract.ReviewerConfig{
 		Profile:      settingString(stage.Settings, "profile"),
 		Intensity:    settingString(stage.Settings, "intensity"),
@@ -347,6 +356,33 @@ func validateReviewStageSettings(stage StageTemplate) error {
 		return fmt.Errorf("stage %q review profile %q is not supported in v1", stage.ID, "custom")
 	}
 	return nil
+}
+
+func validateReviewTargetPlacement(stage StageTemplate, index int, stages []StageTemplate) error {
+	switch stage.Target {
+	case TargetValidationEvidence:
+		if !hasPriorStageType(stages, index, StageTypeValidation) {
+			return fmt.Errorf("stage %q review target %q requires a prior %s stage", stage.ID, stage.Target, StageTypeValidation)
+		}
+	case TargetDeliveryResult:
+		if !hasPriorStageType(stages, index, StageTypeCommit, StageTypePRCreation) {
+			return fmt.Errorf("stage %q review target %q requires a prior %s or %s stage", stage.ID, stage.Target, StageTypeCommit, StageTypePRCreation)
+		}
+	}
+	return nil
+}
+
+func hasPriorStageType(stages []StageTemplate, index int, stageTypes ...string) bool {
+	allowed := map[string]bool{}
+	for _, stageType := range stageTypes {
+		allowed[stageType] = true
+	}
+	for i := 0; i < index && i < len(stages); i++ {
+		if allowed[stages[i].Type] {
+			return true
+		}
+	}
+	return false
 }
 
 func settingString(settings map[string]any, key string) string {

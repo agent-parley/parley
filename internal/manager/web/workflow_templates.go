@@ -1,6 +1,9 @@
 package web
 
-import "github.com/agent-parley/parley/internal/manager/workflow"
+import (
+	"github.com/agent-parley/parley/internal/manager/workflow"
+	"github.com/agent-parley/parley/internal/shared/contract"
+)
 
 type WorkflowTemplatesData struct {
 	Templates     []WorkflowTemplateSummaryData
@@ -26,6 +29,7 @@ type WorkflowTemplateEditData struct {
 	Template      workflow.Template
 	Settings      WorkflowTemplateSettingsData
 	StageRows     []WorkflowTemplateStageRowData
+	ReviewTargets []contract.ReviewTargetOption
 	SavePath      string
 	Notifications NotificationCenterData
 	Notice        *Notice
