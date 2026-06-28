@@ -9,11 +9,20 @@ import (
 
 	"github.com/agent-parley/parley/internal/manager"
 	"github.com/agent-parley/parley/internal/manager/settings"
+	runnerbootstrap "github.com/agent-parley/parley/internal/runner/bootstrap"
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if os.Getenv("PARLEY_RUNNER_CHILD") == "1" {
+		if err := runnerbootstrap.Run(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	loadedSettings, err := settings.Load(settings.LoadOptions{
 		GlobalPath:  getenv("PARLEY_GLOBAL_CONFIG", settings.DefaultGlobalConfigPath()),

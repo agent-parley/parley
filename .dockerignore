@@ -1,0 +1,9 @@
+.git
+.gitignore
+.github
+.pi
+.parley-data
+bin
+cover.out
+*.test
+*.log

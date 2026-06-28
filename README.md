@@ -106,6 +106,24 @@ make run
 
 `make run` builds first, starts the web UI at `http://127.0.0.1:8080` by default, and stores local state in `.parley-data`. Override with environment variables such as `PARLEY_ADDR`, `PARLEY_DATA_DIR`, and `PARLEY_RUNNER_BIN`.
 
+Build and run the manager app-container image:
+
+```sh
+podman build -f build/manager/Dockerfile -t localhost/parley-manager:dev .
+```
+
+```sh
+podman run --rm \
+  --publish 127.0.0.1:8080:8080 \
+  --userns keep-id \
+  --user "$(id -u):$(id -g)" \
+  --volume /absolute/path/to/parley-data:/data:rw \
+  --volume /absolute/path/to/repository:/workspace/repo:rw \
+  localhost/parley-manager:dev
+```
+
+See [container deployment](docs/deployment.md) for mounted-root requirements, optional reference material, and runtime notes.
+
 The default implementation adapter is `noop`, which makes no file changes — useful as a smoke test, but a run using it stops at the commit stage with *no changes to commit*. To exercise the full commit → PR-ready loop, run the real Pi adapter by providing the Pi worker image/auth configuration and opting in explicitly, for example:
 
 ```sh

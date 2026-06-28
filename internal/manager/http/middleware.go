@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"net"
 	"net/http"
+	"net/url"
 	"sync"
 )
 
@@ -100,12 +101,11 @@ func (s *security) allowedOrigin(r *http.Request) bool {
 	if origin == "" {
 		return true
 	}
-	for _, host := range s.allowedHosts() {
-		if origin == "http://"+host {
-			return true
-		}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme != "http" {
+		return false
 	}
-	return false
+	return s.allowedHost(parsed.Host)
 }
 
 func (s *security) allowedHosts() []string {
@@ -113,10 +113,18 @@ func (s *security) allowedHosts() []string {
 	if err != nil {
 		return []string{s.addr}
 	}
-	if host != "127.0.0.1" && host != "localhost" {
-		return []string{s.addr}
+	if host == "127.0.0.1" || host == "localhost" {
+		return []string{net.JoinHostPort("127.0.0.1", port), net.JoinHostPort("localhost", port)}
 	}
-	return []string{net.JoinHostPort("127.0.0.1", port), net.JoinHostPort("localhost", port)}
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+		return []string{
+			s.addr,
+			net.JoinHostPort("127.0.0.1", port),
+			net.JoinHostPort("localhost", port),
+			net.JoinHostPort("::1", port),
+		}
+	}
+	return []string{s.addr}
 }
 
 func randomToken() string {
