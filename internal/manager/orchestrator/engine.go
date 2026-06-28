@@ -1043,6 +1043,7 @@ func (e *Engine) stageDispatchInput(runtime runtimeWorkflow, stage workflow.Stag
 	out["workflow_stage_actor"] = stage.Actor
 	out["workflow_stage_target"] = stage.Target
 	out["workflow_stage_settings"] = stage.Settings
+	addMemoryCaptureInput(out, runtime.Template, stage)
 	return out
 }
 

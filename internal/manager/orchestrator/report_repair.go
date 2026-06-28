@@ -59,7 +59,11 @@ func (e *Engine) dispatchWithReportRepair(ctx context.Context, wr store.Workflow
 		}
 		return dispatchFailedReport(wr, stage, opts.AdapterName, err), nil
 	}
-	return e.validateOrRepairReport(ctx, wr, stage, disp, rep, opts)
+	validated, err := e.validateOrRepairReport(ctx, wr, stage, disp, rep, opts)
+	if err != nil {
+		return report.Report{}, err
+	}
+	return enforceMemoryCapturePayloadPolicy(validated, memoryCaptureInputEnabled(disp.Input)), nil
 }
 
 func (e *Engine) validateOrRepairReport(ctx context.Context, wr store.WorkflowRun, stage store.Stage, disp contract.Dispatch, candidate report.Report, opts reportRepairOptions) (report.Report, error) {
@@ -262,6 +266,14 @@ func expectedReportSchema(disp contract.Dispatch) map[string]any {
 			"confidence":                "required for arbiter dispatches",
 			"critic_report_artifact_id": "required for arbiter dispatches after normalization",
 		}
+	}
+	if memoryCaptureInputEnabled(disp.Input) {
+		payload, _ := schema["payload"].(map[string]any)
+		if payload == nil {
+			payload = map[string]any{}
+		}
+		payload[memoryCapturePayloadKey] = []map[string]string{{"kind": store.ProjectMemoryKindLesson, "title": "concise reusable learning", "body": "durable lesson from this stage", "source_summary": "why this stage report supports the candidate"}}
+		schema["payload"] = payload
 	}
 	if disp.Input != nil && disp.Input["input_mode"] == contract.AdapterInputModePlanning {
 		schema["status"] = []string{report.StatusCompleted, report.StatusFailed, report.StatusInvalid}
