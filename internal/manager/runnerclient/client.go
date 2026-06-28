@@ -74,7 +74,11 @@ func ResolveRunnerBinary() (string, error) {
 		return "", fmt.Errorf("resolve executable: %w", err)
 	}
 	name := "parley-runner"
-	return filepath.Join(filepath.Dir(exe), name), nil
+	sibling := filepath.Join(filepath.Dir(exe), name)
+	if _, err := os.Stat(sibling); err == nil {
+		return sibling, nil
+	}
+	return exe, nil
 }
 
 func StartChild(ctx context.Context, runnerBin string) (*Client, error) {
@@ -95,6 +99,9 @@ func StartChildWithEnvAndID(ctx context.Context, runnerBin string, env []string,
 		if err != nil {
 			return nil, err
 		}
+	}
+	if isCurrentExecutable(runnerBin) {
+		env = append(env, "PARLEY_RUNNER_CHILD=1")
 	}
 	cmd := exec.Command(runnerBin)
 	if len(env) > 0 {
@@ -193,6 +200,33 @@ func Dial(ctx context.Context, url, runnerID string) (*Client, error) {
 	go c.watchSession()
 	go c.heartbeat()
 	return c, nil
+}
+
+func isCurrentExecutable(candidate string) bool {
+	if candidate == "" {
+		return false
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	exeAbs, err := filepath.Abs(exe)
+	if err != nil {
+		return false
+	}
+	candidateAbs, err := filepath.Abs(candidate)
+	if err != nil {
+		return false
+	}
+	exeInfo, err := os.Stat(exeAbs)
+	if err != nil {
+		return false
+	}
+	candidateInfo, err := os.Stat(candidateAbs)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(exeInfo, candidateInfo)
 }
 
 func mergeEnv(base, overrides []string) []string {
