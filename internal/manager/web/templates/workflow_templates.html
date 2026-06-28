@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <script type="module" src="/assets/datastar.min.js"></script>
+  <style>{{template "styles" .}}</style>
+</head>
+<body data-signals:csrf="'{{.CSRF}}'" data-on:load="@get('/notifications/events', {openWhenHidden: true})">
+  {{template "notifications_center.html" .Notifications}}
+  <main>
+    <header class="settings-header">
+      <p class="breadcrumb"><a href="/projects">Projects</a> · <a href="/projects/default">Default project</a> · <a href="/settings">System Settings</a></p>
+      <h1>Workflow templates</h1>
+      <p class="muted">Copy predefined templates into editable project templates, then tune stage settings, optional stages, and linear stage order. Edges are derived by Parley on save.</p>
+    </header>
+    {{with .Notice}}
+    <section class="notice" role="status" aria-live="polite">
+      <strong>{{.Title}}</strong>
+      <p>{{.Message}}</p>
+    </section>
+    {{end}}
+    <section class="card">
+      <div class="section-heading">
+        <div>
+          <h2>Available templates</h2>
+          <p class="muted">Predefined templates are read-only; copy one before editing.</p>
+        </div>
+      </div>
+      {{if .Templates}}
+      <ul class="template-list">
+        {{range .Templates}}
+        <li class="template-card">
+          <div class="template-card-head">
+            <div>
+              <h3>{{.Name}} {{if .Recommended}}<span class="pill status-completed">recommended</span>{{end}}</h3>
+              <p class="muted"><code>{{.ID}}</code> · {{.StageCount}} stages · {{if .Predefined}}predefined{{else}}project{{end}}</p>
+            </div>
+            {{if .Editable}}<a class="button-link" href="{{.EditPath}}">Edit</a>{{end}}
+          </div>
+          {{if .Description}}<p>{{.Description}}</p>{{end}}
+          <form class="copy-template-form" method="post" action="{{.CopyPath}}">
+            <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+            <label for="copy-name-{{.ID}}">Copy name</label>
+            <div class="inline-grid">
+              <input id="copy-name-{{.ID}}" name="name" value="{{.Name}} copy">
+              <button type="submit" class="secondary">Copy</button>
+            </div>
+          </form>
+        </li>
+        {{end}}
+      </ul>
+      {{else}}
+      <p>No workflow templates found.</p>
+      {{end}}
+    </section>
+  </main>
+</body>
+</html>

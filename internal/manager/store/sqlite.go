@@ -800,7 +800,7 @@ func (s *Store) ensureWorkflowTemplates(ctx context.Context) error {
 }
 
 func (s *Store) upsertPredefinedWorkflowTemplate(ctx context.Context, template workflow.Template) error {
-	template = workflow.NormalizeTemplate(template)
+	template = prepareWorkflowTemplateForSave(template)
 	if err := workflow.ValidateTemplate(template); err != nil {
 		return fmt.Errorf("validate predefined workflow template %s: %w", template.ID, err)
 	}
@@ -872,7 +872,7 @@ func (s *Store) CopyWorkflowTemplate(ctx context.Context, sourceID, newID, name 
 }
 
 func (s *Store) CreateWorkflowTemplate(ctx context.Context, template workflow.Template) error {
-	template = workflow.NormalizeTemplate(template)
+	template = prepareWorkflowTemplateForSave(template)
 	if !template.Editable {
 		return ErrWorkflowTemplateNotEditable
 	}
@@ -893,7 +893,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, template.ID, template.Name, template.Descri
 }
 
 func (s *Store) UpdateWorkflowTemplate(ctx context.Context, template workflow.Template) error {
-	template = workflow.NormalizeTemplate(template)
+	template = prepareWorkflowTemplateForSave(template)
 	if !template.Editable || template.Predefined {
 		return ErrWorkflowTemplateNotEditable
 	}
@@ -936,6 +936,12 @@ func decodeWorkflowTemplate(raw string) (workflow.Template, error) {
 		return workflow.Template{}, fmt.Errorf("stored workflow template %s is invalid: %w", template.ID, err)
 	}
 	return template, nil
+}
+
+func prepareWorkflowTemplateForSave(template workflow.Template) workflow.Template {
+	template = workflow.NormalizeTemplate(template)
+	template.Edges = workflow.DeriveTemplateEdges(template)
+	return workflow.NormalizeTemplate(template)
 }
 
 func (s *Store) ensureRunnerRegistrySchema(ctx context.Context) error {
