@@ -119,8 +119,10 @@
             <div class="stage-settings-grid">
               <label>Review target
                 <select name="target_{{.ID}}">
-                  <option value="plan" {{if eq .Target "plan"}}selected{{end}}>Plan</option>
-                  <option value="code_changes" {{if eq .Target "code_changes"}}selected{{end}}>Code changes</option>
+                  {{$row := .}}
+                  {{range $.ReviewTargets}}
+                  <option value="{{.ID}}" {{if eq $row.Target .ID}}selected{{end}}>{{.Label}}</option>
+                  {{end}}
                 </select>
               </label>
               <label>Reviewer profile

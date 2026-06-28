@@ -1046,9 +1046,11 @@ func appendReviewWorkerContract(b *strings.Builder, disp contract.Dispatch) {
 	profile := inputString(disp.Input, "review_profile")
 	intensity := inputString(disp.Input, "review_intensity")
 	instructions := inputString(disp.Input, "review_instructions")
+	target := contract.NormalizeReviewTarget(inputString(disp.Input, "review_target"))
 	b.WriteString("## Review Contract\n\n")
 	b.WriteString("This Review stage is user-facing as one reviewer. Internally it always runs exactly one critic and one hidden arbiter; never create a panel and never add a `custom` profile.\n\n")
 	fmt.Fprintf(b, "- Review role for this dispatch: `%s`\n", role)
+	fmt.Fprintf(b, "- Review target: `%s` (%s)\n", target, contract.ReviewTargetLabel(target))
 	fmt.Fprintf(b, "- Reviewer profile: `%s`\n", profile)
 	fmt.Fprintf(b, "- Review intensity: `%s`\n", intensity)
 	if instructions != "" {
@@ -1056,15 +1058,40 @@ func appendReviewWorkerContract(b *strings.Builder, disp contract.Dispatch) {
 	}
 	b.WriteString("- Intensity tunes the single critic's strictness/persona only; it never changes critic count.\n")
 	b.WriteString("- Classifications are `accepted`, `rejected`, `deferred`, or `escalated`; only `accepted` findings may become implementation work.\n\n")
+	if _, ok := disp.Input["review_target_packet"]; ok {
+		b.WriteString("### Review target packet\n\n")
+		b.WriteString("Use this target-specific packet as the concise evidence index; the Stage Brief remains authoritative for broader context.\n\n")
+		b.WriteString("```json\n")
+		b.WriteString(inputJSON(disp.Input, "review_target_packet", map[string]any{}))
+		b.WriteString("\n```\n\n")
+	}
+	b.WriteString("### Target-specific instructions\n\n")
+	b.WriteString(reviewTargetInstructions(target))
+	b.WriteString("\n")
 	if role == contract.ReviewRoleArbiter {
 		b.WriteString("### Arbiter input\n\n")
-		b.WriteString("Classify the critic's raw findings independently. Use the Stage Brief and repository evidence; do not assume the critic is correct. Preserve raw findings for audit.\n\n")
+		b.WriteString("Classify the critic's raw findings independently. Use the Stage Brief, review target packet, and repository evidence; do not assume the critic is correct. Preserve raw findings for audit.\n\n")
 		b.WriteString("```json\n")
 		b.WriteString(inputJSON(disp.Input, "raw_findings", []any{}))
 		b.WriteString("\n```\n\n")
 	} else {
 		b.WriteString("### Critic task\n\n")
-		b.WriteString("Review the target semantically against the task contract, stage brief, implementation diff, validation evidence, repository evidence, and profile. Produce raw findings only; do not arbitrate and do not emit a verdict.\n\n")
+		b.WriteString("Review only the configured target semantically against the task contract, stage brief, review target packet, repository evidence, and profile. Produce raw findings only; do not arbitrate and do not emit a verdict.\n\n")
+	}
+}
+
+func reviewTargetInstructions(target string) string {
+	switch contract.NormalizeReviewTarget(target) {
+	case contract.ReviewTargetPlan:
+		return "- Target `plan`: judge the task plan against the task contract. Check scope fit, assumptions, validation approach, and that the plan does not choose or mutate workflow stages."
+	case contract.ReviewTargetCodeChanges:
+		return "- Target `code_changes`: judge the implementation diff and changed behavior. Use validation evidence as supporting evidence, but findings should be about the code changes unless validation evidence itself blocks confidence."
+	case contract.ReviewTargetValidationEvidence:
+		return "- Target `validation_evidence`: judge the validation report itself. Check whether result, checks run, outputs/artifact refs, failures, skipped checks, environment notes, confidence/risk, and next action support the claimed outcome. Do not request code changes unless the evidence reveals a concrete implementation issue."
+	case contract.ReviewTargetDeliveryResult:
+		return "- Target `delivery_result`: judge the final delivery handoff. Check branch/commit/PR or PR-ready metadata, diff artifact, validation result, residual operator action, and whether the delivery result satisfies the task contract."
+	default:
+		return "- Target is custom or unknown: judge the configured target against the task contract and available evidence without broadening scope."
 	}
 }
 

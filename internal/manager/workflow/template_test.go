@@ -151,6 +151,35 @@ func TestQuickFixDeliveryIsSlimPRGatedAndOptIn(t *testing.T) {
 	}
 }
 
+func TestReviewTargetValidationAllowsV1Targets(t *testing.T) {
+	cases := []struct {
+		target string
+		middle []StageTemplate
+	}{
+		{target: TargetPlan, middle: []StageTemplate{reviewStage("review_plan", "Review", ActorAgent, TargetPlan)}},
+		{target: TargetCodeChanges, middle: []StageTemplate{reviewStage("review_code_changes", "Review", ActorAgent, TargetCodeChanges)}},
+		{target: TargetValidationEvidence, middle: []StageTemplate{stage("validation", StageTypeValidation, "Validation", ActorHarness, ""), reviewStage("review_validation_evidence", "Review", ActorAgent, TargetValidationEvidence)}},
+		{target: TargetDeliveryResult, middle: []StageTemplate{stage("commit", StageTypeCommit, "Commit", ActorHarness, ""), reviewStage("review_delivery_result", "Review", ActorAgent, TargetDeliveryResult)}},
+	}
+	for _, tc := range cases {
+		template := validTemplateForTest("t_"+tc.target, tc.middle...)
+		if err := ValidateTemplate(template); err != nil {
+			t.Fatalf("ValidateTemplate(%s) error = %v", tc.target, err)
+		}
+	}
+
+	bad := reviewStage("bad_target", "Bad target", ActorAgent, "final_review")
+	assertValidateTemplateError(t, validTemplateForTest("bad_target", bad), "review target must be one of")
+}
+
+func TestReviewTargetValidationRejectsTargetsBeforeEvidenceProducer(t *testing.T) {
+	validationBeforeEvidence := validTemplateForTest("validation_before_evidence", reviewStage("review_validation", "Review", ActorAgent, TargetValidationEvidence), stage("validation", StageTypeValidation, "Validation", ActorHarness, ""))
+	assertValidateTemplateError(t, validationBeforeEvidence, "requires a prior validation")
+
+	deliveryBeforeResult := validTemplateForTest("delivery_before_result", stage("validation", StageTypeValidation, "Validation", ActorHarness, ""), reviewStage("review_delivery", "Review", ActorAgent, TargetDeliveryResult), stage("commit", StageTypeCommit, "Commit", ActorHarness, ""))
+	assertValidateTemplateError(t, deliveryBeforeResult, "requires a prior commit or pr_creation")
+}
+
 func TestReviewProfileDefaultsAndValidation(t *testing.T) {
 	cases := map[string]string{
 		contract.ReviewProfileGeneralist:  contract.ReviewIntensityNormal,

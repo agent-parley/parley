@@ -15,7 +15,7 @@ import (
 
 const defaultMaxFixLoops = 3
 
-func (e *Engine) runReviewStage(ctx context.Context, wr store.WorkflowRun, runtime runtimeWorkflow, runtimeStage runtimeStage, lastReport, lastValidationReport report.Report, snapshot workerSnapshot, snapshotErr error) (report.Report, error) {
+func (e *Engine) runReviewStage(ctx context.Context, wr store.WorkflowRun, runtime runtimeWorkflow, runtimeStage runtimeStage, lastReport, lastValidationReport, lastDeliveryReport report.Report, snapshot workerSnapshot, snapshotErr error) (report.Report, error) {
 	stage := runtimeStage.Stage
 	templateStage := runtimeStage.Template
 	brief, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
@@ -27,7 +27,7 @@ func (e *Engine) runReviewStage(ctx context.Context, wr store.WorkflowRun, runti
 		return report.Report{}, err
 	}
 
-	baseInput := e.stageDispatchInput(runtime, templateStage, reviewBaseInput(wr, templateStage, lastReport, lastValidationReport, snapshot, snapshotErr))
+	baseInput := e.stageDispatchInput(runtime, templateStage, reviewBaseInput(wr, templateStage, lastReport, lastValidationReport, lastDeliveryReport, snapshot, snapshotErr))
 	baseInput = withStageBriefInput(baseInput, brief, briefArtifact.ID)
 
 	criticInput := cloneInput(baseInput)
@@ -117,16 +117,19 @@ func (e *Engine) dispatchReviewPass(ctx context.Context, wr store.WorkflowRun, s
 	})
 }
 
-func reviewBaseInput(wr store.WorkflowRun, stage workflow.StageTemplate, lastReport, lastValidationReport report.Report, snapshot workerSnapshot, snapshotErr error) map[string]any {
+func reviewBaseInput(wr store.WorkflowRun, stage workflow.StageTemplate, lastReport, lastValidationReport, lastDeliveryReport report.Report, snapshot workerSnapshot, snapshotErr error) map[string]any {
 	profile := settingString(stage.Settings, "profile")
 	intensity := settingString(stage.Settings, "intensity")
 	instructions := settingString(stage.Settings, "instructions")
+	target := contract.NormalizeReviewTarget(stage.Target)
 	input := map[string]any{
 		"idea":                    wr.Run.Idea,
 		"review_profile":          profile,
 		"review_intensity":        intensity,
 		"review_instructions":     instructions,
-		"review_target":           stage.Target,
+		"review_target":           target,
+		"review_target_label":     contract.ReviewTargetLabel(target),
+		"review_target_packet":    reviewTargetPacket(stage, lastReport, lastValidationReport, lastDeliveryReport, snapshot, snapshotErr),
 		"critic_count":            1,
 		"arbiter_count":           1,
 		"arbitration_internal":    true,
@@ -140,20 +143,85 @@ func reviewBaseInput(wr store.WorkflowRun, stage workflow.StageTemplate, lastRep
 	if lastValidationReport.StageID != "" {
 		input["validation_report"] = reportInput(lastValidationReport)
 	}
-	if snapshot.DiffArtifactID != "" {
-		input["implementation_snapshot"] = map[string]any{
-			"worktree_path":    snapshot.WorktreePath,
-			"base_sha":         snapshot.BaseSHA,
-			"base_tree_sha":    snapshot.BaseTreeSHA,
-			"worker_tree_sha":  snapshot.WorkerTreeSHA,
-			"diff_artifact_id": snapshot.DiffArtifactID,
-			"snapshot_error":   "",
-		}
+	if snapshotPayload := workerSnapshotPayload(snapshot, snapshotErr); len(snapshotPayload) > 0 {
+		input["implementation_snapshot"] = snapshotPayload
 	}
 	if snapshotErr != nil {
 		input["implementation_snapshot_error"] = snapshotErr.Error()
 	}
 	return input
+}
+
+func reviewTargetPacket(stage workflow.StageTemplate, lastReport, lastValidationReport, lastDeliveryReport report.Report, snapshot workerSnapshot, snapshotErr error) map[string]any {
+	target := contract.NormalizeReviewTarget(stage.Target)
+	packet := map[string]any{
+		"target": target,
+		"label":  contract.ReviewTargetLabel(target),
+	}
+	if snapshotPayload := workerSnapshotPayload(snapshot, snapshotErr); len(snapshotPayload) > 0 {
+		packet["implementation_snapshot"] = snapshotPayload
+	}
+	switch target {
+	case contract.ReviewTargetPlan:
+		packet["focus"] = "Judge whether the task plan satisfies the task contract, states usable assumptions, and stays within the workflow boundary."
+		if lastReport.StageID != "" {
+			packet["plan_report"] = reportInput(lastReport)
+			copyPayloadString(packet, lastReport.Payload, "task_plan_artifact_id")
+			copyPayloadString(packet, lastReport.Payload, "task_contract_artifact_id")
+		}
+	case contract.ReviewTargetCodeChanges:
+		packet["focus"] = "Judge the implementation diff against the task contract, plan, validation evidence, and repository evidence."
+		if lastReport.StageID != "" {
+			packet["latest_report"] = reportInput(lastReport)
+		}
+		if lastValidationReport.StageID != "" {
+			packet["validation_report"] = reportInput(lastValidationReport)
+		}
+	case contract.ReviewTargetValidationEvidence:
+		packet["focus"] = "Judge whether validation evidence is complete, reliable, and sufficient for the claimed delivery confidence."
+		packet["expected_evidence_fields"] = []string{"result", "checks_run", "outputs", "failures", "skipped", "env_notes", "confidence", "next_action"}
+		if lastValidationReport.StageID != "" {
+			packet["validation_report"] = reportInput(lastValidationReport)
+		} else {
+			packet["missing_evidence"] = []string{"validation_report"}
+		}
+	case contract.ReviewTargetDeliveryResult:
+		packet["focus"] = "Judge the final delivery handoff: committed branch/SHA, PR creation or PR-ready state, diff reference, validation result, and any residual operator action."
+		packet["expected_evidence_fields"] = []string{"branch", "commit_sha", "diff_artifact_id", "push_performed", "pr_created", "pr_url", "pr_behavior"}
+		deliveryReport := lastDeliveryReport
+		if reportIsDeliveryResult(lastReport) {
+			deliveryReport = lastReport
+		}
+		if reportIsDeliveryResult(deliveryReport) {
+			packet["delivery_report"] = reportInput(deliveryReport)
+		} else {
+			packet["missing_evidence"] = []string{"delivery_report"}
+		}
+		if lastValidationReport.StageID != "" {
+			packet["validation_report"] = reportInput(lastValidationReport)
+		}
+	default:
+		packet["focus"] = "Judge the configured review target against the task contract, stage brief, and available evidence."
+		if lastReport.StageID != "" {
+			packet["latest_report"] = reportInput(lastReport)
+		}
+	}
+	return packet
+}
+
+func reportIsDeliveryResult(rep report.Report) bool {
+	switch rep.StageType {
+	case workflow.StageTypeCommit, workflow.StageTypePRCreation, contract.StageTypePRReady:
+		return rep.StageID != ""
+	default:
+		return false
+	}
+}
+
+func copyPayloadString(packet map[string]any, payload map[string]any, key string) {
+	if value := payloadString(payload, key); value != "" {
+		packet[key] = value
+	}
 }
 
 func normalizeIntermediateReviewReport(wr store.WorkflowRun, stage store.Stage, rep report.Report) (report.Report, error) {

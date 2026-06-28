@@ -39,6 +39,13 @@ const (
 )
 
 const (
+	ReviewTargetPlan               = "plan"
+	ReviewTargetCodeChanges        = "code_changes"
+	ReviewTargetValidationEvidence = "validation_evidence"
+	ReviewTargetDeliveryResult     = "delivery_result"
+)
+
+const (
 	ReviewProfileGeneralist  = "generalist"
 	ReviewProfileSecurity    = "security"
 	ReviewProfileTests       = "tests"
@@ -59,6 +66,11 @@ type ReviewerConfig struct {
 	Profile      string `json:"profile"`
 	Intensity    string `json:"intensity"`
 	Instructions string `json:"instructions,omitempty"`
+}
+
+type ReviewTargetOption struct {
+	ID    string
+	Label string
 }
 
 // Dispatch is the Manager -> Runner input for an adapter stage.
@@ -100,6 +112,38 @@ func ValidateRefinementLevel(level string) error {
 	default:
 		return fmt.Errorf("refinement_level must be one of %q or %q", RefinementLevelDirect, RefinementLevelStandard)
 	}
+}
+
+func ReviewTargetOptions() []ReviewTargetOption {
+	return []ReviewTargetOption{
+		{ID: ReviewTargetPlan, Label: "Plan"},
+		{ID: ReviewTargetCodeChanges, Label: "Code changes"},
+		{ID: ReviewTargetValidationEvidence, Label: "Validation evidence"},
+		{ID: ReviewTargetDeliveryResult, Label: "Delivery result"},
+	}
+}
+
+func NormalizeReviewTarget(target string) string {
+	return strings.ToLower(strings.TrimSpace(target))
+}
+
+func ValidReviewTarget(target string) bool {
+	switch NormalizeReviewTarget(target) {
+	case ReviewTargetPlan, ReviewTargetCodeChanges, ReviewTargetValidationEvidence, ReviewTargetDeliveryResult:
+		return true
+	default:
+		return false
+	}
+}
+
+func ReviewTargetLabel(target string) string {
+	target = NormalizeReviewTarget(target)
+	for _, option := range ReviewTargetOptions() {
+		if option.ID == target {
+			return option.Label
+		}
+	}
+	return strings.ReplaceAll(target, "_", " ")
 }
 
 func NormalizeReviewProfile(profile string) string {

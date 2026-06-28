@@ -554,6 +554,33 @@ func TestPiRunRepairsInvalidReportOnce(t *testing.T) {
 	}
 }
 
+func TestReviewWorkerInputIncludesNewTargetInstructions(t *testing.T) {
+	for _, tc := range []struct {
+		target string
+		want   string
+	}{
+		{target: contract.ReviewTargetValidationEvidence, want: "judge the validation report itself"},
+		{target: contract.ReviewTargetDeliveryResult, want: "judge the final delivery handoff"},
+	} {
+		disp := piTestDispatch()
+		disp.StageType = contract.StageTypeReview
+		disp.Input = map[string]any{
+			"review_role":      contract.ReviewRoleCritic,
+			"review_profile":   contract.ReviewProfileGeneralist,
+			"review_intensity": contract.ReviewIntensityNormal,
+			"review_target":    tc.target,
+			"review_target_packet": map[string]any{
+				"target": tc.target,
+				"focus":  "target packet focus",
+			},
+		}
+		input := workerInputMarkdown(disp, "/project/workspace/report.json")
+		if !strings.Contains(input, "Review target: `"+tc.target+"`") || !strings.Contains(input, tc.want) || !strings.Contains(input, "Review target packet") {
+			t.Fatalf("worker input for %s missing target instructions:\n%s", tc.target, input)
+		}
+	}
+}
+
 func TestPiRunPreservesReviewVerdictAndPayload(t *testing.T) {
 	ctx := context.Background()
 	fake := &scriptedPiProvider{
