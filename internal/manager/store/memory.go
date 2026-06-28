@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/ids"
@@ -85,6 +88,239 @@ func (s *Store) ListProjectMemoryEntries(ctx context.Context, projectID string) 
 		entries = append(entries, entry)
 	}
 	return entries, rows.Err()
+}
+
+func (s *Store) ExportProjectMemoryEntries(ctx context.Context, req ProjectMemoryExportRequest) (ProjectMemoryExportResult, error) {
+	projectID := normalizeProjectID(req.ProjectID)
+	repositoryPath := filepath.Clean(strings.TrimSpace(req.RepositoryPath))
+	if strings.TrimSpace(req.RepositoryPath) == "" {
+		return ProjectMemoryExportResult{}, fmt.Errorf("repository path is required for project memory export")
+	}
+	info, err := os.Stat(repositoryPath)
+	if err != nil {
+		return ProjectMemoryExportResult{}, fmt.Errorf("stat project memory export repository: %w", err)
+	}
+	if !info.IsDir() {
+		return ProjectMemoryExportResult{}, fmt.Errorf("project memory export repository is not a directory: %s", repositoryPath)
+	}
+	entryIDs := normalizeProjectMemoryExportEntryIDs(req.EntryIDs)
+	if len(entryIDs) == 0 {
+		return ProjectMemoryExportResult{}, fmt.Errorf("select at least one memory entry to export")
+	}
+
+	entries, err := s.ListProjectMemoryEntries(ctx, projectID)
+	if err != nil {
+		return ProjectMemoryExportResult{}, err
+	}
+	entriesByID := make(map[string]ProjectMemoryEntry, len(entries))
+	for _, entry := range entries {
+		entriesByID[entry.ID] = entry
+	}
+	selected := make([]ProjectMemoryEntry, 0, len(entryIDs))
+	for _, entryID := range entryIDs {
+		entry, ok := entriesByID[entryID]
+		if !ok {
+			return ProjectMemoryExportResult{}, fmt.Errorf("memory entry %s was not found for project %s", entryID, projectID)
+		}
+		selected = append(selected, entry)
+	}
+
+	exportedAt := nowRFC3339()
+	result := ProjectMemoryExportResult{Files: make([]ProjectMemoryExportFile, 0, len(selected))}
+	for _, entry := range selected {
+		sanitized, notes, changed := sanitizeProjectMemoryExportEntry(entry)
+		relativePath := projectMemoryExportRelativePath(sanitized)
+		absolutePath := filepath.Join(repositoryPath, filepath.FromSlash(relativePath))
+		if err := os.MkdirAll(filepath.Dir(absolutePath), 0o755); err != nil {
+			return ProjectMemoryExportResult{}, fmt.Errorf("create project memory export dir: %w", err)
+		}
+		content := renderProjectMemoryExport(sanitized, exportedAt, notes)
+		if err := os.WriteFile(absolutePath, []byte(content), 0o644); err != nil {
+			return ProjectMemoryExportResult{}, fmt.Errorf("write project memory export: %w", err)
+		}
+		result.Files = append(result.Files, ProjectMemoryExportFile{EntryID: entry.ID, RelativePath: relativePath, Path: absolutePath, Sanitized: changed})
+	}
+	return result, nil
+}
+
+func normalizeProjectMemoryExportEntryIDs(raw []string) []string {
+	seen := map[string]bool{}
+	ids := make([]string, 0, len(raw))
+	for _, value := range raw {
+		id := strings.TrimSpace(value)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func sanitizeProjectMemoryExportEntry(entry ProjectMemoryEntry) (ProjectMemoryEntry, []string, bool) {
+	var notes []string
+	changed := false
+	kind := normalizeProjectMemoryKind(entry.Kind)
+	if kind == "" || !validProjectMemoryKind(kind) || projectMemoryExportForbiddenText(kind) {
+		kind = ProjectMemoryKindLesson
+		notes = append(notes, "kind contained unsupported or forbidden content and was replaced")
+		changed = true
+	}
+	entry.Kind = kind
+
+	if title, fieldChanged := sanitizeProjectMemoryExportText(entry.Title, "Untitled sanitized memory entry"); fieldChanged {
+		entry.Title = projectMemoryExportOneLine(title)
+		notes = append(notes, "title contained forbidden content and was sanitized")
+		changed = true
+	} else {
+		entry.Title = projectMemoryExportOneLine(title)
+	}
+	if body, fieldChanged := sanitizeProjectMemoryExportText(entry.Body, "All body content was removed by project-memory export sanitization."); fieldChanged {
+		entry.Body = body
+		notes = append(notes, "body lines containing secrets or forbidden content were removed")
+		changed = true
+	} else {
+		entry.Body = body
+	}
+	if summary, fieldChanged := sanitizeProjectMemoryExportText(entry.SourceSummary, "Sanitized source summary"); fieldChanged {
+		entry.SourceSummary = projectMemoryExportOneLine(summary)
+		notes = append(notes, "source summary contained forbidden content and was sanitized")
+		changed = true
+	} else {
+		entry.SourceSummary = projectMemoryExportOneLine(summary)
+	}
+	return entry, notes, changed
+}
+
+func sanitizeProjectMemoryExportText(value, fallback string) (string, bool) {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	if strings.TrimSpace(value) == "" {
+		return "", false
+	}
+	lines := strings.Split(value, "\n")
+	kept := make([]string, 0, len(lines))
+	removed := false
+	inSecretBlock := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if inSecretBlock {
+			removed = true
+			if projectMemoryExportSecretBlockEnd(trimmed) {
+				inSecretBlock = false
+			}
+			continue
+		}
+		if projectMemoryExportSecretBlockStart(trimmed) {
+			removed = true
+			if !projectMemoryExportSecretBlockEnd(trimmed) {
+				inSecretBlock = true
+			}
+			continue
+		}
+		if trimmed != "" && projectMemoryExportForbiddenText(line) {
+			removed = true
+			continue
+		}
+		kept = append(kept, line)
+	}
+	result := strings.TrimSpace(strings.Join(kept, "\n"))
+	if result == "" {
+		return fallback, true
+	}
+	return result, removed || result != strings.TrimSpace(value)
+}
+
+func projectMemoryExportSecretBlockStart(line string) bool {
+	lower := strings.ToLower(line)
+	return strings.Contains(lower, "-----begin ") && strings.Contains(lower, "private key-----")
+}
+
+func projectMemoryExportSecretBlockEnd(line string) bool {
+	lower := strings.ToLower(line)
+	return strings.Contains(lower, "-----end ") && strings.Contains(lower, "private key-----")
+}
+
+func projectMemoryExportForbiddenText(text string) bool {
+	return looksLikeSecret(text) || looksLikeStandingInstruction("", text) || looksLikeCurrentCodeTruth("", text)
+}
+
+func projectMemoryExportRelativePath(entry ProjectMemoryEntry) string {
+	kind := projectMemoryExportSlug(entry.Kind)
+	if kind == "" {
+		kind = "memory"
+	}
+	base := projectMemoryExportSlug(entry.Title)
+	if base == "" {
+		base = "memory"
+	}
+	if id := projectMemoryExportSlug(entry.ID); id != "" {
+		base += "-" + id
+	}
+	return filepath.ToSlash(filepath.Join(ProjectMemoryExportDir, kind, base+".md"))
+}
+
+func projectMemoryExportSlug(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range value {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash && b.Len() > 0 {
+			b.WriteByte('-')
+			lastDash = true
+		}
+		if b.Len() >= 80 {
+			break
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func renderProjectMemoryExport(entry ProjectMemoryEntry, exportedAt string, notes []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s\n\n", entry.Title)
+	b.WriteString("> [!info] Exported project memory\n")
+	projectMemoryExportMetadata(&b, "Memory ID", entry.ID)
+	projectMemoryExportMetadata(&b, "Kind", entry.Kind)
+	projectMemoryExportMetadata(&b, "Source run", entry.SourceRunID)
+	projectMemoryExportMetadata(&b, "Source task", entry.SourceTaskID)
+	projectMemoryExportMetadata(&b, "Source stage", entry.SourceStageID)
+	projectMemoryExportMetadata(&b, "Source artifact", entry.SourceArtifactID)
+	projectMemoryExportMetadata(&b, "Curator stage", entry.CuratorStageID)
+	projectMemoryExportMetadata(&b, "Source summary", entry.SourceSummary)
+	projectMemoryExportMetadata(&b, "Created at", entry.CreatedAt)
+	projectMemoryExportMetadata(&b, "Updated at", entry.UpdatedAt)
+	if entry.UpdatedAt != "" {
+		projectMemoryExportMetadata(&b, "Freshness", "memory updated at "+entry.UpdatedAt)
+	}
+	projectMemoryExportMetadata(&b, "Exported at", exportedAt)
+	if len(notes) == 0 {
+		projectMemoryExportMetadata(&b, "Sanitization", "no forbidden content detected by export sanitizer")
+	} else {
+		projectMemoryExportMetadata(&b, "Sanitization", strings.Join(notes, "; "))
+	}
+	b.WriteString("\n")
+	b.WriteString(entry.Body)
+	if !strings.HasSuffix(entry.Body, "\n") {
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func projectMemoryExportMetadata(b *strings.Builder, label, value string) {
+	value = projectMemoryExportOneLine(value)
+	if value == "" {
+		return
+	}
+	fmt.Fprintf(b, "> - %s: `%s`\n", label, strings.ReplaceAll(value, "`", "'"))
+}
+
+func projectMemoryExportOneLine(value string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
 }
 
 func validateProjectMemoryCuratorStageTx(ctx context.Context, tx *sql.Tx, update ProjectMemoryUpdate) error {

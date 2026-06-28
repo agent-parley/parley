@@ -554,6 +554,60 @@ func TestProjectSettingsLoadFromRepoIsDraftUntilSaved(t *testing.T) {
 	assertNotContains(t, body, "⚠ repo candidate differs")
 }
 
+func TestProjectSettingsMemoryExportRendersSelectionAndExportsOnlyChecked(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	repo := t.TempDir()
+	spec := store.DefaultProjectSpec(st.DataDir())
+	spec.RepositoryPath = repo
+	if _, err := st.EnsureProject(ctx, spec); err != nil {
+		t.Fatalf("ensure project repo: %v", err)
+	}
+	entries := seedRouteProjectMemoryEntries(t, st)
+
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	body := getSettingsBody(t, srv, "/projects/default/settings")
+	assertContains(t, body, "Project Memory Export")
+	assertContains(t, body, "Select memory entries to export")
+	assertContains(t, body, "Export selected memory")
+	assertContains(t, body, store.ProjectMemoryExportDir)
+	assertContains(t, body, entries[0].Title)
+	assertContains(t, body, entries[1].Title)
+	if _, err := os.Stat(filepath.Join(repo, store.ProjectMemoryExportDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("memory export dir before explicit post stat err = %v, want not exist", err)
+	}
+
+	cookie, csrf := getCSRFToken(t, srv)
+	missingSelection := postForm(t, srv, "/projects/default/settings/memory/export", cookie, url.Values{"_csrf": {csrf}})
+	if missingSelection.Code != http.StatusBadRequest {
+		t.Fatalf("POST memory export without selection status = %d want %d body=%s", missingSelection.Code, http.StatusBadRequest, missingSelection.Body.String())
+	}
+	assertContains(t, missingSelection.Body.String(), "select at least one memory entry to export")
+	if _, err := os.Stat(filepath.Join(repo, store.ProjectMemoryExportDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("memory export dir after missing selection stat err = %v, want not exist", err)
+	}
+
+	rec := postForm(t, srv, "/projects/default/settings/memory/export", cookie, url.Values{"memory_entry_id": {entries[0].ID}, "_csrf": {csrf}})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST memory export status = %d want %d body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	assertContains(t, rec.Body.String(), "exported 1 selected memory entry")
+	assertContains(t, rec.Body.String(), store.ProjectMemoryExportDir)
+	files, err := filepath.Glob(filepath.Join(repo, store.ProjectMemoryExportDir, "*", "*.md"))
+	if err != nil {
+		t.Fatalf("glob memory exports: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("export files = %#v, want exactly one selected entry", files)
+	}
+	exportContent, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatalf("read exported memory: %v", err)
+	}
+	assertContains(t, string(exportContent), entries[0].Title)
+	assertNotContains(t, string(exportContent), entries[1].Title)
+}
+
 func TestProjectSettingsDiffBadgeIgnoresTrailingWhitespace(t *testing.T) {
 	ctx := context.Background()
 	st := openRouteTestStore(t)
@@ -1336,6 +1390,43 @@ func defaultRouteQueueState() orchestrator.QueueState {
 		ReadyRunnerSlots:       1,
 		EffectiveMaxConcurrent: 1,
 	}
+}
+
+func seedRouteProjectMemoryEntries(t *testing.T, st *store.Store) []store.ProjectMemoryEntry {
+	t.Helper()
+	ctx := context.Background()
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "learn from project memory", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create memory run: %v", err)
+	}
+	sourceReport := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		StageID:       wr.ImplementationStage.ID,
+		StageType:     wr.ImplementationStage.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: "noop"},
+		Status:        report.StatusCompleted,
+		Summary:       "implementation produced memory",
+		Payload:       map[string]any{},
+		Errors:        []string{},
+	}
+	sourceArtifact, err := st.SaveReportArtifact(ctx, sourceReport)
+	if err != nil {
+		t.Fatalf("save memory source report: %v", err)
+	}
+	result, err := st.ApplyProjectMemoryUpdate(ctx, store.ProjectMemoryUpdate{ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, CuratorStageID: wr.MemoryUpdateStage.ID, Entries: []store.ProjectMemoryInput{
+		{Kind: store.ProjectMemoryKindGotcha, Title: "Selected export gotcha", Body: "Export only when selected.", SourceStageID: wr.ImplementationStage.ID, SourceArtifactID: sourceArtifact.ID, SourceSummary: "implementation report"},
+		{Kind: store.ProjectMemoryKindLesson, Title: "Private unselected lesson", Body: "Do not export unless checked.", SourceStageID: wr.ImplementationStage.ID, SourceArtifactID: sourceArtifact.ID, SourceSummary: "implementation report"},
+	}})
+	if err != nil {
+		t.Fatalf("apply route memory update: %v", err)
+	}
+	if len(result.Entries) != 2 {
+		t.Fatalf("route memory entries = %d, want 2", len(result.Entries))
+	}
+	return result.Entries
 }
 
 func openRouteTestStore(t *testing.T) *store.Store {

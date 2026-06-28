@@ -841,10 +841,14 @@ func TestStartRunFreezesSelectedWorkflowTemplateSnapshot(t *testing.T) {
 func createMemoryProducerTemplate(t *testing.T, st *store.Store, templateID string, includeMemoryUpdate bool) {
 	t.Helper()
 	stages := []workflow.StageTemplate{
+		{ID: "idea_refinement", Type: workflow.StageTypeIdeaRefinement, Label: "Idea refinement", Actor: workflow.ActorHarness},
 		{ID: "implementation", Type: workflow.StageTypeImplementation, Label: "Implementation", Actor: workflow.ActorAgent},
 		{ID: "change_review_agent", Type: workflow.StageTypeReview, Label: "Code review", Actor: workflow.ActorAgent, Target: workflow.TargetCodeChanges},
 	}
-	edges := []workflow.Edge{{From: "implementation", To: "change_review_agent", On: workflow.OnCompleted}}
+	edges := []workflow.Edge{
+		{From: "idea_refinement", To: "implementation", On: workflow.OnCompleted},
+		{From: "implementation", To: "change_review_agent", On: workflow.OnCompleted},
+	}
 	reviewNext := "stop_report"
 	if includeMemoryUpdate {
 		stages = append(stages, workflow.StageTemplate{ID: "memory_update", Type: workflow.StageTypeMemoryUpdate, Label: "Memory update", Actor: workflow.ActorAgent})
