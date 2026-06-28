@@ -81,6 +81,12 @@ func TestFullLoopWithFakeSandboxProvider(t *testing.T) {
 		if bundle.Run.Status == store.RunStatusCompleted {
 			break
 		}
+		if bundle.Run.Status == store.RunStatusAwaitingWorkflowAdjustment {
+			if err := engine.FreezeRunWorkflowSnapshot(ctx, runID, event.Actor{Kind: event.ActorKindOperator, ID: "test"}); err != nil {
+				t.Fatalf("freeze workflow snapshot: %v", err)
+			}
+			continue
+		}
 		select {
 		case <-time.After(25 * time.Millisecond):
 		case <-ctx.Done():

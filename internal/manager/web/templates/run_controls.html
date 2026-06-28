@@ -1,0 +1,20 @@
+<section id="run-controls" class="card run-controls" aria-label="Run controls">
+  {{with .WorkflowSnapshot}}
+  <div class="workflow-adjustment-controls">
+    {{if .Editable}}
+    <p><strong>Workflow snapshot is editable.</strong> Make final run-only changes before execution resumes.</p>
+    <a class="button-link" href="{{.EditPath}}">Customize run workflow</a>
+    <form method="post" action="{{.FreezePath}}">
+      <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+      <button type="submit">Freeze snapshot and continue</button>
+    </form>
+    {{else if .Frozen}}
+    <p class="muted">Workflow snapshot is frozen for this run.</p>
+    {{end}}
+  </div>
+  {{end}}
+  <form method="post" action="/projects/{{.Project.ID}}/runs/{{.Run.ID}}/cancel">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}">
+    <button type="submit" class="danger">Cancel run</button>
+  </form>
+</section>

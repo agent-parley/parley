@@ -298,6 +298,7 @@ func TestReRunStageDeliveryUsesExistingBranchAndDoesNotCreatePRDuplicate(t *test
 	if err != nil {
 		t.Fatalf("StartProjectRunInput() error = %v", err)
 	}
+	freezeRunWorkflowSnapshot(t, engine, st, runID)
 	waitForRunStatus(t, st, runID, store.RunStatusCompleted)
 	firstWR, err := st.GetWorkflowRun(ctx, runID)
 	if err != nil {

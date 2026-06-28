@@ -33,6 +33,11 @@ type WorkflowTemplateEditData struct {
 	ReviewTargets []contract.ReviewTargetOption
 	AgentProfiles []agentregistry.Profile
 	SavePath      string
+	BackPath      string
+	Breadcrumb    string
+	Heading       string
+	Help          string
+	SubmitLabel   string
 	Notifications NotificationCenterData
 	Notice        *Notice
 	Error         string

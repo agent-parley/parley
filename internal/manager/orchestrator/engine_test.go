@@ -679,6 +679,7 @@ func TestMemoryProducerLoopPersistsAgentLearningOpportunities(t *testing.T) {
 	if err := env.engine.StartQueuedRun(ctx, runID); err != nil {
 		t.Fatalf("StartQueuedRun() error = %v", err)
 	}
+	freezeRunWorkflowSnapshot(t, env.engine, env.store, runID)
 	waitForRunStatus(t, env.store, runID, store.RunStatusCompleted)
 
 	var sawImplementationCapture, sawReviewCapture bool
@@ -736,6 +737,7 @@ func TestMemoryCaptureDisabledWithoutMemoryUpdateStage(t *testing.T) {
 	if err := env.engine.StartQueuedRun(ctx, runID); err != nil {
 		t.Fatalf("StartQueuedRun() error = %v", err)
 	}
+	freezeRunWorkflowSnapshot(t, env.engine, env.store, runID)
 	waitForRunStatus(t, env.store, runID, store.RunStatusCompleted)
 
 	for _, disp := range runner.disps {
@@ -922,7 +924,7 @@ func TestReviewFixLoopExhaustionBlocksThroughNeedsInput(t *testing.T) {
 	}
 }
 
-func TestStartRunFreezesSelectedWorkflowTemplateSnapshot(t *testing.T) {
+func TestStartRunCapturesEditableSelectedWorkflowTemplateSnapshot(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
 	if err != nil {
@@ -945,14 +947,14 @@ func TestStartRunFreezesSelectedWorkflowTemplateSnapshot(t *testing.T) {
 	if err := json.Unmarshal([]byte(rawSnapshot), &snapshot); err != nil {
 		t.Fatalf("decode start snapshot: %v", err)
 	}
-	if snapshot["frozen"] != true {
-		t.Fatalf("snapshot frozen = %v, want true", snapshot["frozen"])
+	if snapshot["frozen"] != false {
+		t.Fatalf("snapshot frozen = %v, want false before idea-intake adjustment", snapshot["frozen"])
 	}
 	if snapshot["workflow_template_id"] != copied.ID {
 		t.Fatalf("snapshot template id = %v, want %s", snapshot["workflow_template_id"], copied.ID)
 	}
-	if snapshot["workflow_template_frozen"] != true {
-		t.Fatalf("workflow_template_frozen = %v, want true", snapshot["workflow_template_frozen"])
+	if snapshot["workflow_template_frozen"] != false {
+		t.Fatalf("workflow_template_frozen = %v, want false before idea-intake adjustment", snapshot["workflow_template_frozen"])
 	}
 	templateSnapshot, ok := snapshot["workflow_template_snapshot"].(map[string]any)
 	if !ok || templateSnapshot["id"] != copied.ID {

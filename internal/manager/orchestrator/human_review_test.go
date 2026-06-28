@@ -30,6 +30,7 @@ func TestHumanReviewSuspendsAndRestartResumeAcceptsHumanEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartRunInput() error = %v", err)
 	}
+	freezeRunWorkflowSnapshot(t, firstEngine, st, runID)
 	waitForRunStatus(t, st, runID, store.RunStatusAwaitingHuman)
 	queue, err := firstEngine.QueueState(ctx)
 	if err != nil {
@@ -71,6 +72,7 @@ func TestAgentEscalationRoutesToWiredHumanReviewAndDoubleSubmitRejected(t *testi
 	if err != nil {
 		t.Fatalf("StartRunInput() error = %v", err)
 	}
+	freezeRunWorkflowSnapshot(t, engine, st, runID)
 	waitForRunStatus(t, st, runID, store.RunStatusAwaitingHuman)
 	planStage := stageByWorkflowID(t, st, runID, "plan_review_human")
 	if _, err := engine.SubmitHumanReview(ctx, runID, planStage.ID, HumanReviewSubmission{Verdict: string(report.ReviewVerdictPass), Summary: "plan ok"}); err != nil {
@@ -244,6 +246,7 @@ func startLostWorktreeResumeFixture(t *testing.T, ctx context.Context) lostWorkt
 	if err != nil {
 		t.Fatalf("StartRunInput() error = %v", err)
 	}
+	freezeRunWorkflowSnapshot(t, firstEngine, st, runID)
 	waitForRunStatus(t, st, runID, store.RunStatusAwaitingHuman)
 	planStage := stageByWorkflowID(t, st, runID, "plan_review_human")
 	if _, err := firstEngine.SubmitHumanReview(ctx, runID, planStage.ID, HumanReviewSubmission{Verdict: string(report.ReviewVerdictPass), Summary: "plan approved"}); err != nil {
@@ -302,6 +305,7 @@ func TestMalformedHumanReviewRejectedWhileAwaiting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartRunInput() error = %v", err)
 	}
+	freezeRunWorkflowSnapshot(t, engine, st, runID)
 	waitForRunStatus(t, st, runID, store.RunStatusAwaitingHuman)
 	stage := stageByWorkflowID(t, st, runID, "plan_review_human")
 	if _, err := engine.SubmitHumanReview(ctx, runID, stage.ID, HumanReviewSubmission{Verdict: "bogus", Summary: "bad"}); err == nil {
@@ -332,6 +336,7 @@ func TestSubmitHumanReviewRollsBackRunStatusOnPostCASFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartRunInput() error = %v", err)
 	}
+	freezeRunWorkflowSnapshot(t, engine, st, runID)
 	waitForRunStatus(t, st, runID, store.RunStatusAwaitingHuman)
 	stage := stageByWorkflowID(t, st, runID, "plan_review_human")
 

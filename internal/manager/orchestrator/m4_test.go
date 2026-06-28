@@ -81,8 +81,8 @@ func TestIdeaIntakeFreezesVerbatimIdeaIntoContractAndSnapshot(t *testing.T) {
 	if err := json.Unmarshal([]byte(rawSnapshot), &snapshot); err != nil {
 		t.Fatalf("decode snapshot: %v", err)
 	}
-	if snapshot["idea_verbatim"] != wr.Run.Idea || snapshot["frozen"] != true {
-		t.Fatalf("snapshot did not freeze idea: %+v", snapshot)
+	if snapshot["idea_verbatim"] != wr.Run.Idea || snapshot["frozen"] != false {
+		t.Fatalf("snapshot did not preserve editable idea snapshot: %+v", snapshot)
 	}
 	if snapshot["task_contract_artifact_id"] != contractID {
 		t.Fatalf("snapshot task contract id = %v, want %s", snapshot["task_contract_artifact_id"], contractID)
@@ -96,8 +96,8 @@ func TestIdeaIntakeFreezesVerbatimIdeaIntoContractAndSnapshot(t *testing.T) {
 	if snapshot["workflow_template_id"] != workflow.DefaultTemplateID {
 		t.Fatalf("snapshot workflow template id = %v, want %s", snapshot["workflow_template_id"], workflow.DefaultTemplateID)
 	}
-	if snapshot["workflow_template_frozen"] != true {
-		t.Fatalf("workflow_template_frozen = %v, want true", snapshot["workflow_template_frozen"])
+	if snapshot["workflow_template_frozen"] != false {
+		t.Fatalf("workflow_template_frozen = %v, want false before final adjustment", snapshot["workflow_template_frozen"])
 	}
 	templateSnapshot, ok := snapshot["workflow_template_snapshot"].(map[string]any)
 	if !ok {

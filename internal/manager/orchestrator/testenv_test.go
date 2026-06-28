@@ -158,6 +158,14 @@ func waitForRunStatus(t *testing.T, st *store.Store, runID, want string) {
 	})
 }
 
+func freezeRunWorkflowSnapshot(t *testing.T, engine *Engine, st *store.Store, runID string) {
+	t.Helper()
+	waitForRunStatus(t, st, runID, store.RunStatusAwaitingWorkflowAdjustment)
+	if err := engine.FreezeRunWorkflowSnapshot(context.Background(), runID, event.Actor{Kind: event.ActorKindOperator, ID: "test"}); err != nil {
+		t.Fatalf("FreezeRunWorkflowSnapshot() error = %v", err)
+	}
+}
+
 func waitForNotRunStatus(t *testing.T, st *store.Store, runID, status string) {
 	t.Helper()
 	recorderForStore(t, st).waitUntil(t, func() bool {

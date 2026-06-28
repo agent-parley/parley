@@ -96,6 +96,7 @@ func TestHumanReviewPacketsIncludeNewTargetEvidence(t *testing.T) {
 			if err != nil {
 				t.Fatalf("StartRunInput() error = %v", err)
 			}
+			freezeRunWorkflowSnapshot(t, engine, st, runID)
 			waitForWorkflowStageAwaiting(t, st, runID, "human_review")
 
 			awaitingEvent := eventByWorkflowStage(t, st, runID, "stage.awaiting_human", "human_review")

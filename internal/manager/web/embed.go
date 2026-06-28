@@ -284,12 +284,20 @@ type RunView struct {
 	DiffPatch          ArtifactView
 	PRReady            PRReadyView
 	PendingHumanReview *HumanReviewView
+	WorkflowSnapshot   *WorkflowSnapshotView
 	StageGroups        []StageGroupView
 	TaskPlan           TaskPlanView
 	Outcome            OutcomeView
 	DiffLines          []DiffLineView
 	DiffIsLong         bool
 	CSRF               string
+}
+
+type WorkflowSnapshotView struct {
+	Editable   bool
+	Frozen     bool
+	EditPath   string
+	FreezePath string
 }
 
 type StageGroupView struct {
@@ -399,6 +407,10 @@ func newTaskOverviewItem(projectID string, bundle store.RunBundle, autoWhenReady
 			item.NeedsReason = "human input needed"
 		}
 	}
+	if bundle.Run.Status == store.RunStatusAwaitingWorkflowAdjustment {
+		item.NeedsYou = true
+		item.NeedsReason = "workflow adjustment"
+	}
 	return item
 }
 
@@ -501,12 +513,21 @@ func NewRunView(bundle store.RunBundle) RunView {
 			view.DiffPatch = artifactView
 		}
 	}
+	view.WorkflowSnapshot = workflowSnapshotView(bundle)
 	view.StageGroups = stageGroups(bundle.Run.Status, bundle.Stages, bundle.Events)
 	view.TaskPlan = taskPlanView(bundle, view.ArtifactViews)
 	view.Outcome = outcomeView(bundle)
 	view.DiffLines = diffLines(view.DiffPatch.Preview)
 	view.DiffIsLong = len(view.DiffLines) > 80
 	return view
+}
+
+func workflowSnapshotView(bundle store.RunBundle) *WorkflowSnapshotView {
+	if bundle.Run.Status != store.RunStatusAwaitingWorkflowAdjustment {
+		return nil
+	}
+	base := "/projects/" + bundle.Project.ID + "/runs/" + bundle.Run.ID + "/workflow"
+	return &WorkflowSnapshotView{Editable: true, EditPath: base + "/edit", FreezePath: base + "/freeze"}
 }
 
 func NewRenderer() (*TemplateRenderer, error) {
@@ -972,7 +993,7 @@ func statusClass(status string) string {
 		return "status-completed"
 	case "failed", "invalid", "down", "cancelled":
 		return "status-failed"
-	case "running", "awaiting_human", "suspect":
+	case "running", "awaiting_human", "awaiting_workflow_adjustment", "suspect":
 		return "status-running"
 	default:
 		return "status-pending"
@@ -980,10 +1001,14 @@ func statusClass(status string) string {
 }
 
 func statusLabel(status string) string {
-	if status == "pending" {
+	switch status {
+	case "pending":
 		return "queued"
+	case "awaiting_workflow_adjustment":
+		return "awaiting workflow adjustment"
+	default:
+		return status
 	}
-	return status
 }
 
 func compactHTML(in string) string {

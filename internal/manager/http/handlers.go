@@ -89,6 +89,10 @@ func (s *Server) handleProjectPath(w http.ResponseWriter, r *http.Request) {
 		s.handleStartQueuedRun(w, r, projectID, runID)
 		return
 	}
+	if len(parts) == 5 && parts[3] == "workflow" {
+		s.handleRunWorkflowSnapshotPath(w, r, projectID, runID, parts[4])
+		return
+	}
 	if len(parts) == 6 && parts[3] == "stages" && parts[5] == "rerun" {
 		s.handleReRunStage(w, r, projectID, runID, parts[4])
 		return
@@ -168,6 +172,11 @@ func (s *Server) projectsIndexData(r *http.Request) (web.ProjectsIndexData, erro
 		if err != nil {
 			return web.ProjectsIndexData{}, err
 		}
+		workflowCount, err := s.store.CountRunsByProjectStatus(r.Context(), project.ID, store.RunStatusAwaitingWorkflowAdjustment)
+		if err != nil {
+			return web.ProjectsIndexData{}, err
+		}
+		count += workflowCount
 		total += count
 		views = append(views, web.ProjectNeedsYouView{Project: project, NeedsYouCount: count})
 	}
@@ -776,6 +785,10 @@ func (s *Server) handleRunPath(w http.ResponseWriter, r *http.Request) {
 		s.handleStartQueuedRun(w, r, projectID, runID)
 		return
 	}
+	if len(parts) == 3 && parts[1] == "workflow" {
+		s.handleRunWorkflowSnapshotPath(w, r, projectID, runID, parts[2])
+		return
+	}
 	if len(parts) == 4 && parts[1] == "stages" && parts[3] == "rerun" {
 		s.handleReRunStage(w, r, projectID, runID, parts[2])
 		return
@@ -807,6 +820,7 @@ func (s *Server) handleRunDetail(w http.ResponseWriter, r *http.Request, project
 	}
 	csrf := csrfFromContext(r.Context())
 	data := web.NewRunData(bundle, csrf, "Run "+runID, r.URL.Query().Get("tab"))
+	data.View.WorkflowSnapshot = s.runWorkflowSnapshotView(r, bundle)
 	notifications, err := s.notificationCenterData(r.Context(), csrf)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

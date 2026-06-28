@@ -13,12 +13,7 @@
     <nav class="breadcrumb"><a href="/projects/{{.View.Project.ID}}">← {{.View.Project.Name}}</a></nav>
     {{template "run_summary.html" .View}}
 
-    <section class="card run-controls" aria-label="Run controls">
-      <form method="post" action="/projects/{{.View.Project.ID}}/runs/{{.View.Run.ID}}/cancel">
-        <input type="hidden" name="_csrf" value="{{.CSRF}}">
-        <button type="submit" class="danger">Cancel run</button>
-      </form>
-    </section>
+    {{template "run_controls.html" .View}}
 
     <nav class="run-tabs" aria-label="Run detail tabs">
       <a class="{{if eq .Tab "story"}}active{{end}}" href="/projects/{{.View.Project.ID}}/runs/{{.View.Run.ID}}">Story</a>

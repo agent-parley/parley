@@ -797,6 +797,7 @@ func TestConversationCreateTaskActionCreatesDirectBalancedRunLinkedToConversatio
 	if len(runs) != 1 {
 		t.Fatalf("runs = %#v, want one created run", runs)
 	}
+	freezeRunWorkflowSnapshot(t, engine, st, runs[0].ID)
 	waitForWorkflowStageAwaiting(t, st, runs[0].ID, "plan_review_human")
 	wr, err := st.GetWorkflowRun(ctx, runs[0].ID)
 	if err != nil {

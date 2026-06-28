@@ -315,7 +315,7 @@ func (e *Engine) createQueuedRun(ctx context.Context, projectID string, input co
 	if err != nil {
 		return store.WorkflowRun{}, err
 	}
-	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, template, "", "", true)); err != nil {
+	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, editableRunSnapshotTemplate(template), "", "", false)); err != nil {
 		return store.WorkflowRun{}, err
 	}
 	return wr, nil
@@ -384,6 +384,10 @@ func (e *Engine) CancelRun(ctx context.Context, runID string) error {
 	if wr.Run.Status == store.RunStatusAwaitingHuman {
 		e.queueMu.Unlock()
 		return e.cancelRunTerminal(ctx, wr, "workflow cancelled while awaiting human input")
+	}
+	if wr.Run.Status == store.RunStatusAwaitingWorkflowAdjustment {
+		e.queueMu.Unlock()
+		return e.cancelRunTerminal(ctx, wr, "workflow cancelled while awaiting workflow snapshot adjustment")
 	}
 	e.queueMu.Unlock()
 	e.markCancelling(runID)
@@ -931,6 +935,12 @@ func (e *Engine) executeRunWithOptions(ctx context.Context, runID string, opts e
 		if err != nil {
 			return err
 		}
+		if runtimeStage.Template.Type == workflow.StageTypeIdeaRefinement && rep.Status == report.StatusCompleted {
+			if err := e.pauseForWorkflowSnapshotAdjustment(context.Background(), wr, runtime.Template); err != nil {
+				return err
+			}
+			return errRunAwaitingHuman
+		}
 		if runtimeStage.Template.Type == workflow.StageTypeImplementation && rep.Status == report.StatusCompleted {
 			snapshot, snapshotErr = e.snapshotWorktree(ctx, wr, rep)
 		}
@@ -1106,7 +1116,7 @@ func (e *Engine) runIdeaIntakeStage(ctx context.Context, wr store.WorkflowRun, s
 	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
 		return report.Report{}, err
 	}
-	return e.completeIdeaIntakeWithPlan(ctx, wr, stage, template, contractArtifact.ID, taskPlanMarkdown(wr), report.Actor{Kind: report.ActorKindHarness, ID: "idea_intake"}, "idea refined into a task plan and frozen workflow snapshot")
+	return e.completeIdeaIntakeWithPlan(ctx, wr, stage, template, contractArtifact.ID, taskPlanMarkdown(wr), report.Actor{Kind: report.ActorKindHarness, ID: "idea_intake"}, "idea refined into a task plan and editable workflow snapshot")
 }
 
 func (e *Engine) runStandardIdeaPlanningStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage, template workflow.Template, contractMarkdown, contractArtifactID, briefMarkdown, briefArtifactID string) (report.Report, error) {
@@ -1158,7 +1168,7 @@ func (e *Engine) runStandardIdeaPlanningStage(ctx context.Context, wr store.Work
 	if actor.Kind == "" {
 		actor = report.Actor{Kind: report.ActorKindAgent, ID: e.planningAdapter}
 	}
-	return e.completeIdeaIntakeWithPlan(ctx, wr, stage, template, contractArtifactID, normalizePlannerTaskPlan(payloadString(plannerReport.Payload, "task_plan_markdown")), actor, "planner agent refined the idea into a task plan and frozen workflow snapshot")
+	return e.completeIdeaIntakeWithPlan(ctx, wr, stage, template, contractArtifactID, normalizePlannerTaskPlan(payloadString(plannerReport.Payload, "task_plan_markdown")), actor, "planner agent refined the idea into a task plan and editable workflow snapshot")
 }
 
 func plannerTemplateStage(template workflow.Template, stage store.Stage) workflow.StageTemplate {
@@ -1226,7 +1236,7 @@ func (e *Engine) completeIdeaIntakeWithPlan(ctx context.Context, wr store.Workfl
 		return report.Report{}, err
 	}
 	stage.TaskPlanArtifactID = planArtifact.ID
-	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, template, contractArtifactID, planArtifact.ID, true)); err != nil {
+	if err := e.store.SaveWorkflowSnapshot(ctx, wr.Run.ID, e.workflowSnapshot(wr, editableRunSnapshotTemplate(template), contractArtifactID, planArtifact.ID, false)); err != nil {
 		return report.Report{}, err
 	}
 	rep := report.Report{
@@ -1245,7 +1255,7 @@ func (e *Engine) completeIdeaIntakeWithPlan(ctx context.Context, wr store.Workfl
 			"refinement_level":          wr.Run.RefinementLevel,
 			"task_contract_artifact_id": contractArtifactID,
 			"task_plan_artifact_id":     planArtifact.ID,
-			"workflow_snapshot_frozen":  true,
+			"workflow_snapshot_frozen":  false,
 			"implementation_stage_id":   wr.ImplementationStage.ID,
 			"validation_stage_id":       wr.ValidationStage.ID,
 			"commit_stage_id":           wr.CommitStage.ID,
@@ -1815,6 +1825,8 @@ func notificationClassForEvent(ev event.Event) (string, bool) {
 			return "", false
 		}
 		return store.NotificationClassNeedsYou, true
+	case "run.awaiting_workflow_adjustment":
+		return store.NotificationClassNeedsYou, true
 	case "run.completed":
 		return store.NotificationClassFinished, true
 	case "run.failed":
@@ -1838,6 +1850,8 @@ func notificationTitle(ev event.Event, bundle store.RunBundle) string {
 	switch ev.Type {
 	case "stage.awaiting_human":
 		return "Review needed: " + idea
+	case "run.awaiting_workflow_adjustment":
+		return "Workflow adjustment needed: " + idea
 	case "run.completed":
 		return "Run completed: " + idea
 	case "run.failed":
@@ -1851,6 +1865,7 @@ func notificationTitle(ev event.Event, bundle store.RunBundle) string {
 }
 
 func (e *Engine) workflowSnapshot(wr store.WorkflowRun, template workflow.Template, taskContractArtifactID, taskPlanArtifactID string, frozen bool) map[string]any {
+	template = editableRunSnapshotTemplate(template)
 	stages, err := e.store.ListStagesForAttempt(context.Background(), wr.Run.ID, wr.Attempt.ID)
 	if err != nil || len(stages) == 0 {
 		stages = []store.Stage{wr.IdeaIntakeStage, wr.ImplementationStage, wr.ValidationStage, wr.CommitStage, wr.PRReadyStage}
@@ -1863,7 +1878,7 @@ func (e *Engine) workflowSnapshot(wr store.WorkflowRun, template workflow.Templa
 		"conversation_id":            wr.Task.ConversationID,
 		"workflow_template_id":       wr.Run.WorkflowTemplateID,
 		"workflow_template_snapshot": template,
-		"workflow_template_frozen":   true,
+		"workflow_template_frozen":   frozen,
 		"run_id":                     wr.Run.ID,
 		"task_id":                    wr.Task.ID,
 		"attempt_id":                 wr.Attempt.ID,
