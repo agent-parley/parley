@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -355,10 +356,11 @@ func (c forgeCredentialAuth) gitEnv() []string {
 	if host == "" {
 		host = "github.com"
 	}
+	basic := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + c.token))
 	return []string{
 		"GIT_CONFIG_COUNT=1",
 		"GIT_CONFIG_KEY_0=http.https://" + host + "/.extraheader",
-		"GIT_CONFIG_VALUE_0=AUTHORIZATION: bearer " + c.token,
+		"GIT_CONFIG_VALUE_0=AUTHORIZATION: basic " + basic,
 	}
 }
 

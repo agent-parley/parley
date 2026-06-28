@@ -44,7 +44,7 @@ func TestCLIForgeDeliveryUsesStoredCredentialForGHAndGitPush(t *testing.T) {
 	for _, want := range []string{
 		"gh auth status GH_TOKEN=sealed-token",
 		"git push --set-upstream https://github.com/acme/repo.git agent/test:agent/test",
-		"GIT_CONFIG_VALUE_0=AUTHORIZATION: bearer sealed-token",
+		"GIT_CONFIG_VALUE_0=AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46c2VhbGVkLXRva2Vu",
 		"gh pr merge https://github.com/acme/repo/pull/42 --merge GH_TOKEN=sealed-token",
 	} {
 		if !strings.Contains(logContent, want) {
