@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-parley/parley/internal/manager/agentregistry"
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/secrets"
 	"github.com/agent-parley/parley/internal/manager/store"
@@ -296,7 +297,11 @@ func TestWorkflowTemplateAuthoringCopyEditSaveReloadAndRejectsMalformed(t *testi
 	saveForm.Set("order_commit_feature_branch", "7")
 	saveForm.Set("order_pr_creation", "8")
 	saveForm.Set("target_change_review_agent", workflow.TargetValidationEvidence)
+	saveForm.Set("profile_id_implementation", agentregistry.ProfilePiInteractivePlanner)
 	saveForm.Set("instructions_implementation", "Prefer the smallest safe change.")
+	saveForm.Set("context_settings_implementation", `{"sources":["project_memory"]}`)
+	saveForm.Set("timeout_implementation", "45m")
+	saveForm.Set("max_attempts_implementation", "2")
 	saveForm.Set("fix_loop", "1")
 	saveForm.Set("max_fix_loops", "2")
 	saveRec := postForm(t, srv, "/templates/"+templateID+"/save", cookie, saveForm)
@@ -320,8 +325,14 @@ func TestWorkflowTemplateAuthoringCopyEditSaveReloadAndRejectsMalformed(t *testi
 	}
 	assertWorkflowStageOrder(t, saved, "implementation", "memory_update", "validation")
 	implementation := saved.Stages[workflowTemplateStageIndex(saved, "implementation")]
-	if implementation.Settings["instructions"] != "Prefer the smallest safe change." {
-		t.Fatalf("implementation instructions = %#v", implementation.Settings["instructions"])
+	if implementation.ProfileID != agentregistry.ProfilePiInteractivePlanner {
+		t.Fatalf("implementation profile_id = %q, want %q", implementation.ProfileID, agentregistry.ProfilePiInteractivePlanner)
+	}
+	if implementation.Instructions != "Prefer the smallest safe change." {
+		t.Fatalf("implementation instructions = %#v", implementation.Instructions)
+	}
+	if implementation.ContextSettings["sources"] == nil || implementation.Timeout != "45m" || implementation.MaxAttempts != 2 {
+		t.Fatalf("implementation common settings = %+v", implementation)
 	}
 	if !workflowTemplateHasEdge(saved, "implementation", "memory_update", workflow.OnCompleted) {
 		t.Fatalf("saved template did not derive implementation -> memory_update completed edge: %+v", saved.Edges)
@@ -1591,7 +1602,16 @@ func workflowTemplateSaveForm(template workflow.Template, csrf string) url.Value
 		form.Set("label_"+row.ID, row.Label)
 		form.Set("actor_"+row.ID, row.Actor)
 		form.Set("target_"+row.ID, row.Target)
+		form.Set("profile_id_"+row.ID, row.ProfileID)
 		form.Set("instructions_"+row.ID, row.Instructions)
+		if row.Required {
+			form.Set("required_"+row.ID, "1")
+		}
+		form.Set("context_settings_"+row.ID, row.ContextSettings)
+		form.Set("timeout_"+row.ID, row.Timeout)
+		if row.MaxAttempts > 0 {
+			form.Set("max_attempts_"+row.ID, strconv.Itoa(row.MaxAttempts))
+		}
 		form.Set("profile_"+row.ID, row.Profile)
 		form.Set("intensity_"+row.ID, row.Intensity)
 	}

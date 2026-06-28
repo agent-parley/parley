@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/agent-parley/parley/internal/manager/agentregistry"
 	"github.com/agent-parley/parley/internal/shared/contract"
 )
 
@@ -69,12 +71,18 @@ type Template struct {
 }
 
 type StageTemplate struct {
-	ID       string         `json:"id"`
-	Type     string         `json:"type"`
-	Label    string         `json:"label"`
-	Actor    string         `json:"actor"`
-	Target   string         `json:"target,omitempty"`
-	Settings map[string]any `json:"settings,omitempty"`
+	ID              string         `json:"id"`
+	Type            string         `json:"type"`
+	Label           string         `json:"label"`
+	Actor           string         `json:"actor"`
+	Target          string         `json:"target,omitempty"`
+	ProfileID       string         `json:"profile_id,omitempty"`
+	Instructions    string         `json:"instructions,omitempty"`
+	Required        *bool          `json:"required,omitempty"`
+	ContextSettings map[string]any `json:"context_settings,omitempty"`
+	Timeout         string         `json:"timeout,omitempty"`
+	MaxAttempts     int            `json:"max_attempts,omitempty"`
+	Settings        map[string]any `json:"settings,omitempty"`
 }
 
 type Edge struct {
@@ -118,6 +126,10 @@ func mergePolicyRequiresHumanGate(policy string) bool {
 }
 
 func NormalizeTemplate(template Template) Template {
+	return NormalizeTemplateWithRegistry(template, agentregistry.Defaults())
+}
+
+func NormalizeTemplateWithRegistry(template Template, registry agentregistry.Registry) Template {
 	template.ID = strings.TrimSpace(template.ID)
 	template.Name = strings.TrimSpace(template.Name)
 	template.Description = strings.TrimSpace(template.Description)
@@ -131,9 +143,33 @@ func NormalizeTemplate(template Template) Template {
 		stage.Label = strings.TrimSpace(stage.Label)
 		stage.Actor = strings.TrimSpace(stage.Actor)
 		stage.Target = strings.TrimSpace(stage.Target)
+		stage.ProfileID = strings.ToLower(strings.TrimSpace(stage.ProfileID))
+		stage.Instructions = strings.TrimSpace(stage.Instructions)
+		stage.Timeout = strings.TrimSpace(stage.Timeout)
+		if stage.Required == nil {
+			stage.Required = boolPtr(true)
+		}
+		if stage.MaxAttempts == 0 {
+			stage.MaxAttempts = 1
+		}
+		stage.ContextSettings = copyNonEmptyMap(stage.ContextSettings)
+		if legacyInstructions := settingString(stage.Settings, "instructions"); legacyInstructions != "" && stage.Instructions == "" {
+			stage.Instructions = legacyInstructions
+		}
 		if stage.Type == StageTypeReview {
 			stage.Target = contract.NormalizeReviewTarget(stage.Target)
-			stage.Settings = normalizeReviewSettings(stage.Settings)
+			stage.Settings = normalizeReviewSettings(stage.Settings, stage.Instructions)
+		} else {
+			stage.Settings = copyNonEmptyMap(stage.Settings)
+			delete(stage.Settings, "instructions")
+			if len(stage.Settings) == 0 {
+				stage.Settings = nil
+			}
+		}
+		if stage.Actor == ActorAgent && stage.ProfileID == "" {
+			if profileID, ok := agentregistry.DefaultProfileIDForStageType(registry, stage.Type); ok {
+				stage.ProfileID = profileID
+			}
 		}
 	}
 	for i := range template.Edges {
@@ -155,8 +191,15 @@ func DeriveTemplateEdges(template Template) []Edge {
 }
 
 func ValidateTemplate(template Template) error {
-	template = NormalizeTemplate(template)
+	return ValidateTemplateWithRegistry(template, agentregistry.Defaults())
+}
+
+func ValidateTemplateWithRegistry(template Template, registry agentregistry.Registry) error {
+	template = NormalizeTemplateWithRegistry(template, registry)
 	var errs []error
+	if err := agentregistry.Validate(registry); err != nil {
+		errs = append(errs, fmt.Errorf("agent registry is invalid: %w", err))
+	}
 	if template.SchemaVersion != SchemaVersion {
 		errs = append(errs, fmt.Errorf("schema_version must be %d", SchemaVersion))
 	}
@@ -193,6 +236,26 @@ func ValidateTemplate(template Template) error {
 		}
 		if !validActor(stage.Actor) {
 			errs = append(errs, fmt.Errorf("stage %q actor %q is invalid", stage.ID, stage.Actor))
+		}
+		if stage.Actor == ActorAgent {
+			if stage.ProfileID == "" {
+				errs = append(errs, fmt.Errorf("stage %q agent profile_id is required", stage.ID))
+			} else if _, ok := agentregistry.ProfileByID(registry, stage.ProfileID); !ok {
+				errs = append(errs, fmt.Errorf("stage %q profile_id %q does not resolve to an agent profile", stage.ID, stage.ProfileID))
+			}
+		} else if stage.ProfileID != "" {
+			errs = append(errs, fmt.Errorf("stage %q profile_id is only valid for agent stages", stage.ID))
+		}
+		if stage.MaxAttempts < 1 {
+			errs = append(errs, fmt.Errorf("stage %q max_attempts must be at least 1", stage.ID))
+		}
+		if stage.Timeout != "" {
+			duration, err := time.ParseDuration(stage.Timeout)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("stage %q timeout must be a Go duration such as 30m or 1h: %w", stage.ID, err))
+			} else if duration <= 0 {
+				errs = append(errs, fmt.Errorf("stage %q timeout must be greater than zero", stage.ID))
+			}
 		}
 		if stage.Type == StageTypeReview {
 			if err := validateReviewStageSettings(stage); err != nil {
@@ -314,24 +377,23 @@ func validEdgeOn(on string) bool {
 	}
 }
 
-func normalizeReviewSettings(settings map[string]any) map[string]any {
+func normalizeReviewSettings(settings map[string]any, instructions string) map[string]any {
 	if settings == nil {
 		settings = map[string]any{}
 	}
 	profile := settingString(settings, "profile")
 	intensity := settingString(settings, "intensity")
-	config := contract.NormalizeReviewerConfig(contract.ReviewerConfig{Profile: profile, Intensity: intensity, Instructions: settingString(settings, "instructions")})
+	if instructions == "" {
+		instructions = settingString(settings, "instructions")
+	}
+	config := contract.NormalizeReviewerConfig(contract.ReviewerConfig{Profile: profile, Intensity: intensity, Instructions: instructions})
 	out := map[string]any{}
 	for key, value := range settings {
 		out[key] = value
 	}
 	out["profile"] = config.Profile
 	out["intensity"] = config.Intensity
-	if config.Instructions != "" {
-		out["instructions"] = config.Instructions
-	} else {
-		delete(out, "instructions")
-	}
+	delete(out, "instructions")
 	delete(out, "critic_count")
 	delete(out, "arbiter_count")
 	delete(out, "reviewer_count")
@@ -347,7 +409,7 @@ func validateReviewStageSettings(stage StageTemplate) error {
 	config := contract.ReviewerConfig{
 		Profile:      settingString(stage.Settings, "profile"),
 		Intensity:    settingString(stage.Settings, "intensity"),
-		Instructions: settingString(stage.Settings, "instructions"),
+		Instructions: stage.Instructions,
 	}
 	if err := contract.ValidateReviewerConfig(config); err != nil {
 		return fmt.Errorf("stage %q review settings are invalid: %w", stage.ID, err)
@@ -383,6 +445,23 @@ func hasPriorStageType(stages []StageTemplate, index int, stageTypes ...string) 
 		}
 	}
 	return false
+}
+
+func StageRequired(stage StageTemplate) bool {
+	return stage.Required == nil || *stage.Required
+}
+
+func boolPtr(value bool) *bool { return &value }
+
+func copyNonEmptyMap(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func settingString(settings map[string]any, key string) string {
@@ -530,11 +609,17 @@ func predefined(id, name, description string, recommended bool, stages []StageTe
 		Settings:      settings,
 	}
 	template.Edges = DeriveTemplateEdges(template)
-	return template
+	return NormalizeTemplate(template)
 }
 
 func stage(id, stageType, label, actor, target string) StageTemplate {
-	return StageTemplate{ID: id, Type: stageType, Label: label, Actor: actor, Target: target}
+	stage := StageTemplate{ID: id, Type: stageType, Label: label, Actor: actor, Target: target, Required: boolPtr(true), MaxAttempts: 1}
+	if actor == ActorAgent {
+		if profileID, ok := agentregistry.DefaultProfileIDForStageType(agentregistry.Defaults(), stageType); ok {
+			stage.ProfileID = profileID
+		}
+	}
+	return stage
 }
 
 func reviewStage(id, label, actor, target string) StageTemplate {

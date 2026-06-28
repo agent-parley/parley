@@ -1042,9 +1042,39 @@ func (e *Engine) stageDispatchInput(runtime runtimeWorkflow, stage workflow.Stag
 	out["workflow_stage_label"] = stage.Label
 	out["workflow_stage_actor"] = stage.Actor
 	out["workflow_stage_target"] = stage.Target
-	out["workflow_stage_settings"] = stage.Settings
+	out["workflow_stage_profile_id"] = stage.ProfileID
+	out["workflow_stage_instructions"] = stage.Instructions
+	out["workflow_stage_required"] = workflow.StageRequired(stage)
+	out["workflow_stage_context_settings"] = stage.ContextSettings
+	out["workflow_stage_timeout"] = stage.Timeout
+	out["workflow_stage_max_attempts"] = stage.MaxAttempts
+	out["workflow_stage_settings"] = workflowStageSettingsPayload(stage)
 	addMemoryCaptureInput(out, runtime.Template, stage)
 	return out
+}
+
+func workflowStageSettingsPayload(stage workflow.StageTemplate) map[string]any {
+	settings := make(map[string]any, len(stage.Settings)+6)
+	for key, value := range stage.Settings {
+		settings[key] = value
+	}
+	if stage.ProfileID != "" {
+		settings["profile_id"] = stage.ProfileID
+	}
+	if stage.Instructions != "" {
+		settings["instructions"] = stage.Instructions
+	}
+	settings["required"] = workflow.StageRequired(stage)
+	if len(stage.ContextSettings) > 0 {
+		settings["context_settings"] = stage.ContextSettings
+	}
+	if stage.Timeout != "" {
+		settings["timeout"] = stage.Timeout
+	}
+	if stage.MaxAttempts > 0 {
+		settings["max_attempts"] = stage.MaxAttempts
+	}
+	return settings
 }
 
 func (e *Engine) runIdeaIntake(ctx context.Context, wr store.WorkflowRun) (report.Report, error) {
@@ -1515,14 +1545,10 @@ func (e *Engine) workflowStageSettingsForBrief(ctx context.Context, runID string
 		return nil
 	}
 	for _, templateStage := range template.Stages {
-		if templateStage.ID != stage.WorkflowStageID || len(templateStage.Settings) == 0 {
+		if templateStage.ID != stage.WorkflowStageID {
 			continue
 		}
-		settings := make(map[string]any, len(templateStage.Settings))
-		for key, value := range templateStage.Settings {
-			settings[key] = value
-		}
-		return settings
+		return workflowStageSettingsPayload(templateStage)
 	}
 	return nil
 }

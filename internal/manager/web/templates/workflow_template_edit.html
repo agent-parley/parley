@@ -114,7 +114,29 @@
                   <option value="human" {{if eq .Actor "human"}}selected{{end}}>Human</option>
                 </select>
               </label>
+              {{if .Agent}}
+              <label>Agent profile
+                <select name="profile_id_{{.ID}}">
+                  {{$row := .}}
+                  {{range $.AgentProfiles}}
+                  <option value="{{.ID}}" {{if eq $row.ProfileID .ID}}selected{{end}}>{{.Name}}</option>
+                  {{end}}
+                </select>
+              </label>
+              {{end}}
             </div>
+            <div class="stage-settings-grid">
+              <label class="checkbox-line"><input type="checkbox" name="required_{{.ID}}" value="1" {{if .Required}}checked{{end}}> Required to continue</label>
+              <label>Timeout
+                <input name="timeout_{{.ID}}" value="{{.Timeout}}" placeholder="e.g. 30m">
+              </label>
+              <label>Max attempts
+                <input type="number" min="1" name="max_attempts_{{.ID}}" value="{{.MaxAttempts}}">
+              </label>
+            </div>
+            <label>Context settings JSON
+              <textarea name="context_settings_{{.ID}}" rows="2" placeholder="Optional JSON object for advanced context toggles.">{{.ContextSettings}}</textarea>
+            </label>
             {{if .Review}}
             <div class="stage-settings-grid">
               <label>Review target

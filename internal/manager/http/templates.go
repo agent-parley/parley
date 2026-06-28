@@ -1,6 +1,7 @@
 package managerhttp
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/agent-parley/parley/internal/manager/agentregistry"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
 	"github.com/agent-parley/parley/internal/manager/workflow"
@@ -171,6 +173,7 @@ func (s *Server) workflowTemplateEditData(r *http.Request, template workflow.Tem
 		Settings:      workflowTemplateSettingsData(template.Settings),
 		StageRows:     workflowTemplateStageRows(template),
 		ReviewTargets: contract.ReviewTargetOptions(),
+		AgentProfiles: agentregistry.Defaults().Profiles,
 		SavePath:      "/templates/" + url.PathEscape(template.ID) + "/save",
 		Notifications: notifications,
 		Notice:        notice,
@@ -239,12 +242,30 @@ func workflowTemplateFromForm(r *http.Request, current workflow.Template) (workf
 		} else {
 			stage.Target = ""
 		}
+		stage.Instructions = strings.TrimSpace(r.Form.Get("instructions_" + fieldKey))
+		stage.ProfileID = ""
+		if stage.Actor == workflow.ActorAgent {
+			stage.ProfileID = strings.TrimSpace(r.Form.Get("profile_id_" + fieldKey))
+		}
+		required := r.Form.Get("required_"+fieldKey) != ""
+		stage.Required = &required
+		contextSettings, err := parseWorkflowStageContextSettings(r.Form.Get("context_settings_" + fieldKey))
+		if err != nil {
+			return workflow.Template{}, fmt.Errorf("stage %q context_settings %w", stageID, err)
+		}
+		stage.ContextSettings = contextSettings
+		stage.Timeout = strings.TrimSpace(r.Form.Get("timeout_" + fieldKey))
+		maxAttempts, err := parseWorkflowStageMaxAttempts(r.Form.Get("max_attempts_" + fieldKey))
+		if err != nil {
+			return workflow.Template{}, fmt.Errorf("stage %q max_attempts %w", stageID, err)
+		}
+		stage.MaxAttempts = maxAttempts
 		if existingStage, ok := existing[stageID]; !ok || existingStage.Type != stage.Type {
 			stage.Settings = defaultWorkflowStageSettings(stage.Type)
 		} else {
 			stage.Settings = copySettings(existingStage.Settings)
 		}
-		setStringSetting(stage.Settings, "instructions", r.Form.Get("instructions_"+fieldKey))
+		delete(stage.Settings, "instructions")
 		if stage.Type == workflow.StageTypeReview {
 			setStringSetting(stage.Settings, "profile", r.Form.Get("profile_"+fieldKey))
 			setStringSetting(stage.Settings, "intensity", r.Form.Get("intensity_"+fieldKey))
@@ -312,6 +333,33 @@ func parseWorkflowStageOrder(raw string) (int, error) {
 	return order, nil
 }
 
+func parseWorkflowStageContextSettings(raw string) (map[string]any, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var settings map[string]any
+	if err := json.Unmarshal([]byte(raw), &settings); err != nil {
+		return nil, fmt.Errorf("must be a JSON object")
+	}
+	if len(settings) == 0 {
+		return nil, nil
+	}
+	return settings, nil
+}
+
+func parseWorkflowStageMaxAttempts(raw string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 1, nil
+	}
+	attempts, err := strconv.Atoi(raw)
+	if err != nil || attempts < 1 {
+		return 0, fmt.Errorf("must be a positive integer")
+	}
+	return attempts, nil
+}
+
 func workflowTemplateStageRows(template workflow.Template) []web.WorkflowTemplateStageRowData {
 	template = workflow.NormalizeTemplate(template)
 	existingIDs := map[string]bool{}
@@ -360,22 +408,39 @@ func workflowTemplateStageRow(stage workflow.StageTemplate, order int, enabled b
 	stage = workflow.NormalizeTemplate(workflow.Template{Stages: []workflow.StageTemplate{stage}}).Stages[0]
 	mandatory := workflowStageAlwaysEnabled(stage.Type)
 	return web.WorkflowTemplateStageRowData{
-		ID:           stage.ID,
-		Type:         stage.Type,
-		Label:        stage.Label,
-		Actor:        stage.Actor,
-		Target:       stage.Target,
-		Order:        order,
-		Enabled:      enabled || mandatory,
-		Existing:     existing,
-		Mandatory:    mandatory,
-		Disableable:  !mandatory,
-		Reorderable:  stage.Type != workflow.StageTypeIdeaRefinement && stage.Type != workflow.StageTypeStopReport,
-		Review:       stage.Type == workflow.StageTypeReview,
-		Instructions: settingString(stage.Settings, "instructions"),
-		Profile:      settingString(stage.Settings, "profile"),
-		Intensity:    settingString(stage.Settings, "intensity"),
+		ID:              stage.ID,
+		Type:            stage.Type,
+		Label:           stage.Label,
+		Actor:           stage.Actor,
+		Target:          stage.Target,
+		Order:           order,
+		Enabled:         enabled || mandatory,
+		Existing:        existing,
+		Mandatory:       mandatory,
+		Disableable:     !mandatory,
+		Reorderable:     stage.Type != workflow.StageTypeIdeaRefinement && stage.Type != workflow.StageTypeStopReport,
+		Agent:           stage.Actor == workflow.ActorAgent,
+		Review:          stage.Type == workflow.StageTypeReview,
+		Instructions:    stage.Instructions,
+		ProfileID:       stage.ProfileID,
+		Required:        workflow.StageRequired(stage),
+		ContextSettings: workflowTemplateContextSettingsValue(stage.ContextSettings),
+		Timeout:         stage.Timeout,
+		MaxAttempts:     stage.MaxAttempts,
+		Profile:         settingString(stage.Settings, "profile"),
+		Intensity:       settingString(stage.Settings, "intensity"),
 	}
+}
+
+func workflowTemplateContextSettingsValue(settings map[string]any) string {
+	if len(settings) == 0 {
+		return ""
+	}
+	content, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return ""
+	}
+	return string(content)
 }
 
 func optionalWorkflowStages() []workflow.StageTemplate {

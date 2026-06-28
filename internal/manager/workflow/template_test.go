@@ -1,9 +1,11 @@
 package workflow
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
+	"github.com/agent-parley/parley/internal/manager/agentregistry"
 	"github.com/agent-parley/parley/internal/shared/contract"
 )
 
@@ -47,6 +49,9 @@ func TestPredefinedTemplatesValidateAndExposeFiveDeliveryPatterns(t *testing.T) 
 			}
 		}
 		for _, stage := range template.Stages {
+			if stage.Actor == ActorAgent && stage.ProfileID == "" {
+				t.Fatalf("agent stage %s/%s has no profile_id", template.ID, stage.ID)
+			}
 			if stage.Type != StageTypeReview {
 				continue
 			}
@@ -204,6 +209,79 @@ func TestReviewProfileDefaultsAndValidation(t *testing.T) {
 	bad.Settings["profile"] = "custom"
 	if err := ValidateTemplate(validTemplateForTest("bad", bad)); err == nil {
 		t.Fatal("ValidateTemplate accepted custom review profile")
+	}
+}
+
+func TestStageTemplateCommonFieldDefaultingAndValidation(t *testing.T) {
+	template := validTemplateForTest("defaults", StageTemplate{ID: "implementation", Type: StageTypeImplementation, Label: "Implementation", Actor: ActorAgent})
+	normalized := NormalizeTemplate(template)
+	impl := normalized.Stages[1]
+	if impl.ProfileID != agentregistry.ProfilePiHeadlessWorker {
+		t.Fatalf("implementation profile_id = %q, want %q", impl.ProfileID, agentregistry.ProfilePiHeadlessWorker)
+	}
+	if !StageRequired(impl) {
+		t.Fatalf("implementation required = false, want default true")
+	}
+	if impl.MaxAttempts != 1 {
+		t.Fatalf("implementation max_attempts = %d, want 1", impl.MaxAttempts)
+	}
+
+	badProfile := normalized
+	badProfile.Stages[1].ProfileID = "missing_profile"
+	assertValidateTemplateError(t, badProfile, "does not resolve to an agent profile")
+
+	harnessProfile := normalized
+	harnessProfile.Stages[1].Actor = ActorHarness
+	harnessProfile.Stages[1].ProfileID = agentregistry.ProfilePiHeadlessWorker
+	assertValidateTemplateError(t, harnessProfile, "profile_id is only valid for agent stages")
+
+	badAttempts := normalized
+	badAttempts.Stages[1].MaxAttempts = -1
+	assertValidateTemplateError(t, badAttempts, "max_attempts must be at least 1")
+
+	badTimeout := normalized
+	badTimeout.Stages[1].Timeout = "soon"
+	assertValidateTemplateError(t, badTimeout, "timeout must be a Go duration")
+
+	for _, timeout := range []string{"0s", "-30m"} {
+		badTimeout := normalized
+		badTimeout.Stages[1].Timeout = timeout
+		assertValidateTemplateError(t, badTimeout, "timeout must be greater than zero")
+	}
+}
+
+func TestStageTemplateCommonFieldsRoundTrip(t *testing.T) {
+	required := false
+	template := validTemplateForTest("round_trip", StageTemplate{
+		ID:              "implementation",
+		Type:            StageTypeImplementation,
+		Label:           "Implementation",
+		Actor:           ActorAgent,
+		ProfileID:       agentregistry.ProfilePiInteractivePlanner,
+		Instructions:    "Prefer focused changes.",
+		Required:        &required,
+		ContextSettings: map[string]any{"sources": []any{"project_memory"}},
+		Timeout:         "45m",
+		MaxAttempts:     2,
+	})
+	content, err := json.Marshal(NormalizeTemplate(template))
+	if err != nil {
+		t.Fatalf("marshal template: %v", err)
+	}
+	var decoded Template
+	if err := json.Unmarshal(content, &decoded); err != nil {
+		t.Fatalf("unmarshal template: %v", err)
+	}
+	decoded = NormalizeTemplate(decoded)
+	if err := ValidateTemplate(decoded); err != nil {
+		t.Fatalf("ValidateTemplate(round trip) error = %v", err)
+	}
+	impl := decoded.Stages[1]
+	if impl.ProfileID != agentregistry.ProfilePiInteractivePlanner || impl.Instructions != "Prefer focused changes." || StageRequired(impl) || impl.Timeout != "45m" || impl.MaxAttempts != 2 {
+		t.Fatalf("round-tripped implementation = %+v", impl)
+	}
+	if got := impl.ContextSettings["sources"]; got == nil {
+		t.Fatalf("round-tripped context_settings missing sources: %+v", impl.ContextSettings)
 	}
 }
 

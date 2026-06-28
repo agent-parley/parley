@@ -117,7 +117,7 @@ func humanReviewReport(wr store.WorkflowRun, stage store.Stage, templateStage wo
 		"workflow_stage_label":    templateStage.Label,
 		"workflow_stage_actor":    templateStage.Actor,
 		"workflow_stage_target":   templateStage.Target,
-		"workflow_stage_settings": templateStage.Settings,
+		"workflow_stage_settings": workflowStageSettingsPayload(templateStage),
 		"accepted_findings":       humanFindingsPayload(submission.Findings),
 		"human_arbiter":           true,
 	}
@@ -221,11 +221,12 @@ func (e *Engine) suspendForHumanReview(ctx context.Context, wr store.WorkflowRun
 		"workflow_stage_id":        templateStage.ID,
 		"workflow_stage_label":     templateStage.Label,
 		"workflow_stage_target":    templateStage.Target,
+		"workflow_stage_settings":  workflowStageSettingsPayload(templateStage),
 		"stage_brief_artifact_id":  briefArtifact.ID,
 		"allowed_verdicts":         []string{string(report.ReviewVerdictPass), string(report.ReviewVerdictChangesRequested), string(report.ReviewVerdictBlocked)},
 		"human_is_arbiter":         true,
 		"repair_loop":              false,
-		"timeout":                  nil,
+		"timeout":                  templateStage.Timeout,
 		"human_fix_loops_counted":  false,
 		"submission_endpoint_hint": fmt.Sprintf("/runs/%s/human-stages/%s/verdict", wr.Run.ID, stage.ID),
 	}

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"github.com/agent-parley/parley/internal/manager/agentregistry"
 	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 )
@@ -30,6 +31,7 @@ type WorkflowTemplateEditData struct {
 	Settings      WorkflowTemplateSettingsData
 	StageRows     []WorkflowTemplateStageRowData
 	ReviewTargets []contract.ReviewTargetOption
+	AgentProfiles []agentregistry.Profile
 	SavePath      string
 	Notifications NotificationCenterData
 	Notice        *Notice
@@ -47,19 +49,25 @@ type WorkflowTemplateSettingsData struct {
 }
 
 type WorkflowTemplateStageRowData struct {
-	ID           string
-	Type         string
-	Label        string
-	Actor        string
-	Target       string
-	Order        int
-	Enabled      bool
-	Existing     bool
-	Mandatory    bool
-	Disableable  bool
-	Reorderable  bool
-	Review       bool
-	Instructions string
-	Profile      string
-	Intensity    string
+	ID              string
+	Type            string
+	Label           string
+	Actor           string
+	Target          string
+	Order           int
+	Enabled         bool
+	Existing        bool
+	Mandatory       bool
+	Disableable     bool
+	Reorderable     bool
+	Agent           bool
+	Review          bool
+	Instructions    string
+	ProfileID       string
+	Required        bool
+	ContextSettings string
+	Timeout         string
+	MaxAttempts     int
+	Profile         string
+	Intensity       string
 }
