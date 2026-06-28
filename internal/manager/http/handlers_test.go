@@ -1586,6 +1586,8 @@ func workflowTemplateSaveForm(template workflow.Template, csrf string) url.Value
 	form.Set("branch_policy", settings.BranchPolicy)
 	form.Set("pr_behavior", settings.PRBehavior)
 	form.Set("merge_policy", settings.MergePolicy)
+	form.Set("required_checks", settings.RequiredChecks)
+	form.Set("forge_credential", settings.ForgeCredential)
 	if settings.FixLoop {
 		form.Set("fix_loop", "1")
 	}

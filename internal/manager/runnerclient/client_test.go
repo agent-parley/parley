@@ -163,20 +163,22 @@ func TestDispatchContextCancelSendsCancelAttempt(t *testing.T) {
 		t.Fatal("server did not receive dispatch before timeout")
 	}
 	cancel()
+	dispatchReturnDeadline := time.After(30 * time.Second)
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("dispatch error = %v, want context.Canceled", err)
 		}
-	case <-h.ctx.Done():
+	case <-dispatchReturnDeadline:
 		t.Fatal("dispatch did not return after cancellation")
 	}
+	cancelSeenDeadline := time.After(30 * time.Second)
 	select {
 	case got := <-cancelSeen:
 		if got.RunID != disp.RunID || got.TaskID != disp.TaskID || got.AttemptID != disp.AttemptID {
 			t.Fatalf("cancel payload = %+v, want dispatch attempt", got)
 		}
-	case <-h.ctx.Done():
+	case <-cancelSeenDeadline:
 		t.Fatal("server did not receive cancel attempt")
 	}
 }
