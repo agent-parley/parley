@@ -401,7 +401,7 @@ func balancedPRDelivery() Template {
 		"fix_loop":      true,
 		"max_fix_loops": 3,
 	}
-	return predefined(BalancedPRDeliveryID, "Balanced PR Delivery", "Recommended branch-and-PR workflow with human plan review and agent code review.", true, stages, reviewEscalationEdges(stages, fixLoopEdges(stages, defaultEdges(stages))), settings)
+	return predefined(BalancedPRDeliveryID, "Balanced PR Delivery", "Recommended branch-and-PR workflow with human plan review and agent code review.", true, stages, settings)
 }
 
 func autonomousPRDelivery() Template {
@@ -415,8 +415,7 @@ func autonomousPRDelivery() Template {
 		stage("memory_update", StageTypeMemoryUpdate, "Memory update", ActorAgent, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	edges := reviewEscalationEdges(stages, fixLoopEdges(stages, defaultEdges(stages)))
-	return predefined(AutonomousPRDeliveryID, "Autonomous PR Delivery", "Unattended PR workflow with agent review, fix loop, and memory update.", false, stages, edges, map[string]any{
+	return predefined(AutonomousPRDeliveryID, "Autonomous PR Delivery", "Unattended PR workflow with agent review, fix loop, and memory update.", false, stages, map[string]any{
 		"branch_policy": "feature_branch",
 		"pr_behavior":   "create_pr",
 		"fix_loop":      true,
@@ -437,7 +436,7 @@ func carefulReviewDelivery() Template {
 		stage("pr_creation", StageTypePRCreation, "PR creation", ActorHarness, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	return predefined(CarefulReviewID, "Careful Review Delivery", "Branch-and-PR workflow with human review before implementation and before PR handoff.", false, stages, reviewEscalationEdges(stages, fixLoopEdges(stages, defaultEdges(stages))), map[string]any{
+	return predefined(CarefulReviewID, "Careful Review Delivery", "Branch-and-PR workflow with human review before implementation and before PR handoff.", false, stages, map[string]any{
 		"branch_policy": "feature_branch",
 		"pr_behavior":   "create_pr",
 		"review_depth":  "careful",
@@ -456,7 +455,7 @@ func directCommitDelivery() Template {
 		stage("memory_update", StageTypeMemoryUpdate, "Memory update", ActorAgent, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	return predefined(DirectCommitID, "Direct Commit Delivery", "Advanced opt-in workflow that commits to a target branch instead of creating a PR.", false, stages, reviewEscalationEdges(stages, fixLoopEdges(stages, defaultEdges(stages))), map[string]any{
+	return predefined(DirectCommitID, "Direct Commit Delivery", "Advanced opt-in workflow that commits to a target branch instead of creating a PR.", false, stages, map[string]any{
 		"advanced":      true,
 		"branch_policy": "target_branch",
 		"pr_behavior":   "none",
@@ -474,7 +473,7 @@ func quickFixDelivery() Template {
 		stage("pr_creation", StageTypePRCreation, "PR creation", ActorHarness, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	return predefined(QuickFixDeliveryID, "Quick Fix Delivery", "Slim branch-and-PR workflow for trivial fixes with PR merge as the human gate.", false, stages, defaultEdges(stages), map[string]any{
+	return predefined(QuickFixDeliveryID, "Quick Fix Delivery", "Slim branch-and-PR workflow for trivial fixes with PR merge as the human gate.", false, stages, map[string]any{
 		"branch_policy": "feature_branch",
 		"pr_behavior":   "create_pr",
 		"merge_policy":  "human_stop",
@@ -482,8 +481,8 @@ func quickFixDelivery() Template {
 	})
 }
 
-func predefined(id, name, description string, recommended bool, stages []StageTemplate, edges []Edge, settings map[string]any) Template {
-	return Template{
+func predefined(id, name, description string, recommended bool, stages []StageTemplate, settings map[string]any) Template {
+	template := Template{
 		SchemaVersion: SchemaVersion,
 		ID:            id,
 		Name:          name,
@@ -492,9 +491,10 @@ func predefined(id, name, description string, recommended bool, stages []StageTe
 		Recommended:   recommended,
 		Editable:      false,
 		Stages:        stages,
-		Edges:         edges,
 		Settings:      settings,
 	}
+	template.Edges = DeriveTemplateEdges(template)
+	return template
 }
 
 func stage(id, stageType, label, actor, target string) StageTemplate {

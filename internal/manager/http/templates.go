@@ -114,7 +114,12 @@ func (s *Server) handleWorkflowTemplateSave(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if err := workflow.ValidateTemplate(updated); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		data, dataErr := s.workflowTemplateEditData(r, updated, nil, err.Error())
+		if dataErr != nil {
+			http.Error(w, dataErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.writePageStatus(w, "workflow_template_edit.html", data, http.StatusBadRequest)
 		return
 	}
 	if err := s.store.UpdateWorkflowTemplate(r.Context(), updated); err != nil {
