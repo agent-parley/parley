@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/agent-parley/parley/internal/shared/contract"
@@ -161,9 +162,9 @@ func TestReviewProfileDefaultsAndValidation(t *testing.T) {
 		stage := reviewStage("review_"+profile, "Review", ActorAgent, TargetCodeChanges)
 		stage.Settings["profile"] = profile
 		delete(stage.Settings, "intensity")
-		template := Template{SchemaVersion: SchemaVersion, ID: "t_" + profile, Name: "T", Editable: true, Stages: []StageTemplate{stage}, Edges: []Edge{}}
+		template := validTemplateForTest("t_"+profile, stage)
 		normalized := NormalizeTemplate(template)
-		if got := normalized.Stages[0].Settings["intensity"]; got != intensity {
+		if got := normalized.Stages[1].Settings["intensity"]; got != intensity {
 			t.Fatalf("default intensity for %s = %v, want %s", profile, got, intensity)
 		}
 		if err := ValidateTemplate(normalized); err != nil {
@@ -172,9 +173,47 @@ func TestReviewProfileDefaultsAndValidation(t *testing.T) {
 	}
 	bad := reviewStage("bad", "Bad", ActorAgent, TargetCodeChanges)
 	bad.Settings["profile"] = "custom"
-	if err := ValidateTemplate(Template{SchemaVersion: SchemaVersion, ID: "bad", Name: "Bad", Editable: true, Stages: []StageTemplate{bad}}); err == nil {
+	if err := ValidateTemplate(validTemplateForTest("bad", bad)); err == nil {
 		t.Fatal("ValidateTemplate accepted custom review profile")
 	}
+}
+
+func TestValidateTemplateStructuralInvariant(t *testing.T) {
+	t.Run("rejects duplicate start", func(t *testing.T) {
+		template := validTemplateForTest("duplicate_start", stage("implementation", StageTypeImplementation, "Implementation", ActorAgent, ""))
+		template.Stages = append([]StageTemplate{stage("second_start", StageTypeIdeaRefinement, "Second start", ActorHarness, "")}, template.Stages...)
+		template.Edges = DeriveTemplateEdges(template)
+		assertValidateTemplateError(t, template, "exactly one idea_refinement")
+	})
+	t.Run("rejects inbound edge to start", func(t *testing.T) {
+		template := validTemplateForTest("inbound_start", stage("implementation", StageTypeImplementation, "Implementation", ActorAgent, ""))
+		template.Edges = append(template.Edges, Edge{From: "implementation", To: "idea_refinement", On: OnBlocked})
+		assertValidateTemplateError(t, template, "must have no inbound edges")
+	})
+	t.Run("rejects duplicate end", func(t *testing.T) {
+		template := validTemplateForTest("duplicate_end", stage("implementation", StageTypeImplementation, "Implementation", ActorAgent, ""))
+		template.Stages = append(template.Stages, stage("second_stop", StageTypeStopReport, "Second stop", ActorHarness, ""))
+		template.Edges = DeriveTemplateEdges(template)
+		assertValidateTemplateError(t, template, "exactly one stop_report")
+	})
+	t.Run("rejects orphan", func(t *testing.T) {
+		template := validTemplateForTest("orphan", stage("implementation", StageTypeImplementation, "Implementation", ActorAgent, ""))
+		template.Stages = append(template.Stages[:len(template.Stages)-1], stage("orphan_review", StageTypeReview, "Orphan review", ActorAgent, TargetCodeChanges), template.Stages[len(template.Stages)-1])
+		assertValidateTemplateError(t, template, "not reachable from idea_refinement")
+	})
+	t.Run("rejects dead end", func(t *testing.T) {
+		template := validTemplateForTest("dead_end", stage("implementation", StageTypeImplementation, "Implementation", ActorAgent, ""))
+		template.Edges = []Edge{{From: "idea_refinement", To: "implementation", On: OnCompleted}}
+		assertValidateTemplateError(t, template, "stop_report end stage")
+	})
+	t.Run("allows fix loop cycle", func(t *testing.T) {
+		template := validTemplateForTest("fix_loop", stage("implementation", StageTypeImplementation, "Implementation", ActorAgent, ""), stage("validation", StageTypeValidation, "Validation", ActorHarness, ""))
+		template.Settings["fix_loop"] = true
+		template.Edges = DeriveTemplateEdges(template)
+		if err := ValidateTemplate(template); err != nil {
+			t.Fatalf("ValidateTemplate rejected valid fix-loop cycle: %v", err)
+		}
+	})
 }
 
 func TestValidateTemplateRejectsUnstructuredGraph(t *testing.T) {
@@ -190,5 +229,25 @@ func TestValidateTemplateRejectsUnstructuredGraph(t *testing.T) {
 	}
 	if err := ValidateTemplate(template); err == nil {
 		t.Fatal("ValidateTemplate() succeeded, want error")
+	}
+}
+
+func validTemplateForTest(id string, middle ...StageTemplate) Template {
+	stages := []StageTemplate{stage("idea_refinement", StageTypeIdeaRefinement, "Idea refinement", ActorHarness, "")}
+	stages = append(stages, middle...)
+	stages = append(stages, stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""))
+	template := Template{SchemaVersion: SchemaVersion, ID: id, Name: "Test template", Editable: true, Stages: stages, Settings: map[string]any{"fix_loop": false}}
+	template.Edges = DeriveTemplateEdges(template)
+	return template
+}
+
+func assertValidateTemplateError(t *testing.T, template Template, want string) {
+	t.Helper()
+	err := ValidateTemplate(template)
+	if err == nil {
+		t.Fatalf("ValidateTemplate() succeeded, want error containing %q", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("ValidateTemplate() error = %v, want substring %q", err, want)
 	}
 }

@@ -71,9 +71,13 @@ func newRuntimeGraph(template workflow.Template) (runtimeGraph, error) {
 		return runtimeGraph{}, fmt.Errorf("workflow template has no stages")
 	}
 	stageIDs := map[string]bool{}
+	startID := ""
 	stopID := ""
 	for _, stage := range template.Stages {
 		stageIDs[stage.ID] = true
+		if stage.Type == workflow.StageTypeIdeaRefinement && startID == "" {
+			startID = stage.ID
+		}
 		if stage.Type == workflow.StageTypeStopReport && stopID == "" {
 			stopID = stage.ID
 		}
@@ -89,7 +93,7 @@ func newRuntimeGraph(template workflow.Template) (runtimeGraph, error) {
 		}
 		edges[key] = edge.To
 	}
-	return runtimeGraph{start: template.Stages[0].ID, stopID: stopID, edges: edges}, nil
+	return runtimeGraph{start: startID, stopID: stopID, edges: edges}, nil
 }
 
 func (g runtimeGraph) Start() string { return g.start }

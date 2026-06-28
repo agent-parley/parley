@@ -10,7 +10,7 @@
 <body data-signals:csrf="'{{.CSRF}}'" data-on:load="@get('/notifications/events', {openWhenHidden: true}); @get('/projects/{{.Project.ID}}/chat/events', {openWhenHidden: true})">
   {{template "notifications_center.html" .Notifications}}
   <main>
-    <header><h1>{{.Project.Name}}</h1><p><a href="/projects">Projects</a> · <a href="/projects/{{.Project.ID}}/settings">Project Settings</a> · <a href="/settings">System Settings</a> · Project workspace: <code>{{.Project.WorkspacePath}}</code></p></header>
+    <header><h1>{{.Project.Name}}</h1><p><a href="/projects">Projects</a> · <a href="/templates">Workflow Templates</a> · <a href="/projects/{{.Project.ID}}/settings">Project Settings</a> · <a href="/settings">System Settings</a> · Project workspace: <code>{{.Project.WorkspacePath}}</code></p></header>
     {{with .Notice}}
     <section class="notice" role="status" aria-live="polite">
       <strong>{{.Title}}</strong>
