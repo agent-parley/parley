@@ -816,6 +816,23 @@ func parsePiReportErrors(raw json.RawMessage) ([]string, error) {
 }
 
 func invalidPiReport(disp contract.Dispatch, validationErr error) report.Report {
+	payload := map[string]any{"adapter": piName}
+	if disp.StageType == contract.StageTypeValidation {
+		payload[report.ValidationOutputPayloadKey] = report.ValidationOutput{
+			Result: report.ValidationResultFailed,
+			ChecksRun: []report.ValidationCheck{{
+				Name:    "pi report schema validation",
+				Status:  report.ValidationCheckFailed,
+				Summary: "pi worker did not produce a valid report.json",
+			}},
+			Outputs:             []report.ValidationOutputRef{},
+			Failures:            []report.ValidationFailure{{Check: "pi report schema validation", Message: validationErr.Error(), Severity: "error"}},
+			Skipped:             []report.ValidationSkippedCheck{},
+			EnvNotes:            []string{},
+			Confidence:          report.ValidationConfidenceLow,
+			SuggestedNextAction: "repair validation report output before trusting validation evidence",
+		}
+	}
 	return report.Report{
 		SchemaVersion: report.SchemaVersion,
 		RunID:         disp.RunID,
@@ -828,7 +845,7 @@ func invalidPiReport(disp contract.Dispatch, validationErr error) report.Report 
 		Verdict:       nil,
 		Summary:       "pi worker did not produce a valid report.json",
 		EvidenceRefs:  []string{},
-		Payload:       map[string]any{"adapter": piName},
+		Payload:       payload,
 		Errors:        []string{validationErr.Error()},
 	}
 }
@@ -930,6 +947,8 @@ func workerInputMarkdown(disp contract.Dispatch, reportPath string) string {
 		appendPlanningRequiredReport(&b, disp, reportPath)
 	} else if disp.StageType == contract.StageTypeReview {
 		appendReviewRequiredReport(&b, disp, reportPath)
+	} else if disp.StageType == contract.StageTypeValidation {
+		appendValidationRequiredReport(&b, reportPath)
 	} else {
 		appendDefaultRequiredReport(&b, reportPath)
 	}
@@ -1073,6 +1092,14 @@ func appendDefaultRequiredReport(b *strings.Builder, reportPath string) {
 	b.WriteString("{\n  \"status\": \"completed\",\n  \"summary\": \"short implementation summary\",\n  \"errors\": []\n}\n")
 	b.WriteString("```\n\n")
 	b.WriteString("Allowed status values: `completed`, `failed`, `needs_input`, `invalid`. If status is `failed` or `invalid`, `errors` must be non-empty.\n")
+}
+
+func appendValidationRequiredReport(b *strings.Builder, reportPath string) {
+	fmt.Fprintf(b, "Write exactly one report file at `%s`. The report must include typed validation evidence under `payload.validation_output`:\n\n", reportPath)
+	b.WriteString("```json\n")
+	b.WriteString("{\n  \"status\": \"completed\",\n  \"summary\": \"validation passed\",\n  \"evidence_refs\": [],\n  \"payload\": {\n    \"validation_output\": {\n      \"result\": \"passed\",\n      \"checks_run\": [{\"name\": \"go test ./...\", \"status\": \"passed\", \"summary\": \"tests passed\"}],\n      \"outputs\": [],\n      \"failures\": [],\n      \"skipped\": [],\n      \"env_notes\": [],\n      \"confidence\": \"high\",\n      \"suggested_next_action\": \"continue\"\n    }\n  },\n  \"errors\": []\n}\n")
+	b.WriteString("```\n\n")
+	b.WriteString("Allowed status values: `completed`, `failed`, `needs_input`, `invalid`. `payload.validation_output.result` must be `passed`, `failed`, or `inconclusive`; use `passed` with status `completed`, `failed` with status `failed`, and `inconclusive` with status `needs_input`. `checks_run` must list at least one check; `confidence` must be `high`, `medium`, `low`, or `unknown`; and `suggested_next_action` must be non-empty. If status is `failed` or result is `failed`, include at least one typed item in `payload.validation_output.failures` with a non-empty `message`; do not rely only on top-level `errors`.\n")
 }
 
 func appendReviewRequiredReport(b *strings.Builder, disp contract.Dispatch, reportPath string) {

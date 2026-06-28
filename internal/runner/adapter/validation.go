@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/agent-parley/parley/internal/runner/provider"
 	"github.com/agent-parley/parley/internal/runner/runnerio"
@@ -124,6 +125,7 @@ func (a Validation) Run(ctx context.Context, disp contract.Dispatch, sink runner
 			errors = append(errors, runErr.Error())
 		}
 	}
+	payload[report.ValidationOutputPayloadKey] = validationOutput(prepared, status, exitZero, diffNonEmpty, diffID, errors)
 	if err := sink.Emit(ctx, validationEvent(disp, "sandboxed validation completed", map[string]any{"status": status, "diff_artifact_id": diffID})); err != nil {
 		return report.Report{}, err
 	}
@@ -241,9 +243,106 @@ func validationPayload(prepared ValidationPreparedRun, result provider.Result, r
 	return payload
 }
 
+func validationOutput(prepared ValidationPreparedRun, status string, exitZero, diffNonEmpty bool, diffID string, reportErrors []string) report.ValidationOutput {
+	commandStatus := report.ValidationCheckPassed
+	if !exitZero {
+		commandStatus = report.ValidationCheckFailed
+	}
+	diffStatus := report.ValidationCheckPassed
+	if !diffNonEmpty {
+		diffStatus = report.ValidationCheckFailed
+	}
+	checks := []report.ValidationCheck{
+		{Name: "validation command", Status: commandStatus, Command: prepared.Command, Summary: validationCommandSummary(exitZero)},
+		{Name: "worktree diff", Status: diffStatus, Summary: validationDiffSummary(diffNonEmpty), OutputRefs: nonEmptyStrings(diffID)},
+	}
+	outputs := []report.ValidationOutputRef{}
+	if diffID != "" {
+		outputs = append(outputs, report.ValidationOutputRef{ID: diffID, Name: "diff.patch", Kind: "diff_patch", MediaType: "text/x-diff", Summary: "validation-stage worktree diff"})
+	}
+	result := report.ValidationResultPassed
+	confidence := report.ValidationConfidenceHigh
+	nextAction := "continue to commit"
+	failures := []report.ValidationFailure{}
+	if status != report.StatusCompleted {
+		result = report.ValidationResultFailed
+		confidence = report.ValidationConfidenceMedium
+		nextAction = "return to implementation with typed validation failures"
+		for _, message := range reportErrors {
+			failures = append(failures, report.ValidationFailure{Check: validationFailureCheck(message), Message: message, Severity: "error", OutputRefs: nonEmptyStrings(diffID)})
+		}
+	}
+	return report.ValidationOutput{
+		Result:              result,
+		ChecksRun:           checks,
+		Outputs:             outputs,
+		Failures:            failures,
+		Skipped:             []report.ValidationSkippedCheck{},
+		EnvNotes:            []string{fmt.Sprintf("network=%s", prepared.Invocation.Network)},
+		Confidence:          confidence,
+		SuggestedNextAction: nextAction,
+	}
+}
+
+func validationFailureOutput(summary string, err error) report.ValidationOutput {
+	message := err.Error()
+	return report.ValidationOutput{
+		Result: report.ValidationResultFailed,
+		ChecksRun: []report.ValidationCheck{{
+			Name:    "validation harness",
+			Status:  report.ValidationCheckFailed,
+			Summary: summary,
+		}},
+		Outputs:             []report.ValidationOutputRef{},
+		Failures:            []report.ValidationFailure{{Check: "validation harness", Message: message, Severity: "error"}},
+		Skipped:             []report.ValidationSkippedCheck{},
+		EnvNotes:            []string{},
+		Confidence:          report.ValidationConfidenceLow,
+		SuggestedNextAction: "inspect validation harness failure before trusting validation evidence",
+	}
+}
+
+func validationCommandSummary(exitZero bool) string {
+	if exitZero {
+		return "validation command exited successfully"
+	}
+	return "validation command exited non-zero"
+}
+
+func validationDiffSummary(diffNonEmpty bool) string {
+	if diffNonEmpty {
+		return "diff.patch contains validation-stage changes"
+	}
+	return "diff.patch was empty"
+}
+
+func validationFailureCheck(message string) string {
+	switch {
+	case strings.Contains(message, "exit"):
+		return "validation command"
+	case strings.Contains(message, "diff.patch"):
+		return "worktree diff"
+	default:
+		return "validation provider"
+	}
+}
+
+func nonEmptyStrings(values ...string) []string {
+	out := []string{}
+	for _, value := range values {
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
 func validationFailureReport(disp contract.Dispatch, summary string, err error, payload map[string]any) report.Report {
 	if payload == nil {
 		payload = map[string]any{}
+	}
+	if _, ok := payload[report.ValidationOutputPayloadKey]; !ok {
+		payload[report.ValidationOutputPayloadKey] = validationFailureOutput(summary, err)
 	}
 	return report.Report{
 		SchemaVersion: report.SchemaVersion,

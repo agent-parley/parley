@@ -147,6 +147,14 @@ func invalidAdapterReport(wr store.WorkflowRun, stage store.Stage, adapterName, 
 	if summary == "" {
 		summary = "adapter returned invalid report"
 	}
+	payload := map[string]any{
+		"adapter":        adapterName,
+		"invalid_report": reportForRepairInput(candidate),
+	}
+	actorKind := report.ActorKindAgent
+	if stage.StageType == contract.StageTypeValidation {
+		actorKind = report.ActorKindHarness
+	}
 	return report.Report{
 		SchemaVersion: report.SchemaVersion,
 		RunID:         wr.Run.ID,
@@ -154,14 +162,11 @@ func invalidAdapterReport(wr store.WorkflowRun, stage store.Stage, adapterName, 
 		AttemptID:     wr.Attempt.ID,
 		StageID:       stage.ID,
 		StageType:     stage.StageType,
-		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: adapterName},
+		Actor:         report.Actor{Kind: actorKind, ID: adapterName},
 		Status:        report.StatusInvalid,
 		Summary:       summary,
-		Payload: map[string]any{
-			"adapter":        adapterName,
-			"invalid_report": reportForRepairInput(candidate),
-		},
-		Errors: []string{validationErr.Error()},
+		Payload:       withValidationFailureOutput(stage.StageType, payload, "report schema validation", summary, validationErr),
+		Errors:        []string{validationErr.Error()},
 	}
 }
 
@@ -261,6 +266,20 @@ func expectedReportSchema(disp contract.Dispatch) map[string]any {
 			"residual_risk":             "required for arbiter dispatches",
 			"confidence":                "required for arbiter dispatches",
 			"critic_report_artifact_id": "required for arbiter dispatches after normalization",
+		}
+	}
+	if disp.StageType == contract.StageTypeValidation {
+		schema["payload"] = map[string]any{
+			report.ValidationOutputPayloadKey: map[string]any{
+				"result":                []string{string(report.ValidationResultPassed) + " when status=completed", string(report.ValidationResultFailed) + " when status=failed", string(report.ValidationResultInconclusive) + " when status=needs_input"},
+				"checks_run":            []map[string]any{{"name": "required", "status": []string{string(report.ValidationCheckPassed), string(report.ValidationCheckFailed), string(report.ValidationCheckSkipped), string(report.ValidationCheckInconclusive)}, "summary": "optional"}},
+				"outputs":               []map[string]any{{"id": "artifact id or URI/name reference", "name": "optional", "kind": "optional"}},
+				"failures":              []map[string]any{{"check": "check name", "message": "required when result=failed"}},
+				"skipped":               []map[string]any{{"check": "check name", "reason": "required when skipped"}},
+				"env_notes":             []string{},
+				"confidence":            []string{string(report.ValidationConfidenceHigh), string(report.ValidationConfidenceMedium), string(report.ValidationConfidenceLow), string(report.ValidationConfidenceUnknown)},
+				"suggested_next_action": "required non-empty next action",
+			},
 		}
 	}
 	if disp.Input != nil && disp.Input["input_mode"] == contract.AdapterInputModePlanning {

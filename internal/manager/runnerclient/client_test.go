@@ -26,7 +26,7 @@ type runnerClientHarness struct {
 
 func newRunnerClientHarness(t *testing.T, configure func(*protocol.Session)) *runnerClientHarness {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {

@@ -58,6 +58,19 @@ func TestValidationGateTruthTable(t *testing.T) {
 			if rep.Status != tt.wantStatus {
 				t.Fatalf("status = %s, want %s; errors=%v", rep.Status, tt.wantStatus, rep.Errors)
 			}
+			if err := rep.Validate(); err != nil {
+				t.Fatalf("validation report did not validate: %v", err)
+			}
+			output, err := report.ValidationOutputFromPayload(rep.Payload)
+			if err != nil {
+				t.Fatalf("validation output: %v", err)
+			}
+			if tt.wantStatus == report.StatusCompleted && output.Result != report.ValidationResultPassed {
+				t.Fatalf("validation output result = %s, want passed", output.Result)
+			}
+			if tt.wantStatus == report.StatusFailed && len(output.Failures) == 0 {
+				t.Fatalf("validation output missing typed failures: %+v", output)
+			}
 			gate, ok := rep.Payload["gate"].(map[string]any)
 			if !ok {
 				t.Fatalf("missing gate payload: %+v", rep.Payload)
