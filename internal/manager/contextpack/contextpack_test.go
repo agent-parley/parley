@@ -30,10 +30,10 @@ func TestAssemblerBuildsSourceLabeledStageFilteredBrief(t *testing.T) {
 	if brief.Name != "Stage brief" || brief.SchemaVersion != SchemaVersion {
 		t.Fatalf("brief identity = %+v", brief)
 	}
-	if got := strings.Join(brief.IndexedSources, ","); got != "task_plan,repo_evidence,project_rules,workflow_snapshot,planning_artifacts,project_preferences" {
+	if got := strings.Join(brief.IndexedSources, ","); got != "task_plan,repo_evidence,project_rules,workflow_snapshot,planning_artifacts,project_memory,project_preferences" {
 		t.Fatalf("indexed sources = %s", got)
 	}
-	for _, label := range []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectPreferences} {
+	for _, label := range []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences} {
 		if !hasSource(brief, label) {
 			t.Fatalf("missing source label %s in %+v", label, brief.Sources)
 		}
@@ -65,15 +65,15 @@ func TestAssemblerBuildsSourceLabeledStageFilteredBrief(t *testing.T) {
 	if queueDefaults := itemByLabel(preferencesSource, "project_queue_defaults"); queueDefaults.Authority != SourceItemAuthorityAuthoritative {
 		t.Fatalf("queue defaults authority = %+v", queueDefaults)
 	}
-	if hasDeferredSource(brief, SourceTaskPlan) || hasDeferredSource(brief, SourcePlanningArtifacts) {
-		t.Fatalf("task_plan/planning_artifacts are live sources, not deferred: %+v", brief.DeferredSources)
+	if hasDeferredSource(brief, SourceTaskPlan) || hasDeferredSource(brief, SourcePlanningArtifacts) || hasDeferredSource(brief, "private_memory") {
+		t.Fatalf("live sources should not be deferred: %+v", brief.DeferredSources)
 	}
 	if hasDeferredSource(brief, "editable_project_rules_preferences_app_state") {
 		t.Fatalf("project rules/preferences app-state is no longer deferred: %+v", brief.DeferredSources)
 	}
 
 	markdown := Markdown(brief)
-	for _, want := range []string{"## Source: task_plan", "## Source: workflow_snapshot", "## Source: repo_evidence", "## Source: project_rules", "## Source: planning_artifacts", "## Source: project_preferences", "Conflict precedence", "candidate_project_rules:.parley/rules.md", "candidate_project_preferences:.parley/preferences.md", "Authority: `candidate`", "Non-authoritative repo suggestion", "No project rules configured in Parley app state", "No approved task plan artifact is available", "No supplemental planning artifacts are available"} {
+	for _, want := range []string{"## Source: task_plan", "## Source: workflow_snapshot", "## Source: repo_evidence", "## Source: project_rules", "## Source: planning_artifacts", "## Source: project_memory", "## Source: project_preferences", "Conflict precedence", "candidate_project_rules:.parley/rules.md", "candidate_project_preferences:.parley/preferences.md", "Authority: `candidate`", "Non-authoritative repo suggestion", "No project rules configured in Parley app state", "No approved task plan artifact is available", "No supplemental planning artifacts are available", "No curated project memory entries are available"} {
 		if !strings.Contains(markdown, want) {
 			t.Fatalf("markdown missing %q:\n%s", want, markdown)
 		}
@@ -150,7 +150,7 @@ func TestAssemblerStageAllowlistOmitsSourcesPerStageType(t *testing.T) {
 	if hasSource(brief, SourceProjectPreferences) {
 		t.Fatalf("validation stage unexpectedly received preferences: %+v", brief.Sources)
 	}
-	for _, label := range []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts} {
+	for _, label := range []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory} {
 		if !hasSource(brief, label) {
 			t.Fatalf("validation sources missing %s: %+v", label, brief.Sources)
 		}
@@ -211,10 +211,66 @@ func TestAssemblerIncludesApprovedTaskPlanAndPlanningArtifacts(t *testing.T) {
 		t.Fatalf("task_plan/planning_artifacts should not be deferred once providers are live: %+v", brief.DeferredSources)
 	}
 	markdown := Markdown(brief)
-	for _, want := range []string{"2. `approved_task_plan` (source: `task_plan`)", "6. `planning_artifacts` (source: `planning_artifacts`)", "## Source: task_plan", "## Source: planning_artifacts", "Implement the approved plan.", "Original user idea."} {
+	for _, want := range []string{"2. `approved_task_plan` (source: `task_plan`)", "6. `planning_artifacts` (source: `planning_artifacts`)", "7. `project_memory` (source: `project_memory`)", "## Source: task_plan", "## Source: planning_artifacts", "## Source: project_memory", "Implement the approved plan.", "Original user idea."} {
 		if !strings.Contains(markdown, want) {
 			t.Fatalf("markdown missing %q:\n%s", want, markdown)
 		}
+	}
+}
+
+func TestProjectMemorySourceIncludesCuratedEntriesWithinBounds(t *testing.T) {
+	ctx := context.Background()
+	req := briefRequest("", contract.StageTypeImplementation)
+	req.ProjectMemoryEntries = []store.ProjectMemoryEntry{
+		{ID: "memory_old", ProjectID: "p1", Kind: store.ProjectMemoryKindLesson, Title: "Old lesson", Body: "validation_mode: broad", SourceRunID: "run0", SourceTaskID: "task0", SourceStageID: "stage0", SourceArtifactID: "artifact0", CuratorStageID: "curator0", SourceSummary: "old source", CreatedAt: "2026-06-07T10:00:00Z", UpdatedAt: "2026-06-07T10:00:00Z"},
+		{ID: "memory_new", ProjectID: "p1", Kind: store.ProjectMemoryKindGotcha, Title: "Validation image needs git", Body: "validation_image: git\nInstall git before inspecting worktree snapshots.", SourceRunID: "run1", SourceTaskID: "task1", SourceStageID: "stage1", SourceArtifactID: "artifact1", CuratorStageID: "curator1", SourceSummary: "implementation report", CreatedAt: "2026-06-07T12:00:00Z", UpdatedAt: "2026-06-07T12:00:00Z"},
+		{ID: "memory_mid", ProjectID: "p1", Kind: store.ProjectMemoryKindRepoFact, Title: "Middle fact", Body: "default_branch: main", SourceRunID: "run1", SourceTaskID: "task1", SourceStageID: "stage2", SourceArtifactID: "artifact2", CuratorStageID: "curator1", SourceSummary: "validation report", CreatedAt: "2026-06-07T11:00:00Z", UpdatedAt: "2026-06-07T11:00:00Z"},
+	}
+	brief, err := NewAssembler(Options{Now: fixedBriefNow, Bounds: Bounds{MaxSourceBytes: 4096, MaxItemBytes: 2048, MaxItemsPerSource: 2}}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	memorySource := sourceByLabel(brief, SourceProjectMemory)
+	if memorySource.PrecedenceRank != 7 || !memorySource.Truncated || len(memorySource.Items) != 2 {
+		t.Fatalf("memory source rank/truncation/items = rank %d truncated %t len %d: %+v", memorySource.PrecedenceRank, memorySource.Truncated, len(memorySource.Items), memorySource)
+	}
+	newest := itemByLabel(memorySource, "project_memory:gotcha:memory_new")
+	if newest.Authority != SourceItemAuthorityInformational || !strings.Contains(newest.AuthorityNote, "precedence rank 7") || !strings.Contains(newest.Text, "Source artifact: `artifact1`") || !strings.Contains(newest.Text, "Install git before inspecting worktree snapshots") {
+		t.Fatalf("newest memory item = %+v", newest)
+	}
+	if itemByLabel(memorySource, "project_memory:lesson:memory_old").Label != "" {
+		t.Fatalf("oldest memory entry should be outside per-source bound: %+v", memorySource.Items)
+	}
+	markdown := Markdown(brief)
+	for _, want := range []string{"## Source: project_memory", "- Precedence rank: 7", "Authority: `informational`", "Validation image needs git", "source item count truncated to 2"} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("markdown missing %q:\n%s", want, markdown)
+		}
+	}
+}
+
+func TestProjectMemoryConflictWithHigherPrecedenceSourceRaisesWarning(t *testing.T) {
+	ctx := context.Background()
+	req := briefRequest("", contract.StageTypeImplementation)
+	req.Project.ProjectRules = "delivery_mode: guarded\n"
+	req.ProjectMemoryEntries = []store.ProjectMemoryEntry{
+		{ID: "memory_conflict", ProjectID: "p1", Kind: store.ProjectMemoryKindDecision, Title: "Old delivery mode", Body: "delivery_mode: fast\nUse the old fast path for local handoffs.", SourceStageID: "stage_old", SourceArtifactID: "artifact_old", CuratorStageID: "curator_old", SourceSummary: "older run", UpdatedAt: "2026-06-07T12:00:00Z"},
+	}
+	brief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, req)
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	memorySource := sourceByLabel(brief, SourceProjectMemory)
+	if !hasWarningContaining(memorySource.Warnings, "conflicts with higher-precedence project_rules") || !hasWarningContaining(memorySource.Warnings, "not an override") {
+		t.Fatalf("memory conflict warnings = %#v", memorySource.Warnings)
+	}
+	item := itemByLabel(memorySource, "project_memory:decision:memory_conflict")
+	if item.Authority == SourceItemAuthorityAuthoritative {
+		t.Fatalf("project memory conflict must not become authoritative: %+v", item)
+	}
+	markdown := Markdown(brief)
+	if !strings.Contains(markdown, "Warning: project_memory entry") || !strings.Contains(markdown, "Prefer project_rules") {
+		t.Fatalf("markdown missing conflict warning:\n%s", markdown)
 	}
 }
 
@@ -305,6 +361,15 @@ func itemByLabel(source Source, label string) SourceItem {
 		}
 	}
 	return SourceItem{}
+}
+
+func hasWarningContaining(warnings []string, want string) bool {
+	for _, warning := range warnings {
+		if strings.Contains(warning, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasDeferredSource(brief StageBrief, label string) bool {

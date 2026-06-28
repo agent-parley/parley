@@ -26,6 +26,7 @@ const (
 	SourceRepoEvidence       = "repo_evidence"
 	SourceProjectRules       = "project_rules"
 	SourcePlanningArtifacts  = "planning_artifacts"
+	SourceProjectMemory      = "project_memory"
 	SourceProjectPreferences = "project_preferences"
 
 	SourceItemAuthorityAuthoritative = "authoritative"
@@ -58,17 +59,18 @@ func DefaultBounds() Bounds {
 }
 
 type Request struct {
-	Project            store.Project                                 `json:"project"`
-	Task               store.Task                                    `json:"task"`
-	Run                store.Run                                     `json:"run"`
-	Attempt            store.Attempt                                 `json:"attempt"`
-	Stages             []store.Stage                                 `json:"stages"`
-	Events             []event.Event                                 `json:"events"`
-	Artifacts          []store.Artifact                              `json:"artifacts"`
-	CurrentStage       store.Stage                                   `json:"current_stage"`
-	RepositoryPath     string                                        `json:"repository_path,omitempty"`
-	RepositoryWarnings []string                                      `json:"repository_warnings,omitempty"`
-	ReadArtifact       func(context.Context, string) ([]byte, error) `json:"-"`
+	Project              store.Project                                 `json:"project"`
+	Task                 store.Task                                    `json:"task"`
+	Run                  store.Run                                     `json:"run"`
+	Attempt              store.Attempt                                 `json:"attempt"`
+	Stages               []store.Stage                                 `json:"stages"`
+	Events               []event.Event                                 `json:"events"`
+	Artifacts            []store.Artifact                              `json:"artifacts"`
+	CurrentStage         store.Stage                                   `json:"current_stage"`
+	RepositoryPath       string                                        `json:"repository_path,omitempty"`
+	RepositoryWarnings   []string                                      `json:"repository_warnings,omitempty"`
+	ProjectMemoryEntries []store.ProjectMemoryEntry                    `json:"project_memory_entries,omitempty"`
+	ReadArtifact         func(context.Context, string) ([]byte, error) `json:"-"`
 }
 
 type StageBrief struct {
@@ -234,22 +236,23 @@ func defaultProviders() []SourceProvider {
 		RepoEvidenceProvider{},
 		ProjectRulesProvider{},
 		PlanningArtifactsProvider{},
+		ProjectMemoryProvider{},
 		ProjectPreferencesProvider{},
 	}
 }
 
 func defaultAllowlist() map[string][]string {
 	return map[string][]string{
-		contract.StageTypeIdeaIntake:     {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectPreferences},
-		contract.StageTypeIdeaRefinement: {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectPreferences},
-		contract.StageTypeReview:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectPreferences},
-		contract.StageTypeImplementation: {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectPreferences},
-		contract.StageTypeValidation:     {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts},
-		contract.StageTypeCommit:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts},
-		contract.StageTypePRCreation:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
-		contract.StageTypePRReady:        {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
-		contract.StageTypeMemoryUpdate:   {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectPreferences},
-		contract.StageTypeStopReport:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
+		contract.StageTypeIdeaIntake:     {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectMemory, SourceProjectPreferences},
+		contract.StageTypeIdeaRefinement: {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectMemory, SourceProjectPreferences},
+		contract.StageTypeReview:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences},
+		contract.StageTypeImplementation: {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences},
+		contract.StageTypeValidation:     {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory},
+		contract.StageTypeCommit:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory},
+		contract.StageTypePRCreation:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectMemory, SourceProjectPreferences},
+		contract.StageTypePRReady:        {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectMemory, SourceProjectPreferences},
+		contract.StageTypeMemoryUpdate:   {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectMemory, SourceProjectPreferences},
+		contract.StageTypeStopReport:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectMemory, SourceProjectPreferences},
 	}
 }
 
@@ -262,12 +265,11 @@ func cloneAllowlist(in map[string][]string) map[string][]string {
 }
 
 func builtinSourceLabels() []string {
-	return []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectPreferences}
+	return []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences}
 }
 
 func deferredSources() []DeferredSource {
 	return []DeferredSource{
-		{Label: "private_memory", Reason: "deferred until B6 memory-update stage and curated project memory exists"},
 		{Label: "external_forge_metadata", Reason: "deferred until forge issue/PR metadata source is built"},
 	}
 }
@@ -280,7 +282,7 @@ func conflictPrecedence() []PrecedenceRule {
 		{Rank: 4, Label: "project_rules", Source: SourceProjectRules},
 		{Rank: 5, Label: "workflow_stage_settings", Source: SourceWorkflowSnapshot},
 		{Rank: 6, Label: "planning_artifacts", Source: SourcePlanningArtifacts},
-		{Rank: 7, Label: "project_memory"},
+		{Rank: 7, Label: "project_memory", Source: SourceProjectMemory},
 		{Rank: 8, Label: "project_preferences", Source: SourceProjectPreferences},
 	}
 }
@@ -297,6 +299,8 @@ func precedenceRank(label string) int {
 		return 5
 	case SourcePlanningArtifacts:
 		return 6
+	case SourceProjectMemory:
+		return 7
 	case SourceProjectPreferences:
 		return 8
 	default:

@@ -1468,17 +1468,22 @@ func (e *Engine) prepareStageBrief(ctx context.Context, wr store.WorkflowRun, st
 		return "", store.Artifact{}, err
 	}
 	repositoryPath, repositoryWarnings := e.repositoryPathForStage(ctx, wr, stage)
+	memoryEntries, err := e.store.ListProjectMemoryEntries(ctx, bundle.Project.ID)
+	if err != nil {
+		return "", store.Artifact{}, err
+	}
 	brief, err := e.contextAssembler.Assemble(ctx, contextpack.Request{
-		Project:            bundle.Project,
-		Run:                bundle.Run,
-		Task:               bundle.Task,
-		Attempt:            bundle.Attempt,
-		Stages:             bundle.Stages,
-		Events:             bundle.Events,
-		Artifacts:          bundle.Artifacts,
-		CurrentStage:       stage,
-		RepositoryPath:     repositoryPath,
-		RepositoryWarnings: repositoryWarnings,
+		Project:              bundle.Project,
+		Run:                  bundle.Run,
+		Task:                 bundle.Task,
+		Attempt:              bundle.Attempt,
+		Stages:               bundle.Stages,
+		Events:               bundle.Events,
+		Artifacts:            bundle.Artifacts,
+		CurrentStage:         stage,
+		RepositoryPath:       repositoryPath,
+		RepositoryWarnings:   repositoryWarnings,
+		ProjectMemoryEntries: memoryEntries,
 		ReadArtifact: func(ctx context.Context, artifactID string) ([]byte, error) {
 			_, content, err := e.store.GetArtifact(ctx, artifactID)
 			return content, err
