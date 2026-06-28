@@ -18,11 +18,7 @@ coverage.out
 .DS_Store
 .idea/
 .vscode/
-docs/*
-!docs/deployment.md
-!docs/agents/
-docs/agents/*
-!docs/agents/issue-management.md
+docs/
 plans/
 
 # Project-local planning scratch files
