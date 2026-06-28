@@ -869,6 +869,9 @@ func repairPrompt(disp contract.Dispatch, workerInputPath, reportPath string, va
 	} else if disp.StageType == contract.StageTypeReview {
 		shape = "review JSON contract from " + workerInputPath + ", including payload and verdict when the role is arbiter"
 	}
+	if memoryCaptureEnabled(disp) {
+		shape += ", including payload." + memoryCapturePayloadKey(disp)
+	}
 	return "The previous worker run did not produce a valid " + reportPath + ". Do not modify /project/repo during this repair. Read " + workerInputPath + " and the existing work if needed, then replace " + reportPath + " with the " + shape + ". Validation error: " + validationErr.Error()
 }
 
@@ -910,6 +913,9 @@ func workerInputMarkdown(disp contract.Dispatch, reportPath string) string {
 	if disp.StageType == contract.StageTypeReview {
 		appendReviewWorkerContract(&b, disp)
 	}
+	if memoryCaptureEnabled(disp) {
+		appendMemoryCaptureWorkerContract(&b, disp)
+	}
 	b.WriteString("## Filesystem Contract\n\n")
 	if isConversationDispatch(disp) {
 		b.WriteString("- Do not modify repository files during conversation turns; inspect `/project/repo` only with read/list/grep-style operations.\n")
@@ -931,7 +937,7 @@ func workerInputMarkdown(disp contract.Dispatch, reportPath string) string {
 	} else if disp.StageType == contract.StageTypeReview {
 		appendReviewRequiredReport(&b, disp, reportPath)
 	} else {
-		appendDefaultRequiredReport(&b, reportPath)
+		appendDefaultRequiredReport(&b, disp, reportPath)
 	}
 	return b.String()
 }
@@ -1067,12 +1073,27 @@ func appendConversationRequiredReport(b *strings.Builder, reportPath string) {
 	b.WriteString("Allowed status values: `completed`, `failed`, `needs_input`, `invalid`. If status is `failed` or `invalid`, `errors` must be non-empty. If you include `payload.actions`, it must contain exactly one object from `allowed_actions`. `create-Task` requires a non-empty sectioned-brief `idea` using exactly the required Markdown headings and may include optional string `template` from `workflow_template_selection.selectable_templates`; omit `template` for the default. `re-run-stage` requires string `run_id` and string `stage` only; use a run and compute-stage ID from the orchestration snapshot, and rely on the harness to reject invalid target/state fail-closed. Do not include top-level action fields.\n")
 }
 
-func appendDefaultRequiredReport(b *strings.Builder, reportPath string) {
+func appendMemoryCaptureWorkerContract(b *strings.Builder, disp contract.Dispatch) {
+	key := memoryCapturePayloadKey(disp)
+	b.WriteString("## Project Memory Candidate Capture\n\n")
+	b.WriteString("This workflow includes a Memory update stage. If this stage discovers a durable, reusable project learning, emit it into the workflow-local memory inbox by adding `payload.")
+	b.WriteString(key)
+	b.WriteString("` to your report. Use an empty list when there is no real learning. Do not write durable project memory yourself; the Memory update stage curates and writes accepted candidates.\n\n")
+	b.WriteString("Each candidate must be an object with `kind`, `title`, `body`, and `source_summary`. Allowed `kind` values are `lesson`, `repo_fact`, `gotcha`, `implementation_landmark`, `prior_result`, `decision`, and `freshness_note`. Keep candidates source-linked, bounded, and useful for future runs. Do not include secrets, credentials, standing instructions, raw logs/transcripts, speculative plans, or current code truth.\n\n")
+}
+
+func appendDefaultRequiredReport(b *strings.Builder, disp contract.Dispatch, reportPath string) {
 	fmt.Fprintf(b, "Write exactly one report file at `%s`. Do not create `summary.md` or `changed-files.txt` for M3. The report must be valid JSON with this semantic subset only:\n\n", reportPath)
 	b.WriteString("```json\n")
-	b.WriteString("{\n  \"status\": \"completed\",\n  \"summary\": \"short implementation summary\",\n  \"errors\": []\n}\n")
+	if memoryCaptureEnabled(disp) {
+		key := memoryCapturePayloadKey(disp)
+		fmt.Fprintf(b, "{\n  \"status\": \"completed\",\n  \"summary\": \"short implementation summary\",\n  \"payload\": {\n    \"%s\": [\n      {\n        \"kind\": \"lesson\",\n        \"title\": \"concise reusable learning\",\n        \"body\": \"durable lesson from this stage\",\n        \"source_summary\": \"why this stage report supports the candidate\"\n      }\n    ]\n  },\n  \"errors\": []\n}\n", key)
+	} else {
+		b.WriteString("{\n  \"status\": \"completed\",\n  \"summary\": \"short implementation summary\",\n  \"errors\": []\n}\n")
+	}
 	b.WriteString("```\n\n")
 	b.WriteString("Allowed status values: `completed`, `failed`, `needs_input`, `invalid`. If status is `failed` or `invalid`, `errors` must be non-empty.\n")
+	appendMemoryCaptureRequiredReportNote(b, disp)
 }
 
 func appendReviewRequiredReport(b *strings.Builder, disp contract.Dispatch, reportPath string) {
@@ -1091,7 +1112,29 @@ func appendReviewRequiredReport(b *strings.Builder, disp contract.Dispatch, repo
 		b.WriteString("```\n\n")
 		b.WriteString("Do not include `verdict` in the critic report. The hidden arbiter emits the verdict.\n")
 	}
+	appendMemoryCaptureRequiredReportNote(b, disp)
 	b.WriteString("Allowed status values: `completed`, `failed`, `needs_input`, `invalid`. If status is `failed` or `invalid`, `errors` must be non-empty.\n")
+}
+
+func appendMemoryCaptureRequiredReportNote(b *strings.Builder, disp contract.Dispatch) {
+	if !memoryCaptureEnabled(disp) {
+		return
+	}
+	key := memoryCapturePayloadKey(disp)
+	fmt.Fprintf(b, "Because memory capture is enabled for this workflow, include `payload.%s` as a list. Use `[]` when there is no durable learning. Candidate shape: `{\"kind\":\"lesson\",\"title\":\"...\",\"body\":\"...\",\"source_summary\":\"...\"}`.\n\n", key)
+}
+
+func memoryCaptureEnabled(disp contract.Dispatch) bool {
+	enabled, _ := disp.Input["memory_capture_enabled"].(bool)
+	return enabled
+}
+
+func memoryCapturePayloadKey(disp contract.Dispatch) string {
+	key := inputString(disp.Input, "memory_capture_payload_key")
+	if key == "" {
+		return "learning_opportunities"
+	}
+	return key
 }
 
 func inputJSON(input map[string]any, key string, fallback any) string {
