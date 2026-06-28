@@ -105,12 +105,33 @@ func TestPiPrepareBuildsPreflightSafeInvocationAndInputFiles(t *testing.T) {
 	if !strings.Contains(workerInput, "Implement the following user request") || !strings.Contains(workerInput, "/project/workspace/report.json") {
 		t.Fatalf("worker-input.md missing task/report contract:\n%s", workerInput)
 	}
+	if strings.Contains(workerInput, "learning_opportunities") {
+		t.Fatalf("worker-input.md advertised memory capture without opt-in:\n%s", workerInput)
+	}
 	appendSystem := readTestFile(t, prepared.AppendSystemPath)
 	if !strings.Contains(appendSystem, "Parley Headless Worker Rules") || !strings.Contains(appendSystem, "Provider credentials") || !strings.Contains(appendSystem, "extra verification rule") {
 		t.Fatalf("APPEND_SYSTEM.md missing standing rules or run-specific extra:\n%s", appendSystem)
 	}
 	if got := readTestFile(t, prepared.AuthCopyPath); got != readTestFile(t, authPath) {
 		t.Fatalf("auth copy = %q, want source contents", got)
+	}
+}
+
+func TestPiPrepareIncludesMemoryCaptureContractWhenEnabled(t *testing.T) {
+	ctx := context.Background()
+	adapter := newTestPiAdapter(t, ctx, &scriptedPiProvider{})
+	disp := piTestDispatch()
+	disp.Input["memory_capture_enabled"] = true
+	disp.Input["memory_capture_payload_key"] = "learning_opportunities"
+	prepared, err := adapter.Prepare(ctx, disp)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	workerInput := readTestFile(t, prepared.WorkerInputPath)
+	for _, want := range []string{"Project Memory Candidate Capture", "payload.learning_opportunities", "\"learning_opportunities\"", "source_summary", "Memory update stage curates"} {
+		if !strings.Contains(workerInput, want) {
+			t.Fatalf("memory capture worker input missing %q:\n%s", want, workerInput)
+		}
 	}
 }
 

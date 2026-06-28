@@ -142,6 +142,15 @@ func NormalizeTemplate(template Template) Template {
 	return template
 }
 
+func DeriveTemplateEdges(template Template) []Edge {
+	template = NormalizeTemplate(template)
+	edges := defaultEdges(template.Stages)
+	if settingBool(template.Settings, "fix_loop") {
+		edges = fixLoopEdges(template.Stages, edges)
+	}
+	return reviewEscalationEdges(template.Stages, edges)
+}
+
 func ValidateTemplate(template Template) error {
 	template = NormalizeTemplate(template)
 	var errs []error
@@ -158,6 +167,8 @@ func ValidateTemplate(template Template) error {
 		errs = append(errs, errors.New("at least one stage is required"))
 	}
 	stageIDs := map[string]bool{}
+	stageIDOrder := make([]string, 0, len(template.Stages))
+	var startIDs, endIDs []string
 	for _, stage := range template.Stages {
 		if stage.ID == "" {
 			errs = append(errs, errors.New("stage id is required"))
@@ -167,6 +178,13 @@ func ValidateTemplate(template Template) error {
 			errs = append(errs, fmt.Errorf("stage id %q is duplicated", stage.ID))
 		}
 		stageIDs[stage.ID] = true
+		stageIDOrder = append(stageIDOrder, stage.ID)
+		if stage.Type == StageTypeIdeaRefinement {
+			startIDs = append(startIDs, stage.ID)
+		}
+		if stage.Type == StageTypeStopReport {
+			endIDs = append(endIDs, stage.ID)
+		}
 		if !validStageType(stage.Type) {
 			errs = append(errs, fmt.Errorf("stage %q type %q is invalid", stage.ID, stage.Type))
 		}
@@ -179,6 +197,11 @@ func ValidateTemplate(template Template) error {
 			}
 		}
 	}
+	inbound := map[string][]string{}
+	outbound := map[string][]string{}
+	forward := map[string][]string{}
+	reverse := map[string][]string{}
+	edgeKeys := map[string]bool{}
 	for _, edge := range template.Edges {
 		if edge.From == "" || edge.To == "" || edge.On == "" {
 			errs = append(errs, errors.New("edge from, to, and on are required"))
@@ -193,8 +216,62 @@ func ValidateTemplate(template Template) error {
 		if !validEdgeOn(edge.On) {
 			errs = append(errs, fmt.Errorf("edge %q -> %q on %q is invalid", edge.From, edge.To, edge.On))
 		}
+		if stageIDs[edge.From] && stageIDs[edge.To] && validEdgeOn(edge.On) {
+			key := edge.From + "\x00" + edge.On
+			if edgeKeys[key] {
+				errs = append(errs, fmt.Errorf("duplicate workflow edge from %q on %q", edge.From, edge.On))
+			}
+			edgeKeys[key] = true
+			outbound[edge.From] = append(outbound[edge.From], edge.To)
+			inbound[edge.To] = append(inbound[edge.To], edge.From)
+			forward[edge.From] = append(forward[edge.From], edge.To)
+			reverse[edge.To] = append(reverse[edge.To], edge.From)
+		}
+	}
+	if len(startIDs) != 1 {
+		errs = append(errs, fmt.Errorf("exactly one %s start stage is required; found %d", StageTypeIdeaRefinement, len(startIDs)))
+	} else if len(inbound[startIDs[0]]) != 0 {
+		errs = append(errs, fmt.Errorf("%s start stage %q must have no inbound edges", StageTypeIdeaRefinement, startIDs[0]))
+	}
+	if len(endIDs) != 1 {
+		errs = append(errs, fmt.Errorf("exactly one %s end stage is required; found %d", StageTypeStopReport, len(endIDs)))
+	} else if len(outbound[endIDs[0]]) != 0 {
+		errs = append(errs, fmt.Errorf("%s end stage %q must have no outbound edges", StageTypeStopReport, endIDs[0]))
+	}
+	if len(startIDs) == 1 {
+		reachable := reachableStageIDs(startIDs[0], forward)
+		for _, stageID := range stageIDOrder {
+			if !reachable[stageID] {
+				errs = append(errs, fmt.Errorf("stage %q is not reachable from %s start stage %q", stageID, StageTypeIdeaRefinement, startIDs[0]))
+			}
+		}
+	}
+	if len(endIDs) == 1 {
+		canReachEnd := reachableStageIDs(endIDs[0], reverse)
+		for _, stageID := range stageIDOrder {
+			if !canReachEnd[stageID] {
+				errs = append(errs, fmt.Errorf("%s end stage %q is not reachable from stage %q", StageTypeStopReport, endIDs[0], stageID))
+			}
+		}
 	}
 	return errors.Join(errs...)
+}
+
+func reachableStageIDs(start string, graph map[string][]string) map[string]bool {
+	seen := map[string]bool{start: true}
+	stack := []string{start}
+	for len(stack) > 0 {
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, next := range graph[current] {
+			if seen[next] {
+				continue
+			}
+			seen[next] = true
+			stack = append(stack, next)
+		}
+	}
+	return seen
 }
 
 func validStageType(stageType string) bool {
@@ -283,6 +360,29 @@ func settingString(settings map[string]any, key string) string {
 	return strings.TrimSpace(fmt.Sprint(value))
 }
 
+func settingBool(settings map[string]any, key string) bool {
+	if settings == nil {
+		return false
+	}
+	value, ok := settings[key]
+	if !ok || value == nil {
+		return false
+	}
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on", "enabled":
+			return true
+		default:
+			return false
+		}
+	default:
+		return strings.EqualFold(strings.TrimSpace(fmt.Sprint(value)), "true")
+	}
+}
+
 func balancedPRDelivery() Template {
 	stages := []StageTemplate{
 		stage("idea_refinement", StageTypeIdeaRefinement, "Idea refinement", ActorHarness, ""),
@@ -301,7 +401,7 @@ func balancedPRDelivery() Template {
 		"fix_loop":      true,
 		"max_fix_loops": 3,
 	}
-	return predefined(BalancedPRDeliveryID, "Balanced PR Delivery", "Recommended branch-and-PR workflow with human plan review and agent code review.", true, stages, reviewEscalationEdges(stages, fixLoopEdges(stages, defaultEdges(stages))), settings)
+	return predefined(BalancedPRDeliveryID, "Balanced PR Delivery", "Recommended branch-and-PR workflow with human plan review and agent code review.", true, stages, settings)
 }
 
 func autonomousPRDelivery() Template {
@@ -315,8 +415,7 @@ func autonomousPRDelivery() Template {
 		stage("memory_update", StageTypeMemoryUpdate, "Memory update", ActorAgent, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	edges := reviewEscalationEdges(stages, fixLoopEdges(stages, defaultEdges(stages)))
-	return predefined(AutonomousPRDeliveryID, "Autonomous PR Delivery", "Unattended PR workflow with agent review, fix loop, and memory update.", false, stages, edges, map[string]any{
+	return predefined(AutonomousPRDeliveryID, "Autonomous PR Delivery", "Unattended PR workflow with agent review, fix loop, and memory update.", false, stages, map[string]any{
 		"branch_policy": "feature_branch",
 		"pr_behavior":   "create_pr",
 		"fix_loop":      true,
@@ -337,7 +436,7 @@ func carefulReviewDelivery() Template {
 		stage("pr_creation", StageTypePRCreation, "PR creation", ActorHarness, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	return predefined(CarefulReviewID, "Careful Review Delivery", "Branch-and-PR workflow with human review before implementation and before PR handoff.", false, stages, reviewEscalationEdges(stages, fixLoopEdges(stages, defaultEdges(stages))), map[string]any{
+	return predefined(CarefulReviewID, "Careful Review Delivery", "Branch-and-PR workflow with human review before implementation and before PR handoff.", false, stages, map[string]any{
 		"branch_policy": "feature_branch",
 		"pr_behavior":   "create_pr",
 		"review_depth":  "careful",
@@ -356,7 +455,7 @@ func directCommitDelivery() Template {
 		stage("memory_update", StageTypeMemoryUpdate, "Memory update", ActorAgent, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	return predefined(DirectCommitID, "Direct Commit Delivery", "Advanced opt-in workflow that commits to a target branch instead of creating a PR.", false, stages, reviewEscalationEdges(stages, fixLoopEdges(stages, defaultEdges(stages))), map[string]any{
+	return predefined(DirectCommitID, "Direct Commit Delivery", "Advanced opt-in workflow that commits to a target branch instead of creating a PR.", false, stages, map[string]any{
 		"advanced":      true,
 		"branch_policy": "target_branch",
 		"pr_behavior":   "none",
@@ -374,7 +473,7 @@ func quickFixDelivery() Template {
 		stage("pr_creation", StageTypePRCreation, "PR creation", ActorHarness, ""),
 		stage("stop_report", StageTypeStopReport, "Stop/report", ActorHarness, ""),
 	}
-	return predefined(QuickFixDeliveryID, "Quick Fix Delivery", "Slim branch-and-PR workflow for trivial fixes with PR merge as the human gate.", false, stages, defaultEdges(stages), map[string]any{
+	return predefined(QuickFixDeliveryID, "Quick Fix Delivery", "Slim branch-and-PR workflow for trivial fixes with PR merge as the human gate.", false, stages, map[string]any{
 		"branch_policy": "feature_branch",
 		"pr_behavior":   "create_pr",
 		"merge_policy":  "human_stop",
@@ -382,8 +481,8 @@ func quickFixDelivery() Template {
 	})
 }
 
-func predefined(id, name, description string, recommended bool, stages []StageTemplate, edges []Edge, settings map[string]any) Template {
-	return Template{
+func predefined(id, name, description string, recommended bool, stages []StageTemplate, settings map[string]any) Template {
+	template := Template{
 		SchemaVersion: SchemaVersion,
 		ID:            id,
 		Name:          name,
@@ -392,9 +491,10 @@ func predefined(id, name, description string, recommended bool, stages []StageTe
 		Recommended:   recommended,
 		Editable:      false,
 		Stages:        stages,
-		Edges:         edges,
 		Settings:      settings,
 	}
+	template.Edges = DeriveTemplateEdges(template)
+	return template
 }
 
 func stage(id, stageType, label, actor, target string) StageTemplate {

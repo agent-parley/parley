@@ -138,7 +138,7 @@ func (e *Engine) collectProjectMemoryCandidates(ctx context.Context, wr store.Wo
 }
 
 func projectMemoryCandidatesFromReport(rep report.Report, artifactID string) ([]store.ProjectMemoryInput, []store.ProjectMemoryRejection) {
-	raw, ok := firstPayloadValue(rep.Payload, "memory_candidates", "project_memory_candidates", "learning_opportunities")
+	raw, ok := firstPayloadValue(rep.Payload, "learning_opportunities", "memory_candidates", "project_memory_candidates")
 	if !ok || raw == nil {
 		return nil, nil
 	}

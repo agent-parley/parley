@@ -1043,6 +1043,7 @@ func (e *Engine) stageDispatchInput(runtime runtimeWorkflow, stage workflow.Stag
 	out["workflow_stage_actor"] = stage.Actor
 	out["workflow_stage_target"] = stage.Target
 	out["workflow_stage_settings"] = stage.Settings
+	addMemoryCaptureInput(out, runtime.Template, stage)
 	return out
 }
 
@@ -1468,17 +1469,24 @@ func (e *Engine) prepareStageBrief(ctx context.Context, wr store.WorkflowRun, st
 		return "", store.Artifact{}, err
 	}
 	repositoryPath, repositoryWarnings := e.repositoryPathForStage(ctx, wr, stage)
+	workflowStageSettings := e.workflowStageSettingsForBrief(ctx, wr.Run.ID, stage)
+	memoryEntries, err := e.store.ListProjectMemoryEntries(ctx, bundle.Project.ID)
+	if err != nil {
+		return "", store.Artifact{}, err
+	}
 	brief, err := e.contextAssembler.Assemble(ctx, contextpack.Request{
-		Project:            bundle.Project,
-		Run:                bundle.Run,
-		Task:               bundle.Task,
-		Attempt:            bundle.Attempt,
-		Stages:             bundle.Stages,
-		Events:             bundle.Events,
-		Artifacts:          bundle.Artifacts,
-		CurrentStage:       stage,
-		RepositoryPath:     repositoryPath,
-		RepositoryWarnings: repositoryWarnings,
+		Project:               bundle.Project,
+		Run:                   bundle.Run,
+		Task:                  bundle.Task,
+		Attempt:               bundle.Attempt,
+		Stages:                bundle.Stages,
+		Events:                bundle.Events,
+		Artifacts:             bundle.Artifacts,
+		CurrentStage:          stage,
+		RepositoryPath:        repositoryPath,
+		RepositoryWarnings:    repositoryWarnings,
+		WorkflowStageSettings: workflowStageSettings,
+		ProjectMemoryEntries:  memoryEntries,
 		ReadArtifact: func(ctx context.Context, artifactID string) ([]byte, error) {
 			_, content, err := e.store.GetArtifact(ctx, artifactID)
 			return content, err
@@ -1496,6 +1504,27 @@ func (e *Engine) prepareStageBrief(ctx context.Context, wr store.WorkflowRun, st
 		return "", store.Artifact{}, err
 	}
 	return markdown, artifact, nil
+}
+
+func (e *Engine) workflowStageSettingsForBrief(ctx context.Context, runID string, stage store.Stage) map[string]any {
+	if stage.WorkflowStageID == "" {
+		return nil
+	}
+	template, err := e.store.LatestWorkflowTemplateSnapshot(ctx, runID)
+	if err != nil {
+		return nil
+	}
+	for _, templateStage := range template.Stages {
+		if templateStage.ID != stage.WorkflowStageID || len(templateStage.Settings) == 0 {
+			continue
+		}
+		settings := make(map[string]any, len(templateStage.Settings))
+		for key, value := range templateStage.Settings {
+			settings[key] = value
+		}
+		return settings
+	}
+	return nil
 }
 
 func (e *Engine) repositoryPathForStage(ctx context.Context, wr store.WorkflowRun, stage store.Stage) (string, []string) {

@@ -257,6 +257,52 @@ func TestDispatchStagePersistsStageBriefAndPassesItToRunner(t *testing.T) {
 	t.Fatal("implementation stage not found")
 }
 
+func TestDispatchStageBriefIncludesCuratedProjectMemory(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "include curated memory", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sourceReport := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		StageID:       wr.IdeaIntakeStage.ID,
+		StageType:     wr.IdeaIntakeStage.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: "noop"},
+		Status:        report.StatusCompleted,
+		Summary:       "captured a reusable memory entry",
+		Payload:       map[string]any{},
+		Errors:        []string{},
+	}
+	sourceArtifact, err := st.SaveReportArtifact(ctx, sourceReport)
+	if err != nil {
+		t.Fatalf("save source report: %v", err)
+	}
+	if _, err := st.ApplyProjectMemoryUpdate(ctx, store.ProjectMemoryUpdate{ProjectID: wr.Run.ProjectID, RunID: wr.Run.ID, TaskID: wr.Task.ID, CuratorStageID: wr.MemoryUpdateStage.ID, Entries: []store.ProjectMemoryInput{
+		{Kind: store.ProjectMemoryKindGotcha, Title: "Validation image needs git", Body: "validation_image: git\nValidation image used git before checking worktree snapshots.", SourceStageID: wr.IdeaIntakeStage.ID, SourceArtifactID: sourceArtifact.ID, SourceSummary: "idea intake report"},
+	}}); err != nil {
+		t.Fatalf("apply memory update: %v", err)
+	}
+
+	runner := &capturingRunner{}
+	engine := newRecordingEngine(t, st, runner, EngineOptions{})
+	if _, err := engine.dispatchStage(ctx, wr, wr.ImplementationStage, "capture", contract.StageTypeImplementation, implementationInput(wr, report.Report{})); err != nil {
+		t.Fatalf("dispatchStage() error = %v", err)
+	}
+	briefText, _ := runner.disp.Input["stage_brief_markdown"].(string)
+	for _, want := range []string{"## Source: project_memory", "Validation image needs git", "Source artifact: `" + sourceArtifact.ID + "`", "Curated project memory is precedence rank 7"} {
+		if !strings.Contains(briefText, want) {
+			t.Fatalf("stage brief missing %q:\n%s", want, briefText)
+		}
+	}
+}
+
 func TestDispatchStageRepairsMalformedReportBeforeCompletion(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
@@ -552,6 +598,12 @@ func TestAgentStageDispatchReceivesTemplateActorTargetSettings(t *testing.T) {
 	if !ok || settings["profile"] != "generalist" || settings["intensity"] != "normal" {
 		t.Fatalf("dispatch input settings = %#v", runner.disp.Input["workflow_stage_settings"])
 	}
+	briefText, _ := runner.disp.Input["stage_brief_markdown"].(string)
+	for _, want := range []string{"workflow_stage_settings", "profile: generalist", "intensity: normal"} {
+		if !strings.Contains(briefText, want) {
+			t.Fatalf("stage brief missing %q:\n%s", want, briefText)
+		}
+	}
 }
 
 func TestMemoryUpdateStageAppliesCuratedCandidatesWithoutDispatchingWorkflowAgent(t *testing.T) {
@@ -610,6 +662,99 @@ func TestMemoryUpdateStageAppliesCuratedCandidatesWithoutDispatchingWorkflowAgen
 	}
 	if len(entries) != 1 || entries[0].Title != "Validation needs git" || entries[0].CuratorStageID != memoryStage.Stage.ID {
 		t.Fatalf("project memory entries = %#v", entries)
+	}
+}
+
+func TestMemoryProducerLoopPersistsAgentLearningOpportunities(t *testing.T) {
+	ctx := context.Background()
+	runner := &memoryLearningRunner{}
+	env := newTestEnv(t, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
+	templateID := "memory_producer_with_update"
+	createMemoryProducerTemplate(t, env.store, templateID, true)
+
+	runID, err := env.engine.StartRunInput(ctx, contract.TaskInput{Idea: "learn safe implementation and review lessons", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: templateID})
+	if err != nil {
+		t.Fatalf("StartRunInput() error = %v", err)
+	}
+	if err := env.engine.StartQueuedRun(ctx, runID); err != nil {
+		t.Fatalf("StartQueuedRun() error = %v", err)
+	}
+	waitForRunStatus(t, env.store, runID, store.RunStatusCompleted)
+
+	var sawImplementationCapture, sawReviewCapture bool
+	for _, disp := range runner.disps {
+		if disp.StageType == contract.StageTypeImplementation && memoryCaptureInputEnabled(disp.Input) {
+			sawImplementationCapture = true
+		}
+		if disp.StageType == contract.StageTypeReview && disp.Input["review_role"] == contract.ReviewRoleArbiter && memoryCaptureInputEnabled(disp.Input) {
+			sawReviewCapture = true
+		}
+	}
+	if !sawImplementationCapture || !sawReviewCapture {
+		t.Fatalf("memory capture dispatch flags implementation=%v review=%v dispatches=%+v", sawImplementationCapture, sawReviewCapture, runner.disps)
+	}
+
+	memoryReport := reportForWorkflowStage(t, env.store, runID, "memory_update")
+	if got := reportPayloadInt(memoryReport.Payload, "candidate_count"); got != 2 {
+		t.Fatalf("memory candidate_count = %d, want 2; payload=%#v", got, memoryReport.Payload)
+	}
+	if got := reportPayloadInt(memoryReport.Payload, "applied_count"); got != 2 {
+		t.Fatalf("memory applied_count = %d, want 2; payload=%#v", got, memoryReport.Payload)
+	}
+	entries, err := env.store.ListProjectMemoryEntries(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("list project memory entries: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("project memory entry count = %d, want 2: %#v", len(entries), entries)
+	}
+	titles := map[string]bool{}
+	for _, entry := range entries {
+		titles[entry.Title] = true
+		if entry.SourceArtifactID == "" || entry.SourceStageID == "" || entry.CuratorStageID == "" {
+			t.Fatalf("memory entry missing source/curator links: %+v", entry)
+		}
+	}
+	for _, want := range []string{"Implementation fixture layout", "Review source-linking lesson"} {
+		if !titles[want] {
+			t.Fatalf("project memory titles = %#v, missing %q", titles, want)
+		}
+	}
+}
+
+func TestMemoryCaptureDisabledWithoutMemoryUpdateStage(t *testing.T) {
+	ctx := context.Background()
+	runner := &memoryLearningRunner{emitEvenWhenDisabled: true}
+	env := newTestEnv(t, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
+	templateID := "memory_producer_without_update"
+	createMemoryProducerTemplate(t, env.store, templateID, false)
+
+	runID, err := env.engine.StartRunInput(ctx, contract.TaskInput{Idea: "do not collect memory", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: templateID})
+	if err != nil {
+		t.Fatalf("StartRunInput() error = %v", err)
+	}
+	if err := env.engine.StartQueuedRun(ctx, runID); err != nil {
+		t.Fatalf("StartQueuedRun() error = %v", err)
+	}
+	waitForRunStatus(t, env.store, runID, store.RunStatusCompleted)
+
+	for _, disp := range runner.disps {
+		if memoryCaptureInputEnabled(disp.Input) {
+			t.Fatalf("dispatch unexpectedly enabled memory capture without memory_update stage: %+v", disp)
+		}
+	}
+	for _, workflowStageID := range []string{"implementation", "change_review_agent"} {
+		rep := reportForWorkflowStage(t, env.store, runID, workflowStageID)
+		if _, ok := firstPayloadValue(rep.Payload, "memory_candidates", "project_memory_candidates", memoryCapturePayloadKey); ok {
+			t.Fatalf("%s report retained memory candidates without memory_update stage: %#v", workflowStageID, rep.Payload)
+		}
+	}
+	entries, err := env.store.ListProjectMemoryEntries(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("list project memory entries: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("project memory entries = %#v, want none", entries)
 	}
 }
 
@@ -815,6 +960,80 @@ func TestStartRunFreezesSelectedWorkflowTemplateSnapshot(t *testing.T) {
 	}
 }
 
+func createMemoryProducerTemplate(t *testing.T, st *store.Store, templateID string, includeMemoryUpdate bool) {
+	t.Helper()
+	stages := []workflow.StageTemplate{
+		{ID: "idea_refinement", Type: workflow.StageTypeIdeaRefinement, Label: "Idea refinement", Actor: workflow.ActorHarness},
+		{ID: "implementation", Type: workflow.StageTypeImplementation, Label: "Implementation", Actor: workflow.ActorAgent},
+		{ID: "change_review_agent", Type: workflow.StageTypeReview, Label: "Code review", Actor: workflow.ActorAgent, Target: workflow.TargetCodeChanges},
+	}
+	edges := []workflow.Edge{
+		{From: "idea_refinement", To: "implementation", On: workflow.OnCompleted},
+		{From: "implementation", To: "change_review_agent", On: workflow.OnCompleted},
+	}
+	reviewNext := "stop_report"
+	if includeMemoryUpdate {
+		stages = append(stages, workflow.StageTemplate{ID: "memory_update", Type: workflow.StageTypeMemoryUpdate, Label: "Memory update", Actor: workflow.ActorAgent})
+		reviewNext = "memory_update"
+		edges = append(edges, workflow.Edge{From: "memory_update", To: "stop_report", On: workflow.OnCompleted})
+	}
+	stages = append(stages, workflow.StageTemplate{ID: "stop_report", Type: workflow.StageTypeStopReport, Label: "Stop/report", Actor: workflow.ActorHarness})
+	edges = append(edges, workflow.Edge{From: "change_review_agent", To: reviewNext, On: workflow.OnCompleted})
+	template := workflow.Template{
+		SchemaVersion: workflow.SchemaVersion,
+		ID:            templateID,
+		Name:          templateID,
+		Description:   "test memory producer workflow",
+		Editable:      true,
+		Stages:        stages,
+		Edges:         edges,
+	}
+	if err := st.CreateWorkflowTemplate(context.Background(), template); err != nil {
+		t.Fatalf("create workflow template: %v", err)
+	}
+}
+
+func reportForWorkflowStage(t *testing.T, st *store.Store, runID, workflowStageID string) report.Report {
+	t.Helper()
+	events, err := st.ListEvents(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	for _, ev := range events {
+		if ev.Type != "stage.completed" || payloadString(ev.Data, "workflow_stage_id") != workflowStageID {
+			continue
+		}
+		artifactID := payloadString(ev.Data, "report_artifact_id")
+		if artifactID == "" {
+			t.Fatalf("stage.completed for %s missing report_artifact_id: %#v", workflowStageID, ev)
+		}
+		_, content, err := st.GetArtifact(context.Background(), artifactID)
+		if err != nil {
+			t.Fatalf("get report artifact %s: %v", artifactID, err)
+		}
+		var rep report.Report
+		if err := json.Unmarshal(content, &rep); err != nil {
+			t.Fatalf("decode report artifact %s: %v", artifactID, err)
+		}
+		return rep
+	}
+	t.Fatalf("stage.completed report for workflow stage %s not found", workflowStageID)
+	return report.Report{}
+}
+
+func reportPayloadInt(payload map[string]any, key string) int {
+	switch value := payload[key].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	default:
+		return 0
+	}
+}
+
 type reviewVerdictRunner struct {
 	verdict report.Verdict
 	disps   []contract.Dispatch
@@ -887,6 +1106,58 @@ func (r *capturingRunner) Dispatch(_ context.Context, disp contract.Dispatch) (r
 }
 
 func (r *capturingRunner) CancelAttempt(context.Context, string, string, string) error { return nil }
+
+type memoryLearningRunner struct {
+	emitEvenWhenDisabled bool
+	disps                []contract.Dispatch
+}
+
+func (r *memoryLearningRunner) Dispatch(_ context.Context, disp contract.Dispatch) (report.Report, error) {
+	r.disps = append(r.disps, disp)
+	rep := validAdapterReport(disp, "memory learning dispatch")
+	switch disp.StageType {
+	case contract.StageTypeImplementation:
+		r.addLearning(&rep, disp, store.ProjectMemoryKindGotcha, "Implementation fixture layout", "Implementation discovered that generated fixtures should be kept under internal testdata for this repo.", "implementation report")
+	case contract.StageTypeReview:
+		switch disp.Input["review_role"] {
+		case contract.ReviewRoleCritic:
+			rep.Summary = "critic reviewed memory capture"
+			rep.Payload = map[string]any{"raw_findings": []any{}}
+			r.addLearning(&rep, disp, store.ProjectMemoryKindLesson, "Critic transient lesson", "Critic observed a transient learning that the final arbiter may consider.", "critic report")
+		case contract.ReviewRoleArbiter:
+			verdict := report.ReviewVerdictPass
+			rep.Verdict = &verdict
+			rep.Summary = "arbiter approved memory capture"
+			rep.Payload = map[string]any{
+				"raw_findings":          disp.Input["raw_findings"],
+				"arbitration_decisions": []any{},
+				"residual_risk":         "low",
+				"confidence":            "high",
+			}
+			r.addLearning(&rep, disp, store.ProjectMemoryKindLesson, "Review source-linking lesson", "Review confirmed that memory candidates can stay source-linked through report artifacts until curation.", "review arbiter report")
+		}
+	}
+	return rep, nil
+}
+
+func (r *memoryLearningRunner) addLearning(rep *report.Report, disp contract.Dispatch, kind, title, body, sourceSummary string) {
+	if !memoryCaptureInputEnabled(disp.Input) && !r.emitEvenWhenDisabled {
+		return
+	}
+	if rep.Payload == nil {
+		rep.Payload = map[string]any{}
+	}
+	rep.Payload[memoryCapturePayloadKey] = []any{map[string]any{
+		"kind":           kind,
+		"title":          title,
+		"body":           body,
+		"source_summary": sourceSummary,
+	}}
+}
+
+func (r *memoryLearningRunner) CancelAttempt(context.Context, string, string, string) error {
+	return nil
+}
 
 type malformedThenRepairedRunner struct {
 	disps []contract.Dispatch

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -247,6 +248,94 @@ func TestProjectNotificationSettingsSaveSwapsSection(t *testing.T) {
 	if prefs.OnlyWhenNeeded || !prefs.WhenFinished {
 		t.Fatalf("notification prefs = %+v, want only when_finished", prefs)
 	}
+}
+
+func TestWorkflowTemplateAuthoringCopyEditSaveReloadAndRejectsMalformed(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+
+	body := getSettingsBody(t, srv, "/templates")
+	assertContains(t, body, "Workflow templates")
+	assertContains(t, body, "Balanced PR Delivery")
+	assertContains(t, body, "Quick Fix Delivery")
+
+	cookie, csrf := getCSRFToken(t, srv)
+	copyRec := postForm(t, srv, "/templates/"+workflow.BalancedPRDeliveryID+"/copy", cookie, url.Values{"name": {"Team Balanced"}, "_csrf": {csrf}})
+	if copyRec.Code != http.StatusSeeOther {
+		t.Fatalf("POST template copy status = %d want %d body=%s", copyRec.Code, http.StatusSeeOther, copyRec.Body.String())
+	}
+	copyLocation := copyRec.Header().Get("Location")
+	if !strings.Contains(copyLocation, "/templates/") || !strings.Contains(copyLocation, "/edit") {
+		t.Fatalf("copy Location = %q, want edit location", copyLocation)
+	}
+	copyURL, err := url.Parse(copyLocation)
+	if err != nil {
+		t.Fatalf("parse copy location: %v", err)
+	}
+	templateID := strings.TrimPrefix(strings.TrimSuffix(copyURL.Path, "/edit"), "/templates/")
+	templateID, err = url.PathUnescape(templateID)
+	if err != nil {
+		t.Fatalf("unescape template id: %v", err)
+	}
+	copied, err := st.GetWorkflowTemplate(ctx, templateID)
+	if err != nil {
+		t.Fatalf("get copied template: %v", err)
+	}
+	if !copied.Editable || copied.Predefined || copied.Name != "Team Balanced" {
+		t.Fatalf("copied template = %+v, want editable project copy named Team Balanced", copied)
+	}
+
+	saveForm := workflowTemplateSaveForm(copied, csrf)
+	saveForm.Set("name", "Team Balanced Edited")
+	saveForm.Set("description", "Edited through the HTTP template authoring surface.")
+	saveForm.Set("enabled_memory_update", "1")
+	saveForm.Set("order_memory_update", "4")
+	saveForm.Set("order_validation", "5")
+	saveForm.Set("order_change_review_agent", "6")
+	saveForm.Set("order_commit_feature_branch", "7")
+	saveForm.Set("order_pr_creation", "8")
+	saveForm.Set("instructions_implementation", "Prefer the smallest safe change.")
+	saveForm.Set("fix_loop", "1")
+	saveForm.Set("max_fix_loops", "2")
+	saveRec := postForm(t, srv, "/templates/"+templateID+"/save", cookie, saveForm)
+	if saveRec.Code != http.StatusSeeOther {
+		t.Fatalf("POST template save status = %d want %d body=%s", saveRec.Code, http.StatusSeeOther, saveRec.Body.String())
+	}
+
+	saved, err := st.GetWorkflowTemplate(ctx, templateID)
+	if err != nil {
+		t.Fatalf("reload saved template: %v", err)
+	}
+	if saved.Name != "Team Balanced Edited" || saved.Description != "Edited through the HTTP template authoring surface." {
+		t.Fatalf("saved metadata = %q/%q", saved.Name, saved.Description)
+	}
+	if workflowTemplateStageIndex(saved, "memory_update") < 0 {
+		t.Fatalf("saved template missing enabled memory_update stage: %+v", saved.Stages)
+	}
+	assertWorkflowStageOrder(t, saved, "implementation", "memory_update", "validation")
+	implementation := saved.Stages[workflowTemplateStageIndex(saved, "implementation")]
+	if implementation.Settings["instructions"] != "Prefer the smallest safe change." {
+		t.Fatalf("implementation instructions = %#v", implementation.Settings["instructions"])
+	}
+	if !workflowTemplateHasEdge(saved, "implementation", "memory_update", workflow.OnCompleted) {
+		t.Fatalf("saved template did not derive implementation -> memory_update completed edge: %+v", saved.Edges)
+	}
+	if !workflowTemplateHasEdge(saved, "validation", "implementation", workflow.OnFailed) {
+		t.Fatalf("saved template did not derive validation fix-loop edge: %+v", saved.Edges)
+	}
+
+	editBody := getSettingsBody(t, srv, "/templates/"+templateID+"/edit")
+	assertContains(t, editBody, "Team Balanced Edited")
+	assertContains(t, editBody, "Memory update")
+
+	badForm := workflowTemplateSaveForm(saved, csrf)
+	badForm.Set("stage_type_implementation", workflow.StageTypeIdeaRefinement)
+	badRec := postForm(t, srv, "/templates/"+templateID+"/save", cookie, badForm)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("POST malformed template save status = %d want %d body=%s", badRec.Code, http.StatusBadRequest, badRec.Body.String())
+	}
+	assertContains(t, badRec.Body.String(), "exactly one idea_refinement")
 }
 
 func TestSystemSettingsExternalSinkCreationSealsSecretAndShowsWebhookSecretOnce(t *testing.T) {
@@ -1377,4 +1466,64 @@ func assertBefore(t *testing.T, body, first, second string) {
 	if firstIndex < 0 || secondIndex < 0 || firstIndex >= secondIndex {
 		t.Fatalf("body order want %q before %q (indexes %d, %d):\n%s", first, second, firstIndex, secondIndex, body)
 	}
+}
+
+func workflowTemplateSaveForm(template workflow.Template, csrf string) url.Values {
+	settings := workflowTemplateSettingsData(template.Settings)
+	form := url.Values{}
+	form.Set("_csrf", csrf)
+	form.Set("name", template.Name)
+	form.Set("description", template.Description)
+	form.Set("branch_policy", settings.BranchPolicy)
+	form.Set("pr_behavior", settings.PRBehavior)
+	form.Set("merge_policy", settings.MergePolicy)
+	if settings.FixLoop {
+		form.Set("fix_loop", "1")
+	}
+	if settings.MaxFixLoops > 0 {
+		form.Set("max_fix_loops", strconv.Itoa(settings.MaxFixLoops))
+	}
+	for _, row := range workflowTemplateStageRows(template) {
+		form.Add("stage_id", row.ID)
+		form.Set("stage_type_"+row.ID, row.Type)
+		if row.Enabled {
+			form.Set("enabled_"+row.ID, "1")
+		}
+		form.Set("order_"+row.ID, strconv.Itoa(row.Order))
+		form.Set("label_"+row.ID, row.Label)
+		form.Set("actor_"+row.ID, row.Actor)
+		form.Set("target_"+row.ID, row.Target)
+		form.Set("instructions_"+row.ID, row.Instructions)
+		form.Set("profile_"+row.ID, row.Profile)
+		form.Set("intensity_"+row.ID, row.Intensity)
+	}
+	return form
+}
+
+func workflowTemplateStageIndex(template workflow.Template, stageID string) int {
+	for i, stage := range template.Stages {
+		if stage.ID == stageID {
+			return i
+		}
+	}
+	return -1
+}
+
+func assertWorkflowStageOrder(t *testing.T, template workflow.Template, first, second, third string) {
+	t.Helper()
+	firstIndex := workflowTemplateStageIndex(template, first)
+	secondIndex := workflowTemplateStageIndex(template, second)
+	thirdIndex := workflowTemplateStageIndex(template, third)
+	if firstIndex < 0 || secondIndex < 0 || thirdIndex < 0 || !(firstIndex < secondIndex && secondIndex < thirdIndex) {
+		t.Fatalf("stage order indexes %s=%d %s=%d %s=%d in %+v", first, firstIndex, second, secondIndex, third, thirdIndex, template.Stages)
+	}
+}
+
+func workflowTemplateHasEdge(template workflow.Template, from, to, on string) bool {
+	for _, edge := range template.Edges {
+		if edge.From == from && edge.To == to && edge.On == on {
+			return true
+		}
+	}
+	return false
 }

@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <script type="module" src="/assets/datastar.min.js"></script>
+  <style>{{template "styles" .}}</style>
+</head>
+<body data-signals:csrf="'{{.CSRF}}'" data-on:load="@get('/notifications/events', {openWhenHidden: true})">
+  {{template "notifications_center.html" .Notifications}}
+  <main class="template-edit-main">
+    <header class="settings-header">
+      <p class="breadcrumb"><a href="/templates">Workflow templates</a> · <code>{{.Template.ID}}</code></p>
+      <h1>Edit workflow template</h1>
+      <p class="muted">Use forms for stage settings and order. Start, end, and fix-loop edges are derived by the harness every time this template is saved.</p>
+    </header>
+    {{with .Notice}}
+    <section class="notice" role="status" aria-live="polite">
+      <strong>{{.Title}}</strong>
+      <p>{{.Message}}</p>
+    </section>
+    {{end}}
+    {{if .Error}}
+    <section class="settings-inline-notice warning" role="alert">{{.Error}}</section>
+    {{end}}
+    {{if not .Template.Editable}}
+    <section class="card">
+      <h2>Read-only predefined template</h2>
+      <p>Copy this template from the templates list before editing. Predefined templates are reseeded by Parley and cannot be modified directly.</p>
+      <p><a href="/templates">Back to templates</a></p>
+    </section>
+    {{else}}
+    <form method="post" action="{{.SavePath}}">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
+      <section class="card">
+        <h2>Template details</h2>
+        <label for="name">Name</label>
+        <input id="name" name="name" required value="{{.Template.Name}}">
+        <label for="description">Description</label>
+        <textarea id="description" name="description" rows="3">{{.Template.Description}}</textarea>
+      </section>
+      <section class="card">
+        <h2>Delivery settings</h2>
+        <div class="template-settings-grid">
+          <label>Branch policy
+            <select name="branch_policy">
+              <option value="" {{if eq .Settings.BranchPolicy ""}}selected{{end}}>Unspecified</option>
+              <option value="feature_branch" {{if eq .Settings.BranchPolicy "feature_branch"}}selected{{end}}>Feature branch</option>
+              <option value="target_branch" {{if eq .Settings.BranchPolicy "target_branch"}}selected{{end}}>Target branch</option>
+            </select>
+          </label>
+          <label>PR behavior
+            <select name="pr_behavior">
+              <option value="" {{if eq .Settings.PRBehavior ""}}selected{{end}}>Unspecified</option>
+              <option value="create_pr" {{if eq .Settings.PRBehavior "create_pr"}}selected{{end}}>Create PR</option>
+              <option value="none" {{if eq .Settings.PRBehavior "none"}}selected{{end}}>No PR</option>
+            </select>
+          </label>
+          <label>Merge policy
+            <select name="merge_policy">
+              <option value="" {{if eq .Settings.MergePolicy ""}}selected{{end}}>Unspecified</option>
+              <option value="human_stop" {{if eq .Settings.MergePolicy "human_stop"}}selected{{end}}>Human stop</option>
+              <option value="no_auto_merge" {{if eq .Settings.MergePolicy "no_auto_merge"}}selected{{end}}>No auto-merge</option>
+              <option value="manual" {{if eq .Settings.MergePolicy "manual"}}selected{{end}}>Manual</option>
+            </select>
+          </label>
+          <label>Max fix loops
+            <input type="number" min="0" name="max_fix_loops" value="{{.Settings.MaxFixLoops}}">
+          </label>
+        </div>
+        <label class="checkbox-line"><input type="checkbox" name="fix_loop" value="1" {{if .Settings.FixLoop}}checked{{end}}> Enable validation/review fix-loop edges back to implementation</label>
+      </section>
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>Stage sequence</h2>
+            <p class="muted">Enable optional stages, set numeric order for compute stages, and edit stage-specific settings. Edges are not editable here.</p>
+          </div>
+          <button type="submit">Save template</button>
+        </div>
+        <div class="stage-editor-list">
+          {{range .StageRows}}
+          <fieldset class="stage-editor-row {{if not .Enabled}}stage-disabled{{end}}">
+            <legend>{{stageLabel .Type}} {{if .Existing}}<span class="safety-tag small">current</span>{{else}}<span class="safety-tag small">optional</span>{{end}}</legend>
+            <input type="hidden" name="stage_id" value="{{.ID}}">
+            <input type="hidden" name="stage_type_{{.ID}}" value="{{.Type}}">
+            <div class="stage-editor-controls">
+              <div>
+                {{if .Disableable}}
+                <label class="checkbox-line"><input type="checkbox" name="enabled_{{.ID}}" value="1" {{if .Enabled}}checked{{end}}> Enabled</label>
+                {{else}}
+                <input type="hidden" name="enabled_{{.ID}}" value="1">
+                <span class="safety-tag small">required</span>
+                {{end}}
+              </div>
+              <label>Order
+                {{if .Reorderable}}
+                <input type="number" name="order_{{.ID}}" value="{{.Order}}">
+                {{else}}
+                <input type="number" name="order_{{.ID}}" value="{{.Order}}" readonly>
+                {{end}}
+              </label>
+              <label>Stage ID
+                <input value="{{.ID}}" readonly>
+              </label>
+              <label>Label
+                <input name="label_{{.ID}}" value="{{.Label}}">
+              </label>
+              <label>Actor
+                <select name="actor_{{.ID}}">
+                  <option value="harness" {{if eq .Actor "harness"}}selected{{end}}>Harness</option>
+                  <option value="agent" {{if eq .Actor "agent"}}selected{{end}}>Agent</option>
+                  <option value="human" {{if eq .Actor "human"}}selected{{end}}>Human</option>
+                </select>
+              </label>
+            </div>
+            {{if .Review}}
+            <div class="stage-settings-grid">
+              <label>Review target
+                <select name="target_{{.ID}}">
+                  <option value="plan" {{if eq .Target "plan"}}selected{{end}}>Plan</option>
+                  <option value="code_changes" {{if eq .Target "code_changes"}}selected{{end}}>Code changes</option>
+                </select>
+              </label>
+              <label>Reviewer profile
+                <select name="profile_{{.ID}}">
+                  <option value="generalist" {{if eq .Profile "generalist"}}selected{{end}}>Generalist</option>
+                  <option value="security" {{if eq .Profile "security"}}selected{{end}}>Security</option>
+                  <option value="tests" {{if eq .Profile "tests"}}selected{{end}}>Tests</option>
+                  <option value="adversarial" {{if eq .Profile "adversarial"}}selected{{end}}>Adversarial</option>
+                </select>
+              </label>
+              <label>Intensity
+                <select name="intensity_{{.ID}}">
+                  <option value="light" {{if eq .Intensity "light"}}selected{{end}}>Light</option>
+                  <option value="normal" {{if eq .Intensity "normal"}}selected{{end}}>Normal</option>
+                  <option value="strict" {{if eq .Intensity "strict"}}selected{{end}}>Strict</option>
+                  <option value="adversarial" {{if eq .Intensity "adversarial"}}selected{{end}}>Adversarial</option>
+                </select>
+              </label>
+            </div>
+            {{end}}
+            <label>Instructions
+              <textarea name="instructions_{{.ID}}" rows="2" placeholder="Optional per-stage instructions.">{{.Instructions}}</textarea>
+            </label>
+          </fieldset>
+          {{end}}
+        </div>
+        <button type="submit">Save template</button>
+      </section>
+    </form>
+    {{end}}
+  </main>
+</body>
+</html>
