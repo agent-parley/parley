@@ -104,6 +104,11 @@ func (r Report) Validate() error {
 			errs = append(errs, err)
 		}
 	}
+	if r.StageType == contract.StageTypeMemoryUpdate && r.Status == StatusCompleted {
+		if _, err := MemoryUpdateOutputFromPayload(r.Payload); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	return errors.Join(errs...)
 }
 

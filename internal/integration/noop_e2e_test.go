@@ -222,6 +222,32 @@ func (a fakeImplementationAdapter) Run(ctx context.Context, disp contract.Dispat
 			Errors:        []string{},
 		}, nil
 	}
+	if disp.StageType == contract.StageTypeMemoryUpdate {
+		return report.Report{
+			SchemaVersion: report.SchemaVersion,
+			RunID:         disp.RunID,
+			TaskID:        disp.TaskID,
+			AttemptID:     disp.AttemptID,
+			StageID:       disp.StageID,
+			StageType:     disp.StageType,
+			Actor:         report.Actor{Kind: report.ActorKindAgent, ID: a.Name()},
+			Status:        report.StatusCompleted,
+			Summary:       "fake memory curator completed",
+			Payload: map[string]any{report.MemoryUpdateOutputPayloadKey: report.MemoryUpdateOutput{
+				InboxSummary:      report.MemoryInboxSummary{LearningOpportunities: 0, CandidatesGenerated: 0, CandidatesCurated: 0, SourceArtifactRefs: []string{}},
+				Applied:           []report.MemoryCandidateDecision{},
+				Rejected:          []report.MemoryCandidateDecision{},
+				Edited:            []report.MemoryCandidateDecision{},
+				Merged:            []report.MemoryCandidateDecision{},
+				Deferred:          []report.MemoryCandidateDecision{},
+				MemoryChanges:     []report.MemoryChange{},
+				ActorAuthority:    report.MemoryActorAuthority{Kind: report.ActorKindAgent, ID: a.Name(), Authority: "fake memory curator approved no writes"},
+				SafetyNotes:       []string{},
+				StopReportSummary: "project memory update completed: no candidates",
+			}},
+			Errors: []string{},
+		}, nil
+	}
 	if disp.StageType == contract.StageTypeReview {
 		rep := report.Report{
 			SchemaVersion: report.SchemaVersion,

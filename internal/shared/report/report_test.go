@@ -97,6 +97,22 @@ func TestReportValidate(t *testing.T) {
 			r.Payload = map[string]any{ValidationOutputPayloadKey: validValidationOutput()}
 			r.Errors = []string{"bad report"}
 		}, wantErr: true},
+		{name: "valid memory update output", mutate: func(r *Report) {
+			r.StageType = contract.StageTypeMemoryUpdate
+			r.Payload = map[string]any{MemoryUpdateOutputPayloadKey: validMemoryUpdateOutput()}
+		}},
+		{name: "memory update output required for completed memory stages", mutate: func(r *Report) {
+			r.StageType = contract.StageTypeMemoryUpdate
+		}, wantErr: true},
+		{name: "malformed memory update output rejected", mutate: func(r *Report) {
+			r.StageType = contract.StageTypeMemoryUpdate
+			r.Payload = map[string]any{MemoryUpdateOutputPayloadKey: map[string]any{"applied": []any{}}}
+		}, wantErr: true},
+		{name: "failed memory update may omit output", mutate: func(r *Report) {
+			r.StageType = contract.StageTypeMemoryUpdate
+			r.Status = StatusFailed
+			r.Errors = []string{"curator failed"}
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -112,6 +128,64 @@ func TestReportValidate(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+func TestMemoryUpdateOutputFromPayload(t *testing.T) {
+	out := validMemoryUpdateOutput()
+	parsed, err := MemoryUpdateOutputFromPayload(map[string]any{MemoryUpdateOutputPayloadKey: out})
+	if err != nil {
+		t.Fatalf("MemoryUpdateOutputFromPayload() error = %v", err)
+	}
+	if len(parsed.Applied) != 1 || len(parsed.Merged) != 1 || parsed.Applied[0].EntryID == "" {
+		t.Fatalf("parsed output = %#v", parsed)
+	}
+	if _, err := MemoryUpdateOutputFromPayload(map[string]any{MemoryUpdateOutputPayloadKey: map[string]any{"applied": []any{}}}); err == nil {
+		t.Fatalf("expected malformed memory_update_output to fail validation")
+	}
+}
+
+func validMemoryUpdateOutput() MemoryUpdateOutput {
+	return MemoryUpdateOutput{
+		InboxSummary: MemoryInboxSummary{LearningOpportunities: 2, CandidatesGenerated: 2, CandidatesCurated: 2, SourceArtifactRefs: []string{"artifact_report"}},
+		Applied: []MemoryCandidateDecision{{
+			CandidateID:        "candidate-001",
+			CandidateIDs:       []string{"candidate-001"},
+			State:              MemoryCandidateApplied,
+			Kind:               "lesson",
+			Title:              "Reusable lesson",
+			Body:               "Persist a durable lesson only after curation.",
+			Rationale:          "useful and source-linked",
+			EntryID:            "memory_1",
+			SourceArtifactRefs: []string{"artifact_report"},
+			Freshness:          MemoryFreshness{SourceRunID: "run_1", SourceTaskID: "task_1", SourceArtifactRefs: []string{"artifact_report"}, UpdatedAt: "2026-06-28T00:00:00Z"},
+		}},
+		Rejected: []MemoryCandidateDecision{},
+		Edited:   []MemoryCandidateDecision{},
+		Merged: []MemoryCandidateDecision{{
+			CandidateIDs:       []string{"candidate-002", "candidate-003"},
+			State:              MemoryCandidateMerged,
+			Kind:               "gotcha",
+			Title:              "Merged gotcha",
+			Body:               "Merge overlapping candidates into one memory entry.",
+			Rationale:          "overlapping candidates",
+			EntryID:            "memory_2",
+			SourceArtifactRefs: []string{"artifact_report"},
+			Freshness:          MemoryFreshness{SourceRunID: "run_1", SourceTaskID: "task_1", SourceArtifactRefs: []string{"artifact_report"}, UpdatedAt: "2026-06-28T00:00:00Z"},
+		}},
+		Deferred: []MemoryCandidateDecision{},
+		MemoryChanges: []MemoryChange{{
+			Action:             MemoryChangeApplied,
+			EntryID:            "memory_1",
+			CandidateIDs:       []string{"candidate-001"},
+			Kind:               "lesson",
+			Title:              "Reusable lesson",
+			SourceArtifactRefs: []string{"artifact_report"},
+			Freshness:          MemoryFreshness{SourceRunID: "run_1", SourceTaskID: "task_1", SourceArtifactRefs: []string{"artifact_report"}, UpdatedAt: "2026-06-28T00:00:00Z"},
+		}},
+		ActorAuthority:    MemoryActorAuthority{Kind: ActorKindAgent, ID: "pi", Authority: "agent curator approved automatically"},
+		SafetyNotes:       []string{},
+		StopReportSummary: "project memory update completed",
 	}
 }
 
