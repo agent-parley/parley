@@ -141,19 +141,44 @@ func TestProjectPreferencesAppStateIsAuthoritativeAndRepoPreferencesRemainCandid
 	}
 }
 
-func TestAssemblerStageAllowlistOmitsSourcesPerStageType(t *testing.T) {
+func TestAssemblerStageAllowlistFiltersProjectMemoryPerStageType(t *testing.T) {
 	ctx := context.Background()
-	req := briefRequest("", contract.StageTypeValidation)
-	brief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, req)
+	for _, tc := range []struct {
+		stageType  string
+		wantMemory bool
+	}{
+		{contract.StageTypeIdeaIntake, true},
+		{contract.StageTypeIdeaRefinement, true},
+		{contract.StageTypeReview, true},
+		{contract.StageTypeImplementation, true},
+		{contract.StageTypeMemoryUpdate, true},
+		{contract.StageTypeValidation, false},
+		{contract.StageTypeCommit, false},
+		{contract.StageTypePRCreation, false},
+		{contract.StageTypePRReady, false},
+		{contract.StageTypeStopReport, false},
+	} {
+		t.Run(tc.stageType, func(t *testing.T) {
+			brief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, briefRequest("", tc.stageType))
+			if err != nil {
+				t.Fatalf("Assemble() error = %v", err)
+			}
+			if gotMemory := hasSource(brief, SourceProjectMemory); gotMemory != tc.wantMemory {
+				t.Fatalf("project_memory presence = %t, want %t: %+v", gotMemory, tc.wantMemory, brief.Sources)
+			}
+		})
+	}
+
+	validationBrief, err := NewAssembler(Options{Now: fixedBriefNow}).Assemble(ctx, briefRequest("", contract.StageTypeValidation))
 	if err != nil {
-		t.Fatalf("Assemble() error = %v", err)
+		t.Fatalf("Assemble() validation error = %v", err)
 	}
-	if hasSource(brief, SourceProjectPreferences) {
-		t.Fatalf("validation stage unexpectedly received preferences: %+v", brief.Sources)
+	if hasSource(validationBrief, SourceProjectPreferences) {
+		t.Fatalf("validation stage unexpectedly received preferences: %+v", validationBrief.Sources)
 	}
-	for _, label := range []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory} {
-		if !hasSource(brief, label) {
-			t.Fatalf("validation sources missing %s: %+v", label, brief.Sources)
+	for _, label := range []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts} {
+		if !hasSource(validationBrief, label) {
+			t.Fatalf("validation sources missing %s: %+v", label, validationBrief.Sources)
 		}
 	}
 }

@@ -257,12 +257,12 @@ func defaultAllowlist() map[string][]string {
 		contract.StageTypeIdeaRefinement: {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectMemory, SourceProjectPreferences},
 		contract.StageTypeReview:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences},
 		contract.StageTypeImplementation: {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences},
-		contract.StageTypeValidation:     {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory},
-		contract.StageTypeCommit:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory},
-		contract.StageTypePRCreation:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectMemory, SourceProjectPreferences},
-		contract.StageTypePRReady:        {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectMemory, SourceProjectPreferences},
+		contract.StageTypeValidation:     {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts},
+		contract.StageTypeCommit:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts},
+		contract.StageTypePRCreation:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
+		contract.StageTypePRReady:        {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
 		contract.StageTypeMemoryUpdate:   {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectMemory, SourceProjectPreferences},
-		contract.StageTypeStopReport:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectMemory, SourceProjectPreferences},
+		contract.StageTypeStopReport:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
 	}
 }
 
