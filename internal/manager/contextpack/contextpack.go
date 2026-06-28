@@ -21,13 +21,14 @@ import (
 const (
 	SchemaVersion = 1
 
-	SourceTaskPlan           = "task_plan"
-	SourceWorkflowSnapshot   = "workflow_snapshot"
-	SourceRepoEvidence       = "repo_evidence"
-	SourceProjectRules       = "project_rules"
-	SourcePlanningArtifacts  = "planning_artifacts"
-	SourceProjectMemory      = "project_memory"
-	SourceProjectPreferences = "project_preferences"
+	SourceTaskPlan              = "task_plan"
+	SourceWorkflowSnapshot      = "workflow_snapshot"
+	SourceRepoEvidence          = "repo_evidence"
+	SourceProjectRules          = "project_rules"
+	SourcePlanningArtifacts     = "planning_artifacts"
+	SourceProjectMemory         = "project_memory"
+	SourceProjectPreferences    = "project_preferences"
+	SourceExternalForgeMetadata = "external_forge_metadata"
 
 	SourceItemAuthorityAuthoritative = "authoritative"
 	SourceItemAuthorityCandidate     = "candidate"
@@ -248,20 +249,21 @@ func defaultProviders() []SourceProvider {
 		PlanningArtifactsProvider{},
 		ProjectMemoryProvider{},
 		ProjectPreferencesProvider{},
+		ExternalForgeMetadataProvider{},
 	}
 }
 
 func defaultAllowlist() map[string][]string {
 	return map[string][]string{
-		contract.StageTypeIdeaIntake:     {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectMemory, SourceProjectPreferences},
-		contract.StageTypeIdeaRefinement: {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectMemory, SourceProjectPreferences},
-		contract.StageTypeReview:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences},
-		contract.StageTypeImplementation: {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences},
+		contract.StageTypeIdeaIntake:     {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectMemory, SourceProjectPreferences, SourceExternalForgeMetadata},
+		contract.StageTypeIdeaRefinement: {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectMemory, SourceProjectPreferences, SourceExternalForgeMetadata},
+		contract.StageTypeReview:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences, SourceExternalForgeMetadata},
+		contract.StageTypeImplementation: {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences, SourceExternalForgeMetadata},
 		contract.StageTypeValidation:     {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts},
 		contract.StageTypeCommit:         {SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts},
 		contract.StageTypePRCreation:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
 		contract.StageTypePRReady:        {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
-		contract.StageTypeMemoryUpdate:   {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectMemory, SourceProjectPreferences},
+		contract.StageTypeMemoryUpdate:   {SourceWorkflowSnapshot, SourceProjectRules, SourceProjectMemory, SourceProjectPreferences, SourceExternalForgeMetadata},
 		contract.StageTypeStopReport:     {SourceWorkflowSnapshot, SourceRepoEvidence, SourceProjectPreferences},
 	}
 }
@@ -275,13 +277,11 @@ func cloneAllowlist(in map[string][]string) map[string][]string {
 }
 
 func builtinSourceLabels() []string {
-	return []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences}
+	return []string{SourceTaskPlan, SourceRepoEvidence, SourceProjectRules, SourceWorkflowSnapshot, SourcePlanningArtifacts, SourceProjectMemory, SourceProjectPreferences, SourceExternalForgeMetadata}
 }
 
 func deferredSources() []DeferredSource {
-	return []DeferredSource{
-		{Label: "external_forge_metadata", Reason: "deferred until forge issue/PR metadata source is built"},
-	}
+	return []DeferredSource{}
 }
 
 func conflictPrecedence() []PrecedenceRule {
@@ -294,6 +294,7 @@ func conflictPrecedence() []PrecedenceRule {
 		{Rank: 6, Label: "planning_artifacts", Source: SourcePlanningArtifacts},
 		{Rank: 7, Label: "project_memory", Source: SourceProjectMemory},
 		{Rank: 8, Label: "project_preferences", Source: SourceProjectPreferences},
+		{Rank: 9, Label: "external_forge_metadata", Source: SourceExternalForgeMetadata},
 	}
 }
 
@@ -313,6 +314,8 @@ func precedenceRank(label string) int {
 		return 7
 	case SourceProjectPreferences:
 		return 8
+	case SourceExternalForgeMetadata:
+		return 9
 	default:
 		return 99
 	}
