@@ -55,6 +55,7 @@ type ProjectSettingsData struct {
 	Project       store.Project
 	Rules         ProjectSettingsSectionData
 	Preferences   ProjectSettingsSectionData
+	Memory        ProjectMemoryExportData
 	Notifications NotificationSettingsData
 	Center        NotificationCenterData
 	CSRF          string
@@ -125,6 +126,18 @@ type ProjectSettingsSectionData struct {
 	CandidateDiffers     bool
 	Notice               string
 	Status               string
+	CSRF                 string
+}
+
+type ProjectMemoryExportData struct {
+	Project              store.Project
+	Entries              []store.ProjectMemoryEntry
+	ExportDir            string
+	ExportActionPath     string
+	RepositoryConfigured bool
+	Notice               string
+	Status               string
+	ExportedFiles        []string
 	CSRF                 string
 }
 

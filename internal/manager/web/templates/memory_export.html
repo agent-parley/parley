@@ -1,0 +1,51 @@
+<section id="settings-memory" class="card settings-section">
+  <div class="settings-section-head">
+    <div>
+      <h2>Project Memory Export</h2>
+      <p class="muted">Project memory stays private by default. Select entries explicitly to export sanitized, source-linked copies into the repository.</p>
+    </div>
+  </div>
+  {{if .Notice}}
+  <p class="settings-inline-notice" role="status" aria-live="polite">{{.Notice}}</p>
+  {{end}}
+  {{if .Entries}}
+  <form method="post" action="{{.ExportActionPath}}" data-on:submit="@post('{{.ExportActionPath}}', {contentType: 'form'})">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}" data-bind:csrf>
+    <fieldset class="memory-export-list">
+      <legend>Select memory entries to export</legend>
+      {{range .Entries}}
+      <label class="memory-export-entry">
+        <input type="checkbox" name="memory_entry_id" value="{{.ID}}">
+        <span>
+          <strong>{{.Title}}</strong> <span class="pill">{{.Kind}}</span><br>
+          <small class="muted">updated {{.UpdatedAt}}{{if .SourceSummary}} · source: {{.SourceSummary}}{{end}}</small>
+        </span>
+      </label>
+      {{end}}
+    </fieldset>
+    <div class="settings-actions">
+      <button type="submit" {{if not .RepositoryConfigured}}disabled{{end}}>Export selected memory</button>
+      {{if .RepositoryConfigured}}
+      <span class="muted">Writes one sanitized Markdown file per selected entry under <code>{{.ExportDir}}</code>.</span>
+      {{else}}
+      <span class="muted">No repository configured; memory export is unavailable.</span>
+      {{end}}
+    </div>
+    {{if .Status}}
+    <p class="settings-status muted" role="status" aria-live="polite">{{.Status}}</p>
+    {{end}}
+    {{if .ExportedFiles}}
+    <ul class="muted">
+      {{range .ExportedFiles}}
+      <li><code>{{.}}</code></li>
+      {{end}}
+    </ul>
+    {{end}}
+  </form>
+  {{else}}
+  <p class="muted">No curated project memory entries are available for this project.</p>
+  {{if not .RepositoryConfigured}}
+  <p class="muted">No repository configured; memory export is unavailable.</p>
+  {{end}}
+  {{end}}
+</section>

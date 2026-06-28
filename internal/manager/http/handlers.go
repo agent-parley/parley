@@ -227,6 +227,10 @@ func (s *Server) handleProjectSettingsPath(w http.ResponseWriter, r *http.Reques
 		s.handleProjectNotificationSettingsSave(w, r, projectID)
 		return
 	}
+	if len(parts) == 2 && parts[0] == "memory" && parts[1] == "export" {
+		s.handleProjectMemoryExport(w, r, projectID)
+		return
+	}
 	if len(parts) == 1 && validProjectSettingsKind(parts[0]) {
 		s.handleProjectSettingsSave(w, r, projectID, parts[0])
 		return
@@ -368,12 +372,16 @@ func (s *Server) projectSettingsData(r *http.Request, project store.Project) (we
 	if err != nil {
 		return web.ProjectSettingsData{}, err
 	}
+	memoryExport, err := s.projectMemoryExportData(r, project, "", "", nil)
+	if err != nil {
+		return web.ProjectSettingsData{}, err
+	}
 	notificationSettings := s.projectNotificationSettingsData(r, project, "", "saved · updated "+project.UpdatedAt)
 	center, err := s.notificationCenterData(r.Context(), csrf)
 	if err != nil {
 		return web.ProjectSettingsData{}, err
 	}
-	return web.ProjectSettingsData{Project: project, Rules: rules, Preferences: preferences, Notifications: notificationSettings, Center: center, CSRF: csrf, Title: "Parley · " + project.Name + " Settings"}, nil
+	return web.ProjectSettingsData{Project: project, Rules: rules, Preferences: preferences, Memory: memoryExport, Notifications: notificationSettings, Center: center, CSRF: csrf, Title: "Parley · " + project.Name + " Settings"}, nil
 }
 
 func (s *Server) projectNotificationSettingsData(r *http.Request, project store.Project, notice, status string) web.NotificationSettingsData {

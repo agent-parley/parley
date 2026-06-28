@@ -64,6 +64,7 @@ const (
 	ProjectMemoryMaxTitleRunes       = 160
 	ProjectMemoryMaxBodyRunes        = 2000
 	ProjectMemoryMaxSourceRunes      = 500
+	ProjectMemoryExportDir           = ".parley/memory"
 )
 
 var (
@@ -246,6 +247,23 @@ type ProjectMemoryRejection struct {
 type ProjectMemoryUpdateResult struct {
 	Entries    []ProjectMemoryEntry
 	Rejections []ProjectMemoryRejection
+}
+
+type ProjectMemoryExportRequest struct {
+	ProjectID      string
+	RepositoryPath string
+	EntryIDs       []string
+}
+
+type ProjectMemoryExportFile struct {
+	EntryID      string
+	RelativePath string
+	Path         string
+	Sanitized    bool
+}
+
+type ProjectMemoryExportResult struct {
+	Files []ProjectMemoryExportFile
 }
 
 type Runner struct {
