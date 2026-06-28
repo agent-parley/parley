@@ -219,6 +219,29 @@ CREATE TABLE IF NOT EXISTS project_memory_entries (
   UNIQUE(project_id, kind, title)
 );
 
+CREATE TABLE IF NOT EXISTS project_memory_candidate_decisions (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  curator_stage_id TEXT NOT NULL REFERENCES stages(id),
+  candidate_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  source_stage_id TEXT NOT NULL REFERENCES stages(id),
+  source_artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+  source_summary TEXT NOT NULL DEFAULT '',
+  entry_id TEXT REFERENCES project_memory_entries(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(project_id, run_id) REFERENCES runs(project_id, id),
+  FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
+  UNIQUE(curator_stage_id, candidate_id)
+);
+
 CREATE TABLE IF NOT EXISTS secrets_keymeta (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   kek_version INTEGER NOT NULL,
@@ -251,3 +274,5 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_project_id ON artifacts(project_id);
 CREATE INDEX IF NOT EXISTS idx_notification_sinks_enabled ON notification_sinks(enabled, type, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_project_memory_entries_project ON project_memory_entries(project_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_project_memory_entries_source_run ON project_memory_entries(source_run_id);
+CREATE INDEX IF NOT EXISTS idx_project_memory_decisions_run ON project_memory_candidate_decisions(run_id, curator_stage_id);
+CREATE INDEX IF NOT EXISTS idx_project_memory_decisions_entry ON project_memory_candidate_decisions(entry_id);

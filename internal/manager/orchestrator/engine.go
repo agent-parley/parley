@@ -1011,9 +1011,6 @@ func (e *Engine) runWorkflowStage(ctx context.Context, wr store.WorkflowRun, run
 		}
 		return e.runReviewStage(ctx, wr, runtime, runtimeStage, lastReport, lastValidationReport, lastDeliveryReport, snapshot, snapshotErr)
 	case workflow.StageTypeMemoryUpdate:
-		if templateStage.Actor == workflow.ActorHuman {
-			return e.runHumanStage(ctx, wr, stage, templateStage, lastReport, lastValidationReport, lastDeliveryReport, snapshot, snapshotErr)
-		}
 		return e.runMemoryUpdateStage(ctx, wr, runtime, runtimeStage, lastReport)
 	case workflow.StageTypeCommit:
 		reportForCommit := lastValidationReport

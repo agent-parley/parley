@@ -59,6 +59,15 @@ const (
 	ProjectMemoryKindDecision               = "decision"
 	ProjectMemoryKindFreshnessNote          = "freshness_note"
 
+	ProjectMemoryDecisionApprove = "approve"
+	ProjectMemoryDecisionEdit    = "edit"
+	ProjectMemoryDecisionReject  = "reject"
+	ProjectMemoryDecisionDefer   = "defer"
+
+	ProjectMemoryDecisionOutcomeApplied  = "applied"
+	ProjectMemoryDecisionOutcomeRejected = "rejected"
+	ProjectMemoryDecisionOutcomeDeferred = "deferred"
+
 	ProjectMemoryMaxEntriesPerUpdate = 20
 	ProjectMemoryMaxKindRunes        = 64
 	ProjectMemoryMaxTitleRunes       = 160
@@ -221,6 +230,7 @@ type ProjectMemoryEntry struct {
 }
 
 type ProjectMemoryInput struct {
+	CandidateID      string
 	Kind             string
 	Title            string
 	Body             string
@@ -235,18 +245,53 @@ type ProjectMemoryUpdate struct {
 	TaskID         string
 	CuratorStageID string
 	Entries        []ProjectMemoryInput
+	Decisions      []ProjectMemoryDecisionInput
 }
 
 type ProjectMemoryRejection struct {
+	CandidateID      string `json:"candidate_id,omitempty"`
 	Title            string `json:"title"`
 	Reason           string `json:"reason"`
 	SourceStageID    string `json:"source_stage_id,omitempty"`
 	SourceArtifactID string `json:"source_artifact_id,omitempty"`
 }
 
+type ProjectMemoryDecisionInput struct {
+	CandidateID      string
+	Action           string
+	Kind             string
+	Title            string
+	Body             string
+	Reason           string
+	SourceStageID    string
+	SourceArtifactID string
+	SourceSummary    string
+}
+
+type ProjectMemoryDecisionRecord struct {
+	ID               string `json:"id"`
+	ProjectID        string `json:"project_id"`
+	RunID            string `json:"run_id"`
+	TaskID           string `json:"task_id"`
+	CuratorStageID   string `json:"curator_stage_id"`
+	CandidateID      string `json:"candidate_id"`
+	Action           string `json:"action"`
+	Outcome          string `json:"outcome"`
+	Kind             string `json:"kind"`
+	Title            string `json:"title"`
+	Body             string `json:"body"`
+	Reason           string `json:"reason,omitempty"`
+	SourceStageID    string `json:"source_stage_id"`
+	SourceArtifactID string `json:"source_artifact_id"`
+	SourceSummary    string `json:"source_summary"`
+	EntryID          string `json:"entry_id,omitempty"`
+	CreatedAt        string `json:"created_at"`
+}
+
 type ProjectMemoryUpdateResult struct {
 	Entries    []ProjectMemoryEntry
 	Rejections []ProjectMemoryRejection
+	Decisions  []ProjectMemoryDecisionRecord
 }
 
 type ProjectMemoryExportRequest struct {

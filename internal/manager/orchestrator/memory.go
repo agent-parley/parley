@@ -8,6 +8,7 @@ import (
 
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/workflow"
+	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
 
@@ -25,6 +26,12 @@ func (e *Engine) runMemoryUpdateStage(ctx context.Context, wr store.WorkflowRun,
 	candidates, extractionRejections, err := e.collectProjectMemoryCandidates(ctx, wr, stage.ID)
 	if err != nil {
 		return report.Report{}, err
+	}
+	if runtimeStage.Template.Actor == workflow.ActorHuman {
+		if err := e.suspendForHumanMemoryApproval(context.Background(), wr, stage, runtimeStage.Template, briefArtifact, candidates, extractionRejections); err != nil {
+			return report.Report{}, err
+		}
+		return report.Report{}, errRunAwaitingHuman
 	}
 	result, err := e.store.ApplyProjectMemoryUpdate(ctx, store.ProjectMemoryUpdate{
 		ProjectID:      wr.Run.ProjectID,
@@ -91,6 +98,147 @@ func (e *Engine) runMemoryUpdateStage(ctx context.Context, wr store.WorkflowRun,
 		return report.Report{}, err
 	}
 	return rep, nil
+}
+
+type memoryApprovalPacket struct {
+	SchemaVersion          int                            `json:"schema_version"`
+	RunID                  string                         `json:"run_id"`
+	TaskID                 string                         `json:"task_id"`
+	AttemptID              string                         `json:"attempt_id"`
+	StageID                string                         `json:"stage_id"`
+	StageType              string                         `json:"stage_type"`
+	WorkflowStageID        string                         `json:"workflow_stage_id"`
+	WorkflowStageLabel     string                         `json:"workflow_stage_label"`
+	StageBriefArtifactID   string                         `json:"stage_brief_artifact_id"`
+	PacketType             string                         `json:"packet_type"`
+	InboxSummary           map[string]any                 `json:"inbox_summary"`
+	Candidates             []memoryApprovalCandidate      `json:"candidates"`
+	ExtractionRejections   []store.ProjectMemoryRejection `json:"extraction_rejections,omitempty"`
+	AllowedActions         []string                       `json:"allowed_actions"`
+	HumanIsAuthoritative   bool                           `json:"human_is_authoritative"`
+	CuratorEnactsDecisions bool                           `json:"curator_enacts_decisions"`
+	RepairLoop             bool                           `json:"repair_loop"`
+	Timeout                any                            `json:"timeout"`
+	SubmissionEndpointHint string                         `json:"submission_endpoint_hint"`
+}
+
+type memoryApprovalCandidate struct {
+	CandidateID      string `json:"candidate_id"`
+	Kind             string `json:"kind"`
+	Title            string `json:"title"`
+	Body             string `json:"body"`
+	SourceStageID    string `json:"source_stage_id"`
+	SourceArtifactID string `json:"source_artifact_id"`
+	SourceSummary    string `json:"source_summary"`
+}
+
+func (e *Engine) suspendForHumanMemoryApproval(ctx context.Context, wr store.WorkflowRun, stage store.Stage, templateStage workflow.StageTemplate, briefArtifact store.Artifact, candidates []store.ProjectMemoryInput, extractionRejections []store.ProjectMemoryRejection) error {
+	packetCandidates := memoryApprovalCandidates(candidates)
+	packet := memoryApprovalPacket{
+		SchemaVersion:        report.SchemaVersion,
+		RunID:                wr.Run.ID,
+		TaskID:               wr.Task.ID,
+		AttemptID:            wr.Attempt.ID,
+		StageID:              stage.ID,
+		StageType:            stage.StageType,
+		WorkflowStageID:      templateStage.ID,
+		WorkflowStageLabel:   templateStage.Label,
+		StageBriefArtifactID: briefArtifact.ID,
+		PacketType:           "memory_approval",
+		InboxSummary: map[string]any{
+			"candidate_count":            len(packetCandidates),
+			"extraction_rejection_count": len(extractionRejections),
+			"source_artifact_count":      memoryApprovalSourceArtifactCount(packetCandidates, extractionRejections),
+			"writes_private_sqlite_only": true,
+			"repo_export_performed":      false,
+		},
+		Candidates:             packetCandidates,
+		ExtractionRejections:   extractionRejections,
+		AllowedActions:         []string{store.ProjectMemoryDecisionApprove, store.ProjectMemoryDecisionEdit, store.ProjectMemoryDecisionReject, store.ProjectMemoryDecisionDefer},
+		HumanIsAuthoritative:   true,
+		CuratorEnactsDecisions: true,
+		RepairLoop:             false,
+		Timeout:                nil,
+		SubmissionEndpointHint: fmt.Sprintf("/runs/%s/human-stages/%s/verdict", wr.Run.ID, stage.ID),
+	}
+	content, err := json.MarshalIndent(packet, "", "  ")
+	if err != nil {
+		return err
+	}
+	artifact, err := e.store.SaveArtifact(ctx, wr.Run.ID, "memory_approval_packet", "application/json", content, ".json")
+	if err != nil {
+		return err
+	}
+	changed, err := e.store.UpdateRunStatusFrom(ctx, wr.Run.ID, store.RunStatusRunning, store.RunStatusAwaitingHuman)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	eventData := map[string]any{
+		"status":                     store.RunStatusAwaitingHuman,
+		"pending_stage_id":           stage.ID,
+		"workflow_stage_id":          templateStage.ID,
+		"memory_approval_packet_id":  artifact.ID,
+		"stage_brief_artifact_id":    briefArtifact.ID,
+		"allowed_actions":            packet.AllowedActions,
+		"candidate_count":            len(packetCandidates),
+		"extraction_rejection_count": len(extractionRejections),
+		"human_is_authoritative":     true,
+		"curator_enacts_decisions":   true,
+		"runner_slot_released":       true,
+		"submission_endpoint_hint":   fmt.Sprintf("/runs/%s/human-stages/%s/verdict", wr.Run.ID, stage.ID),
+	}
+	_, err = e.emit(ctx, stageEvent(wr, stage, "stage.awaiting_human", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "memory update awaiting human approval", eventData))
+	return err
+}
+
+func memoryApprovalCandidates(inputs []store.ProjectMemoryInput) []memoryApprovalCandidate {
+	out := make([]memoryApprovalCandidate, 0, len(inputs))
+	for i, input := range inputs {
+		candidateID := strings.TrimSpace(input.CandidateID)
+		if candidateID == "" {
+			candidateID = fmt.Sprintf("candidate-%d", i+1)
+		}
+		out = append(out, memoryApprovalCandidate{
+			CandidateID:      candidateID,
+			Kind:             strings.TrimSpace(input.Kind),
+			Title:            strings.TrimSpace(input.Title),
+			Body:             strings.TrimSpace(input.Body),
+			SourceStageID:    strings.TrimSpace(input.SourceStageID),
+			SourceArtifactID: strings.TrimSpace(input.SourceArtifactID),
+			SourceSummary:    strings.TrimSpace(input.SourceSummary),
+		})
+	}
+	return out
+}
+
+func memoryApprovalSourceArtifactCount(candidates []memoryApprovalCandidate, rejections []store.ProjectMemoryRejection) int {
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		if candidate.SourceArtifactID != "" {
+			seen[candidate.SourceArtifactID] = true
+		}
+	}
+	for _, rejection := range rejections {
+		if rejection.SourceArtifactID != "" {
+			seen[rejection.SourceArtifactID] = true
+		}
+	}
+	return len(seen)
+}
+
+func (candidate memoryApprovalCandidate) projectMemoryInput() store.ProjectMemoryInput {
+	return store.ProjectMemoryInput{
+		CandidateID:      candidate.CandidateID,
+		Kind:             candidate.Kind,
+		Title:            candidate.Title,
+		Body:             candidate.Body,
+		SourceStageID:    candidate.SourceStageID,
+		SourceArtifactID: candidate.SourceArtifactID,
+		SourceSummary:    candidate.SourceSummary,
+	}
 }
 
 func (e *Engine) collectProjectMemoryCandidates(ctx context.Context, wr store.WorkflowRun, memoryStageID string) ([]store.ProjectMemoryInput, []store.ProjectMemoryRejection, error) {

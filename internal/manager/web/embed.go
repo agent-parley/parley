@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"os"
@@ -329,9 +330,23 @@ type OutcomeView struct {
 }
 
 type HumanReviewView struct {
-	StageID          string
-	WorkflowStageID  string
-	PacketArtifactID string
+	StageID             string
+	WorkflowStageID     string
+	StageType           string
+	PacketArtifactID    string
+	MemoryApproval      bool
+	MemoryInboxSummary  string
+	MemoryCandidates    []MemoryCandidateView
+	MemoryAllowedAction []string
+}
+
+type MemoryCandidateView struct {
+	CandidateID      string
+	Kind             string
+	Title            string
+	Body             string
+	SourceArtifactID string
+	SourceSummary    string
 }
 
 type ArtifactView struct {
@@ -909,6 +924,11 @@ func pendingHumanReview(bundle store.RunBundle) *HumanReviewView {
 			continue
 		}
 		packetID := eventString(ev, "human_review_packet_id")
+		memoryApproval := false
+		if memoryPacketID := eventString(ev, "memory_approval_packet_id"); memoryPacketID != "" {
+			packetID = memoryPacketID
+			memoryApproval = true
+		}
 		if packetID == "" {
 			continue
 		}
@@ -919,18 +939,78 @@ func pendingHumanReview(bundle store.RunBundle) *HumanReviewView {
 		if stageID == "" {
 			continue
 		}
-		view = HumanReviewView{StageID: stageID, WorkflowStageID: eventString(ev, "workflow_stage_id"), PacketArtifactID: packetID}
+		view = HumanReviewView{StageID: stageID, WorkflowStageID: eventString(ev, "workflow_stage_id"), PacketArtifactID: packetID, MemoryApproval: memoryApproval}
 		break
 	}
 	if view.StageID == "" {
 		return nil
 	}
 	for _, stage := range bundle.Stages {
-		if stage.ID == view.StageID && stage.Status == store.StageStatusRunning && stage.StageType == contract.StageTypeReview {
-			return &view
+		if stage.ID != view.StageID || stage.Status != store.StageStatusRunning {
+			continue
 		}
+		if stage.StageType != contract.StageTypeReview && stage.StageType != contract.StageTypeMemoryUpdate {
+			return nil
+		}
+		view.StageType = stage.StageType
+		if stage.StageType == contract.StageTypeMemoryUpdate {
+			view.MemoryApproval = true
+			view.populateMemoryApproval(bundle.Artifacts)
+		}
+		return &view
 	}
 	return nil
+}
+
+func (view *HumanReviewView) populateMemoryApproval(artifacts []store.Artifact) {
+	var artifact store.Artifact
+	for _, candidate := range artifacts {
+		if candidate.ID == view.PacketArtifactID {
+			artifact = candidate
+			break
+		}
+	}
+	if artifact.ID == "" {
+		return
+	}
+	content, err := os.ReadFile(artifact.Path)
+	if err != nil {
+		return
+	}
+	var packet struct {
+		InboxSummary map[string]any `json:"inbox_summary"`
+		Candidates   []struct {
+			CandidateID      string `json:"candidate_id"`
+			Kind             string `json:"kind"`
+			Title            string `json:"title"`
+			Body             string `json:"body"`
+			SourceArtifactID string `json:"source_artifact_id"`
+			SourceSummary    string `json:"source_summary"`
+		} `json:"candidates"`
+		AllowedActions []string `json:"allowed_actions"`
+	}
+	if err := json.Unmarshal(content, &packet); err != nil {
+		return
+	}
+	view.MemoryAllowedAction = packet.AllowedActions
+	view.MemoryInboxSummary = memoryInboxSummary(packet.InboxSummary)
+	for _, candidate := range packet.Candidates {
+		view.MemoryCandidates = append(view.MemoryCandidates, MemoryCandidateView{
+			CandidateID:      candidate.CandidateID,
+			Kind:             candidate.Kind,
+			Title:            candidate.Title,
+			Body:             candidate.Body,
+			SourceArtifactID: candidate.SourceArtifactID,
+			SourceSummary:    candidate.SourceSummary,
+		})
+	}
+}
+
+func memoryInboxSummary(summary map[string]any) string {
+	if len(summary) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%v candidates · %v extraction rejections · %v source artifacts", summary["candidate_count"], summary["extraction_rejection_count"], summary["source_artifact_count"])
 }
 
 func eventString(ev event.Event, key string) string {
