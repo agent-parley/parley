@@ -93,6 +93,26 @@ func TestResolveLayersProjectOverridesOverGlobalDefaults(t *testing.T) {
 	}
 }
 
+func TestDefaultProfileIDForStageTypeUsesSuggestedStageMapping(t *testing.T) {
+	registry := Defaults()
+	cases := map[string]string{
+		contract.StageTypeIdeaRefinement: ProfilePiInteractivePlanner,
+		contract.StageTypeImplementation: ProfilePiHeadlessWorker,
+		contract.StageTypeMemoryUpdate:   ProfilePiHeadlessWorker,
+		contract.StageTypeReview:         ProfilePiFreshReviewer,
+	}
+	for stageType, want := range cases {
+		got, ok := DefaultProfileIDForStageType(registry, stageType)
+		if !ok || got != want {
+			t.Fatalf("DefaultProfileIDForStageType(%q) = %q/%v, want %q/true", stageType, got, ok, want)
+		}
+	}
+	got, ok := DefaultProfileIDForStageType(registry, contract.StageTypeValidation)
+	if !ok || got != registry.DefaultProfileID {
+		t.Fatalf("fallback profile = %q/%v, want default %q", got, ok, registry.DefaultProfileID)
+	}
+}
+
 func TestProjectCanAddPiProfile(t *testing.T) {
 	profileID := "project_validator"
 	registry, err := Resolve(Overrides{}, Overrides{Profiles: map[string]ProfileOverride{

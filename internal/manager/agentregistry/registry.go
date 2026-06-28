@@ -248,11 +248,27 @@ func Validate(registry Registry) error {
 func ProfileByID(registry Registry, id string) (Profile, bool) {
 	id = normalizeID(id)
 	for _, profile := range registry.Profiles {
-		if profile.ID == id {
-			return profile, true
+		if normalizeID(profile.ID) == id {
+			return normalizeProfile(profile), true
 		}
 	}
 	return Profile{}, false
+}
+
+func DefaultProfileIDForStageType(registry Registry, stageType string) (string, bool) {
+	registry = normalizeRegistry(registry)
+	stageType = normalizeID(stageType)
+	for _, profile := range registry.Profiles {
+		for _, suggested := range profile.SuggestedStageTypes {
+			if normalizeID(suggested) == stageType {
+				return normalizeID(profile.ID), true
+			}
+		}
+	}
+	if _, ok := ProfileByID(registry, registry.DefaultProfileID); ok {
+		return registry.DefaultProfileID, true
+	}
+	return "", false
 }
 
 func normalizeRegistry(registry Registry) Registry {

@@ -120,7 +120,7 @@ func (e *Engine) dispatchReviewPass(ctx context.Context, wr store.WorkflowRun, s
 func reviewBaseInput(wr store.WorkflowRun, stage workflow.StageTemplate, lastReport, lastValidationReport, lastDeliveryReport report.Report, snapshot workerSnapshot, snapshotErr error) map[string]any {
 	profile := settingString(stage.Settings, "profile")
 	intensity := settingString(stage.Settings, "intensity")
-	instructions := settingString(stage.Settings, "instructions")
+	instructions := stage.Instructions
 	target := contract.NormalizeReviewTarget(stage.Target)
 	input := map[string]any{
 		"idea":                    wr.Run.Idea,
@@ -251,7 +251,7 @@ func normalizeArbiterReviewReport(wr store.WorkflowRun, stage store.Stage, templ
 	rep.Payload["arbitration_internal"] = true
 	rep.Payload["review_profile"] = settingString(templateStage.Settings, "profile")
 	rep.Payload["review_intensity"] = settingString(templateStage.Settings, "intensity")
-	rep.Payload["review_instructions"] = settingString(templateStage.Settings, "instructions")
+	rep.Payload["review_instructions"] = templateStage.Instructions
 	rep.Payload["critic_report_artifact_id"] = criticArtifactID
 	rep.Payload["max_fix_loops"] = maxFixLoops(template, templateStage)
 	if _, ok := rep.Payload["raw_findings"]; !ok {
