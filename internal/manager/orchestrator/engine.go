@@ -1589,7 +1589,7 @@ func (e *Engine) completeStage(ctx context.Context, wr store.WorkflowRun, stage 
 			Actor:         report.Actor{Kind: report.ActorKindHarness, ID: "manager"},
 			Status:        report.StatusInvalid,
 			Summary:       "stage returned invalid report",
-			Payload:       map[string]any{},
+			Payload:       withValidationFailureOutput(stage.StageType, map[string]any{}, "report schema validation", "stage returned invalid report", err),
 			Errors:        []string{err.Error()},
 		}
 	}
@@ -1980,13 +1980,24 @@ func implementationInput(wr store.WorkflowRun, previous report.Report) map[strin
 		}
 	}
 	if previous.StageType == contract.StageTypeValidation && previous.Status == report.StatusFailed {
-		input["fix_loop_context"] = map[string]any{
+		validationOutput, err := report.ValidationOutputFromPayload(previous.Payload)
+		fixContext := map[string]any{
 			"source":           "validation_failure",
 			"trigger_stage_id": previous.StageID,
 			"trigger_status":   previous.Status,
 			"summary":          previous.Summary,
-			"errors":           append([]string{}, previous.Errors...),
 		}
+		if err == nil {
+			fixContext["validation_result"] = validationOutput.Result
+			fixContext["checks_run"] = validationOutput.ChecksRun
+			fixContext["outputs"] = validationOutput.Outputs
+			fixContext["failures"] = validationOutput.Failures
+			fixContext["skipped"] = validationOutput.Skipped
+			fixContext["env_notes"] = validationOutput.EnvNotes
+			fixContext["confidence"] = validationOutput.Confidence
+			fixContext["suggested_next_action"] = validationOutput.SuggestedNextAction
+		}
+		input["fix_loop_context"] = fixContext
 	}
 	return input
 }
@@ -2006,7 +2017,7 @@ func dispatchFailedReport(wr store.WorkflowRun, stage store.Stage, adapterName s
 		Actor:         actor,
 		Status:        report.StatusFailed,
 		Summary:       "dispatch failed",
-		Payload:       map[string]any{},
+		Payload:       withValidationFailureOutput(stage.StageType, map[string]any{}, "dispatch", "dispatch failed", err),
 		Errors:        []string{err.Error()},
 	}
 }

@@ -688,7 +688,7 @@ func payloadPreview(payload map[string]any) map[string]any {
 	}
 	allowed := map[string]bool{
 		"branch": true, "commit_sha": true, "diff_artifact_id": true, "task_contract_artifact_id": true,
-		"workflow_snapshot_frozen": true, "gate": true, "no_verify": true, "hooks_disabled": true,
+		"workflow_snapshot_frozen": true, "gate": true, "validation_output": true, "no_verify": true, "hooks_disabled": true,
 	}
 	out := map[string]any{}
 	for key, value := range payload {

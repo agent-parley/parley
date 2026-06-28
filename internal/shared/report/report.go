@@ -96,6 +96,14 @@ func (r Report) Validate() error {
 	if (r.Status == StatusFailed || r.Status == StatusInvalid) && len(r.Errors) == 0 {
 		errs = append(errs, fmt.Errorf("errors must be populated when status=%s", r.Status))
 	}
+	if r.StageType == contract.StageTypeValidation {
+		validationOutput, err := ValidationOutputFromPayload(r.Payload)
+		if err != nil {
+			errs = append(errs, err)
+		} else if err := validValidationResultForStatus(r.Status, validationOutput.Result); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	return errors.Join(errs...)
 }
 
@@ -125,6 +133,28 @@ func validActorKind(v string) bool {
 	default:
 		return false
 	}
+}
+
+func validValidationResultForStatus(status string, result ValidationResult) error {
+	switch status {
+	case StatusCompleted:
+		if result != ValidationResultPassed {
+			return fmt.Errorf("validation_output.result must be %q when status=%s", ValidationResultPassed, status)
+		}
+	case StatusFailed:
+		if result != ValidationResultFailed {
+			return fmt.Errorf("validation_output.result must be %q when status=%s", ValidationResultFailed, status)
+		}
+	case StatusNeedsInput:
+		if result != ValidationResultInconclusive {
+			return fmt.Errorf("validation_output.result must be %q when status=%s", ValidationResultInconclusive, status)
+		}
+	case StatusInvalid:
+		if result == ValidationResultPassed {
+			return fmt.Errorf("validation_output.result must not be %q when status=%s", ValidationResultPassed, status)
+		}
+	}
+	return nil
 }
 
 func validStatus(v string) bool {

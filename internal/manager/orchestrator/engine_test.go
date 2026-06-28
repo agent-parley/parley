@@ -353,6 +353,40 @@ func TestDispatchStageRepairsMalformedReportBeforeCompletion(t *testing.T) {
 	}
 }
 
+func TestValidationReportRepairExhaustionUsesHarnessActor(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	wr, err := st.CreateWorkflowRun(ctx, "malformed validation report")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	runner := &alwaysMalformedRunner{}
+	engine := newRecordingEngine(t, st, runner, EngineOptions{})
+	rep, err := engine.dispatchStage(ctx, wr, wr.ValidationStage, "validation", contract.StageTypeValidation, map[string]any{"idea": wr.Run.Idea})
+	if err != nil {
+		t.Fatalf("dispatchStage() error = %v", err)
+	}
+	if rep.Status != report.StatusInvalid || rep.Actor.Kind != report.ActorKindHarness {
+		t.Fatalf("validation invalid report status/actor = %s/%s", rep.Status, rep.Actor.Kind)
+	}
+	if _, err := report.ValidationOutputFromPayload(rep.Payload); err != nil {
+		t.Fatalf("invalid validation report missing typed payload: %v", err)
+	}
+	events, err := st.ListEvents(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if !hasEventType(events, "harness.failed") {
+		t.Fatalf("missing harness.failed event: %#v", eventTypes(events))
+	}
+	if hasEventType(events, "adapter.failed") {
+		t.Fatalf("validation report repair emitted adapter.failed: %#v", eventTypes(events))
+	}
+}
+
 func TestReviewArbiterMissingVerdictIsRepaired(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
@@ -767,6 +801,94 @@ func TestReviewChangesRequestedCreatesFixLoopAttempt(t *testing.T) {
 	}
 }
 
+func TestValidationReportWithMalformedOutputCompletesAsInvalid(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "validation schema", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	engine := newRecordingEngine(t, st, nil, EngineOptions{})
+	runtime, err := engine.loadRuntimeWorkflow(ctx, wr)
+	if err != nil {
+		t.Fatalf("load runtime workflow: %v", err)
+	}
+	validationStage := runtime.ByID["validation"].Stage
+	rep := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		StageID:       validationStage.ID,
+		StageType:     contract.StageTypeValidation,
+		Actor:         report.Actor{Kind: report.ActorKindHarness, ID: "validation"},
+		Status:        report.StatusFailed,
+		Summary:       "validation failed",
+		Payload: map[string]any{report.ValidationOutputPayloadKey: map[string]any{
+			"result":                "failed",
+			"checks_run":            []any{map[string]any{"name": "go test", "status": "failed"}},
+			"confidence":            "high",
+			"suggested_next_action": "fix tests",
+		}},
+		Errors: []string{"legacy error"},
+	}
+	if err := engine.completeStage(ctx, wr, validationStage, rep); err != nil {
+		t.Fatalf("complete validation stage: %v", err)
+	}
+	updated := stageByWorkflowID(t, st, wr.Run.ID, "validation")
+	if updated.Status != report.StatusInvalid {
+		t.Fatalf("validation stage status = %s, want invalid", updated.Status)
+	}
+}
+
+func TestValidationFailureFixLoopContextUsesTypedFailures(t *testing.T) {
+	wr := store.WorkflowRun{Run: store.Run{Idea: "fix typed validation failure"}}
+	previous := report.Report{
+		StageID:   "stage_validation",
+		StageType: contract.StageTypeValidation,
+		Status:    report.StatusFailed,
+		Summary:   "validation failed",
+		Payload: map[string]any{report.ValidationOutputPayloadKey: report.ValidationOutput{
+			Result: report.ValidationResultFailed,
+			ChecksRun: []report.ValidationCheck{{
+				Name:    "go test ./...",
+				Status:  report.ValidationCheckFailed,
+				Command: "go test ./...",
+			}},
+			Outputs: []report.ValidationOutputRef{{ID: "artifact_log", Name: "test.log", Kind: "log"}},
+			Failures: []report.ValidationFailure{{
+				Check:      "go test ./...",
+				Message:    "TestWidget failed",
+				Severity:   "error",
+				OutputRefs: []string{"artifact_log"},
+			}},
+			Skipped:             []report.ValidationSkippedCheck{},
+			EnvNotes:            []string{"network=none"},
+			Confidence:          report.ValidationConfidenceMedium,
+			SuggestedNextAction: "fix the failing test",
+		}},
+		Errors: []string{"legacy conventional error should not drive the fix loop"},
+	}
+	input := implementationInput(wr, previous)
+	fixContext, ok := input["fix_loop_context"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing fix loop context: %#v", input)
+	}
+	failures, ok := fixContext["failures"].([]report.ValidationFailure)
+	if !ok || len(failures) != 1 || failures[0].Message != "TestWidget failed" {
+		t.Fatalf("typed failures = %#v", fixContext["failures"])
+	}
+	if _, ok := fixContext["errors"]; ok {
+		t.Fatalf("fix loop context used conventional errors: %#v", fixContext)
+	}
+	if fixContext["suggested_next_action"] != "fix the failing test" {
+		t.Fatalf("suggested_next_action = %#v", fixContext["suggested_next_action"])
+	}
+}
+
 func TestReviewFixLoopExhaustionBlocksThroughNeedsInput(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
@@ -841,10 +963,14 @@ func TestStartRunFreezesSelectedWorkflowTemplateSnapshot(t *testing.T) {
 func createMemoryProducerTemplate(t *testing.T, st *store.Store, templateID string, includeMemoryUpdate bool) {
 	t.Helper()
 	stages := []workflow.StageTemplate{
+		{ID: "idea_refinement", Type: workflow.StageTypeIdeaRefinement, Label: "Idea refinement", Actor: workflow.ActorHarness},
 		{ID: "implementation", Type: workflow.StageTypeImplementation, Label: "Implementation", Actor: workflow.ActorAgent},
 		{ID: "change_review_agent", Type: workflow.StageTypeReview, Label: "Code review", Actor: workflow.ActorAgent, Target: workflow.TargetCodeChanges},
 	}
-	edges := []workflow.Edge{{From: "implementation", To: "change_review_agent", On: workflow.OnCompleted}}
+	edges := []workflow.Edge{
+		{From: "idea_refinement", To: "implementation", On: workflow.OnCompleted},
+		{From: "implementation", To: "change_review_agent", On: workflow.OnCompleted},
+	}
 	reviewNext := "stop_report"
 	if includeMemoryUpdate {
 		stages = append(stages, workflow.StageTemplate{ID: "memory_update", Type: workflow.StageTypeMemoryUpdate, Label: "Memory update", Actor: workflow.ActorAgent})
@@ -960,19 +1086,7 @@ type capturingRunner struct {
 func (r *capturingRunner) Dispatch(_ context.Context, disp contract.Dispatch) (report.Report, error) {
 	r.disp = disp
 	r.disps = append(r.disps, disp)
-	rep := report.Report{
-		SchemaVersion: report.SchemaVersion,
-		RunID:         disp.RunID,
-		TaskID:        disp.TaskID,
-		AttemptID:     disp.AttemptID,
-		StageID:       disp.StageID,
-		StageType:     disp.StageType,
-		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: disp.Adapter},
-		Status:        report.StatusCompleted,
-		Summary:       "captured dispatch",
-		Payload:       map[string]any{},
-		Errors:        []string{},
-	}
+	rep := validAdapterReport(disp, "captured dispatch")
 	if disp.StageType == contract.StageTypeReview {
 		switch disp.Input["review_role"] {
 		case contract.ReviewRoleCritic:
@@ -1136,6 +1250,25 @@ func (r *alwaysMalformedRunner) CancelAttempt(context.Context, string, string, s
 }
 
 func validAdapterReport(disp contract.Dispatch, summary string) report.Report {
+	payload := map[string]any{}
+	actor := report.Actor{Kind: report.ActorKindAgent, ID: disp.Adapter}
+	if disp.StageType == contract.StageTypeValidation {
+		actor = report.Actor{Kind: report.ActorKindHarness, ID: disp.Adapter}
+		payload[report.ValidationOutputPayloadKey] = report.ValidationOutput{
+			Result: report.ValidationResultPassed,
+			ChecksRun: []report.ValidationCheck{{
+				Name:    "test validation",
+				Status:  report.ValidationCheckPassed,
+				Summary: "validation passed",
+			}},
+			Outputs:             []report.ValidationOutputRef{},
+			Failures:            []report.ValidationFailure{},
+			Skipped:             []report.ValidationSkippedCheck{},
+			EnvNotes:            []string{},
+			Confidence:          report.ValidationConfidenceHigh,
+			SuggestedNextAction: "continue",
+		}
+	}
 	return report.Report{
 		SchemaVersion: report.SchemaVersion,
 		RunID:         disp.RunID,
@@ -1143,10 +1276,10 @@ func validAdapterReport(disp contract.Dispatch, summary string) report.Report {
 		AttemptID:     disp.AttemptID,
 		StageID:       disp.StageID,
 		StageType:     disp.StageType,
-		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: disp.Adapter},
+		Actor:         actor,
 		Status:        report.StatusCompleted,
 		Summary:       summary,
-		Payload:       map[string]any{},
+		Payload:       payload,
 		Errors:        []string{},
 	}
 }

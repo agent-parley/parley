@@ -310,6 +310,10 @@ func (s sessionSink) Artifact(ctx context.Context, art runnerio.Artifact) error 
 }
 
 func failedReport(disp contract.Dispatch, err error) report.Report {
+	actor := report.Actor{Kind: report.ActorKindAgent, ID: disp.Adapter}
+	if disp.StageType == contract.StageTypeValidation {
+		actor.Kind = report.ActorKindHarness
+	}
 	return report.Report{
 		SchemaVersion: report.SchemaVersion,
 		RunID:         disp.RunID,
@@ -317,10 +321,10 @@ func failedReport(disp contract.Dispatch, err error) report.Report {
 		AttemptID:     disp.AttemptID,
 		StageID:       disp.StageID,
 		StageType:     disp.StageType,
-		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: disp.Adapter},
+		Actor:         actor,
 		Status:        report.StatusFailed,
 		Summary:       "adapter failed",
-		Payload:       map[string]any{},
+		Payload:       runnerValidationFailurePayload(disp, map[string]any{}, "adapter", err.Error()),
 		Errors:        []string{err.Error()},
 	}
 }
@@ -343,6 +347,7 @@ func invalidReport(disp contract.Dispatch, candidate report.Report, err error) r
 	if candidate.Verdict != nil {
 		invalidCandidate["verdict"] = string(*candidate.Verdict)
 	}
+	payload := map[string]any{"invalid_report": invalidCandidate}
 	return report.Report{
 		SchemaVersion: report.SchemaVersion,
 		RunID:         disp.RunID,
@@ -353,9 +358,36 @@ func invalidReport(disp contract.Dispatch, candidate report.Report, err error) r
 		Actor:         report.Actor{Kind: report.ActorKindHarness, ID: "runner"},
 		Status:        report.StatusInvalid,
 		Summary:       "adapter returned invalid report",
-		Payload:       map[string]any{"invalid_report": invalidCandidate},
+		Payload:       runnerValidationFailurePayload(disp, payload, "report schema validation", err.Error()),
 		Errors:        []string{err.Error()},
 	}
+}
+
+func runnerValidationFailurePayload(disp contract.Dispatch, payload map[string]any, check, message string) map[string]any {
+	if disp.StageType != contract.StageTypeValidation {
+		return payload
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	if _, ok := payload[report.ValidationOutputPayloadKey]; ok {
+		return payload
+	}
+	payload[report.ValidationOutputPayloadKey] = report.ValidationOutput{
+		Result: report.ValidationResultFailed,
+		ChecksRun: []report.ValidationCheck{{
+			Name:    check,
+			Status:  report.ValidationCheckFailed,
+			Summary: message,
+		}},
+		Outputs:             []report.ValidationOutputRef{},
+		Failures:            []report.ValidationFailure{{Check: check, Message: message, Severity: "error"}},
+		Skipped:             []report.ValidationSkippedCheck{},
+		EnvNotes:            []string{},
+		Confidence:          report.ValidationConfidenceLow,
+		SuggestedNextAction: "inspect validation harness failure before trusting validation evidence",
+	}
+	return payload
 }
 
 func CloseSession(sess *protocol.Session) error {
