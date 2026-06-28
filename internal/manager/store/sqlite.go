@@ -397,6 +397,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureNotificationSinksSchema(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureForgeCredentialsSchema(ctx); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, string(schema)); err != nil {
 		return fmt.Errorf("refresh sqlite indexes: %w", err)
 	}
@@ -523,6 +526,28 @@ func (s *Store) ensureNotificationSinksSchema(ctx context.Context) error {
 	if _, ok := cols["send_finished"]; !ok {
 		if _, err := s.db.ExecContext(ctx, `ALTER TABLE notification_sinks ADD COLUMN send_finished INTEGER NOT NULL DEFAULT 1`); err != nil {
 			return fmt.Errorf("add notification sink finished class column: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureForgeCredentialsSchema(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS forge_credentials (
+		id TEXT PRIMARY KEY,
+		host TEXT NOT NULL DEFAULT 'github.com',
+		secret_ciphertext BLOB NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create forge credentials table: %w", err)
+	}
+	cols, err := s.tableColumns(ctx, "forge_credentials")
+	if err != nil {
+		return err
+	}
+	if _, ok := cols["host"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE forge_credentials ADD COLUMN host TEXT NOT NULL DEFAULT 'github.com'`); err != nil {
+			return fmt.Errorf("add forge credential host column: %w", err)
 		}
 	}
 	return nil

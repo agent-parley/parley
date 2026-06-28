@@ -194,6 +194,7 @@ func workflowTemplateFromForm(r *http.Request, current workflow.Template) (workf
 	setStringSetting(updated.Settings, "merge_policy", r.Form.Get("merge_policy"))
 	setStringSetting(updated.Settings, "required_checks", r.Form.Get("required_checks"))
 	setStringSetting(updated.Settings, "forge_credential", r.Form.Get("forge_credential"))
+	setStringSetting(updated.Settings, "merge_wait_timeout", r.Form.Get("merge_wait_timeout"))
 	updated.Settings["fix_loop"] = r.Form.Get("fix_loop") != ""
 	if raw := strings.TrimSpace(r.Form.Get("max_fix_loops")); raw != "" {
 		maxLoops, err := strconv.Atoi(raw)
@@ -514,13 +515,14 @@ func reviewStageKey(stage workflow.StageTemplate) string {
 
 func workflowTemplateSettingsData(settings map[string]any) web.WorkflowTemplateSettingsData {
 	return web.WorkflowTemplateSettingsData{
-		BranchPolicy:    settingString(settings, "branch_policy"),
-		PRBehavior:      settingString(settings, "pr_behavior"),
-		MergePolicy:     settingString(settings, "merge_policy"),
-		RequiredChecks:  strings.Join(settingStringList(settings, "required_checks"), ", "),
-		ForgeCredential: firstSettingString(settings, "forge_credential", "forge_credential_id", "credential_ref"),
-		FixLoop:         settingBool(settings, "fix_loop"),
-		MaxFixLoops:     settingInt(settings, "max_fix_loops"),
+		BranchPolicy:     settingString(settings, "branch_policy"),
+		PRBehavior:       settingString(settings, "pr_behavior"),
+		MergePolicy:      settingString(settings, "merge_policy"),
+		RequiredChecks:   strings.Join(settingStringList(settings, "required_checks"), ", "),
+		ForgeCredential:  firstSettingString(settings, "forge_credential", "forge_credential_id", "credential_ref"),
+		MergeWaitTimeout: settingString(settings, "merge_wait_timeout"),
+		FixLoop:          settingBool(settings, "fix_loop"),
+		MaxFixLoops:      settingInt(settings, "max_fix_loops"),
 	}
 }
 

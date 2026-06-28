@@ -401,6 +401,46 @@ func TestSystemSettingsExternalSinkCreationSealsSecretAndShowsWebhookSecretOnce(
 	assertNotContains(t, body, secret[1])
 }
 
+func TestSystemSettingsForgeCredentialCreationSealsToken(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	svc, err := secrets.New(ctx, st, secrets.Config{})
+	if err != nil {
+		t.Fatalf("new secrets: %v", err)
+	}
+	srv := newRouteTestServerWithSecrets(t, st, &fakeRunController{state: defaultRouteQueueState()}, svc)
+	body := getSettingsBody(t, srv, "/settings")
+	assertContains(t, body, "Forge credentials")
+	cookie, csrf := getCSRFToken(t, srv)
+
+	rec := postForm(t, srv, "/settings/forge-credentials", cookie, url.Values{
+		"host":  {"github.com"},
+		"token": {"gh-secret-token"},
+		"_csrf": {csrf},
+	})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST forge credential status = %d want %d body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	body = rec.Body.String()
+	assertContains(t, body, "Forge credential stored")
+	assertNotContains(t, body, "gh-secret-token")
+	credentials, err := st.ListForgeCredentials(ctx)
+	if err != nil {
+		t.Fatalf("list forge credentials: %v", err)
+	}
+	if len(credentials) != 1 || credentials[0].Host != "github.com" {
+		t.Fatalf("credentials = %+v, want one github.com credential", credentials)
+	}
+	if strings.Contains(string(credentials[0].SecretCiphertext), "gh-secret-token") {
+		t.Fatal("stored forge credential contains plaintext")
+	}
+	table, column, rowID := store.ForgeCredentialSecretAD(credentials[0].ID)
+	plaintext, err := svc.Open(ctx, credentials[0].SecretCiphertext, secrets.AssociatedData{Table: table, Column: column, RowID: rowID})
+	if err != nil || string(plaintext) != "gh-secret-token" {
+		t.Fatalf("opened forge credential = %q, err=%v", plaintext, err)
+	}
+}
+
 func TestSystemSettingsExternalSinkCreationRefusedWhenSecretsUnavailable(t *testing.T) {
 	ctx := context.Background()
 	st := openRouteTestStore(t)
@@ -1588,6 +1628,7 @@ func workflowTemplateSaveForm(template workflow.Template, csrf string) url.Value
 	form.Set("merge_policy", settings.MergePolicy)
 	form.Set("required_checks", settings.RequiredChecks)
 	form.Set("forge_credential", settings.ForgeCredential)
+	form.Set("merge_wait_timeout", settings.MergeWaitTimeout)
 	if settings.FixLoop {
 		form.Set("fix_loop", "1")
 	}

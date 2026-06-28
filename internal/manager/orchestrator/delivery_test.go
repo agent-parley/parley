@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/workflow"
@@ -28,12 +29,13 @@ func TestPRReadyStageAutoMergeAttemptsWithChecksAndCredentials(t *testing.T) {
 	}}
 	engine := newRecordingEngine(t, st, nil, EngineOptions{ForgeDeliveryClient: client})
 	template := createDeliveryTemplate(t, ctx, st, "auto_delivery", map[string]any{
-		"branch_policy":    "feature_branch",
-		"pr_behavior":      "create_pr",
-		"merge_policy":     "auto_merge",
-		"required_checks":  []string{"ci/test", "lint"},
-		"forge_credential": "github-cli",
-		"target_branch":    "main",
+		"branch_policy":      "feature_branch",
+		"pr_behavior":        "create_pr",
+		"merge_policy":       "auto_merge",
+		"required_checks":    []string{"ci/test", "lint"},
+		"forge_credential":   "fcr_test",
+		"target_branch":      "main",
+		"merge_wait_timeout": "2s",
 	})
 	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "ship auto merge", WorkflowTemplateID: template.ID})
 	if err != nil {
@@ -51,11 +53,14 @@ func TestPRReadyStageAutoMergeAttemptsWithChecksAndCredentials(t *testing.T) {
 		t.Fatalf("forge requests = %d, want 1", len(client.requests))
 	}
 	req := client.requests[0]
-	if req.Branch != "agent/test" || req.CommitSHA != "abc123" || req.TargetBranch != "main" || req.CredentialRef != "github-cli" {
+	if req.Branch != "agent/test" || req.CommitSHA != "abc123" || req.TargetBranch != "main" || req.CredentialRef != "fcr_test" {
 		t.Fatalf("forge request = %+v", req)
 	}
 	if strings.Join(req.RequiredChecks, ",") != "ci/test,lint" {
 		t.Fatalf("required checks = %#v", req.RequiredChecks)
+	}
+	if req.MergeWaitTimeout != 2*time.Second {
+		t.Fatalf("merge wait timeout = %s, want 2s", req.MergeWaitTimeout)
 	}
 	if rep.Payload["auto_merge_attempted"] != true || rep.Payload["auto_merge_completed"] != true {
 		t.Fatalf("auto-merge payload = %+v", rep.Payload)
@@ -78,7 +83,7 @@ func TestPRReadyStageDoesNotAutoMergeHumanGatedPolicy(t *testing.T) {
 		"pr_behavior":      "create_pr",
 		"merge_policy":     "human_stop",
 		"required_checks":  []string{"ci/test"},
-		"forge_credential": "github-cli",
+		"forge_credential": "fcr_test",
 	})
 	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "stop for human", WorkflowTemplateID: template.ID})
 	if err != nil {
@@ -116,7 +121,7 @@ func TestPRReadyStageAutoMergeMissingChecksOrCredentialsNeedsInput(t *testing.T)
 				"merge_policy":     "auto_merge",
 				"target_branch":    "main",
 				"required_checks":  []string{"ci/test"},
-				"forge_credential": "github-cli",
+				"forge_credential": "fcr_test",
 			},
 			want: "branch_policy",
 		},
@@ -127,7 +132,7 @@ func TestPRReadyStageAutoMergeMissingChecksOrCredentialsNeedsInput(t *testing.T)
 				"merge_policy":     "auto_merge",
 				"target_branch":    "main",
 				"required_checks":  []string{"ci/test"},
-				"forge_credential": "github-cli",
+				"forge_credential": "fcr_test",
 			},
 			want: "pr_behavior",
 		},
@@ -138,7 +143,7 @@ func TestPRReadyStageAutoMergeMissingChecksOrCredentialsNeedsInput(t *testing.T)
 				"pr_behavior":      "create_pr",
 				"merge_policy":     "auto_merge",
 				"required_checks":  []string{"ci/test"},
-				"forge_credential": "github-cli",
+				"forge_credential": "fcr_test",
 			},
 			want: "target branch",
 		},
@@ -149,7 +154,7 @@ func TestPRReadyStageAutoMergeMissingChecksOrCredentialsNeedsInput(t *testing.T)
 				"pr_behavior":      "create_pr",
 				"merge_policy":     "auto_merge",
 				"target_branch":    "main",
-				"forge_credential": "github-cli",
+				"forge_credential": "fcr_test",
 			},
 			want: "required check",
 		},

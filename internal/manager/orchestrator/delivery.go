@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/workflow"
@@ -18,6 +19,7 @@ type prDeliveryOutcome struct {
 	PRBehavior         string
 	MergePolicy        string
 	TargetBranch       string
+	MergeWaitTimeout   time.Duration
 	RequiredChecks     []string
 	CredentialRef      string
 	PushPerformed      bool
@@ -45,6 +47,13 @@ func (e *Engine) completePRDelivery(ctx context.Context, wr store.WorkflowRun, b
 	}
 	out.RequiredChecks = settingStringList(settings, "required_checks")
 	out.CredentialRef = firstSettingString(settings, "forge_credential", "forge_credential_id", "credential_ref")
+	mergeWaitTimeout, err := settingDuration(settings, "merge_wait_timeout", DefaultMergeWaitTimeout, MaxMergeWaitTimeout)
+	if err != nil {
+		out.Status = report.StatusNeedsInput
+		out.Reason = "auto-merge merge_wait_timeout is invalid: " + err.Error()
+		return out
+	}
+	out.MergeWaitTimeout = mergeWaitTimeout
 	if out.BranchPolicy != "feature_branch" {
 		out.Status = report.StatusNeedsInput
 		out.Reason = "auto-merge requires branch_policy=feature_branch"
@@ -83,16 +92,17 @@ func (e *Engine) completePRDelivery(ctx context.Context, wr store.WorkflowRun, b
 
 	out.AutoMergeAttempted = true
 	result, err := e.forgeDeliveryClient.CompletePR(ctx, ForgeDeliveryRequest{
-		WorktreePath:   e.worktreePathForDelivery(wr),
-		Branch:         branch,
-		TargetBranch:   out.TargetBranch,
-		CommitSHA:      commitSHA,
-		Title:          deliveryTitle(wr),
-		Body:           deliveryBody(wr, diffID),
-		MergePolicy:    out.MergePolicy,
-		MergeMethod:    settingString(settings, "merge_method"),
-		CredentialRef:  out.CredentialRef,
-		RequiredChecks: out.RequiredChecks,
+		WorktreePath:     e.worktreePathForDelivery(wr),
+		Branch:           branch,
+		TargetBranch:     out.TargetBranch,
+		CommitSHA:        commitSHA,
+		Title:            deliveryTitle(wr),
+		Body:             deliveryBody(wr, diffID),
+		MergePolicy:      out.MergePolicy,
+		MergeMethod:      settingString(settings, "merge_method"),
+		MergeWaitTimeout: out.MergeWaitTimeout,
+		CredentialRef:    out.CredentialRef,
+		RequiredChecks:   out.RequiredChecks,
 	})
 	if err != nil {
 		out.Status = report.StatusFailed
@@ -191,4 +201,42 @@ func settingStringList(settings map[string]any, key string) []string {
 		add(fmt.Sprint(v))
 	}
 	return out
+}
+
+func settingDuration(settings map[string]any, key string, fallback, max time.Duration) (time.Duration, error) {
+	if settings == nil {
+		return fallback, nil
+	}
+	value, ok := settings[key]
+	if !ok || value == nil {
+		return fallback, nil
+	}
+	var d time.Duration
+	switch v := value.(type) {
+	case time.Duration:
+		d = v
+	case int:
+		d = time.Duration(v) * time.Second
+	case int64:
+		d = time.Duration(v) * time.Second
+	case float64:
+		d = time.Duration(v) * time.Second
+	default:
+		raw := strings.TrimSpace(fmt.Sprint(v))
+		if raw == "" {
+			return fallback, nil
+		}
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return 0, err
+		}
+		d = parsed
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("must be positive")
+	}
+	if max > 0 && d > max {
+		d = max
+	}
+	return d, nil
 }

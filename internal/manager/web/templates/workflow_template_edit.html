@@ -71,7 +71,10 @@
             <input name="required_checks" value="{{.Settings.RequiredChecks}}" placeholder="ci/test, lint">
           </label>
           <label>Forge credential ref
-            <input name="forge_credential" value="{{.Settings.ForgeCredential}}" placeholder="github-cli or env:GH_TOKEN">
+            <input name="forge_credential" value="{{.Settings.ForgeCredential}}" placeholder="stored credential ID, e.g. fcr_...">
+          </label>
+          <label>Merge wait timeout
+            <input name="merge_wait_timeout" value="{{.Settings.MergeWaitTimeout}}" placeholder="5m (max 30m)">
           </label>
           <label>Max fix loops
             <input type="number" min="0" name="max_fix_loops" value="{{.Settings.MaxFixLoops}}">

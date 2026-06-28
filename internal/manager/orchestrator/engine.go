@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/agent-parley/parley/internal/manager/contextpack"
+	"github.com/agent-parley/parley/internal/manager/secrets"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/runner/worktree"
@@ -106,6 +107,7 @@ type Engine struct {
 	gitAuthorName         string
 	gitAuthorEmail        string
 	gitExecutable         string
+	secrets               *secrets.Service
 	forgeDeliveryClient   ForgeDeliveryClient
 	contextAssembler      *contextpack.Assembler
 }
@@ -120,6 +122,7 @@ type EngineOptions struct {
 	GitAuthorName         string
 	GitAuthorEmail        string
 	GitExecutable         string
+	Secrets               *secrets.Service
 	ForgeDeliveryClient   ForgeDeliveryClient
 	QueuePolicy           *QueuePolicy
 	RunnerSlots           int
@@ -207,7 +210,7 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 	}
 	forgeDeliveryClient := opts.ForgeDeliveryClient
 	if forgeDeliveryClient == nil {
-		forgeDeliveryClient = newCLIForgeDeliveryClient(opts.GitExecutable)
+		forgeDeliveryClient = newCLIForgeDeliveryClient(opts.GitExecutable, st, opts.Secrets)
 	}
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	return &Engine{
@@ -235,6 +238,7 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 		gitAuthorName:         opts.GitAuthorName,
 		gitAuthorEmail:        opts.GitAuthorEmail,
 		gitExecutable:         opts.GitExecutable,
+		secrets:               opts.Secrets,
 		forgeDeliveryClient:   forgeDeliveryClient,
 		contextAssembler:      contextAssembler,
 		rootCtx:               rootCtx,
@@ -1440,6 +1444,7 @@ func (e *Engine) runPRReadyStage(ctx context.Context, wr store.WorkflowRun, stag
 			"pr_behavior":               delivery.PRBehavior,
 			"merge_policy":              delivery.MergePolicy,
 			"target_branch":             delivery.TargetBranch,
+			"merge_wait_timeout":        delivery.MergeWaitTimeout.String(),
 			"required_checks":           delivery.RequiredChecks,
 			"forge_credential":          delivery.CredentialRef,
 			"auto_merge_attempted":      delivery.AutoMergeAttempted,
