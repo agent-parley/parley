@@ -8,11 +8,151 @@ import (
 
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/workflow"
+	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
 
+type projectMemoryInboxCandidate struct {
+	ID    string
+	Input store.ProjectMemoryInput
+}
+
+type projectMemoryApplyDecision struct {
+	State              report.MemoryCandidateState
+	Decision           report.MemoryCandidateDecision
+	Input              store.ProjectMemoryInput
+	CandidateIDs       []string
+	SourceArtifactRefs []string
+}
+
 func (e *Engine) runMemoryUpdateStage(ctx context.Context, wr store.WorkflowRun, runtime runtimeWorkflow, runtimeStage runtimeStage, lastReport report.Report) (report.Report, error) {
+	if runtimeStage.Template.Actor == workflow.ActorHuman {
+		return e.runHumanMemoryUpdateStage(ctx, wr, runtime, runtimeStage, lastReport)
+	}
+	if runtimeStage.Template.Actor == workflow.ActorAgent {
+		return e.runAgentMemoryUpdateStage(ctx, wr, runtime, runtimeStage, lastReport)
+	}
+	return e.runHarnessMemoryUpdateStage(ctx, wr, runtime, runtimeStage, lastReport)
+}
+
+// runHumanMemoryUpdateStage suspends the run for human approval of the project
+// memory candidates instead of writing them. The operator's approve/edit/reject/
+// defer decisions are enacted later via SubmitHumanReview.
+func (e *Engine) runHumanMemoryUpdateStage(ctx context.Context, wr store.WorkflowRun, runtime runtimeWorkflow, runtimeStage runtimeStage, lastReport report.Report) (report.Report, error) {
+	stage := runtimeStage.Stage
+	_, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
+	if err != nil {
+		return report.Report{}, err
+	}
+	stage.StageBriefArtifactID = briefArtifact.ID
+	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
+		return report.Report{}, err
+	}
+	candidates, extractionRejections, err := e.collectProjectMemoryCandidates(ctx, wr, stage.ID)
+	if err != nil {
+		return report.Report{}, err
+	}
+	if err := e.suspendForHumanMemoryApproval(context.Background(), wr, stage, runtimeStage.Template, briefArtifact, candidates, extractionRejections); err != nil {
+		return report.Report{}, err
+	}
+	return report.Report{}, errRunAwaitingHuman
+}
+
+func (e *Engine) runAgentMemoryUpdateStage(ctx context.Context, wr store.WorkflowRun, runtime runtimeWorkflow, runtimeStage runtimeStage, lastReport report.Report) (report.Report, error) {
+	stage := runtimeStage.Stage
+	briefMarkdown, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
+	if err != nil {
+		return report.Report{}, err
+	}
+	stage.StageBriefArtifactID = briefArtifact.ID
+	e.setActiveStage(wr.Run.ID, stage)
+	defer e.clearActiveStage(wr.Run.ID, stage.ID)
+	if err := e.startStage(ctx, wr, stage, stage.StageType+" stage started"); err != nil {
+		return report.Report{}, err
+	}
+
+	candidates, extractionRejections, err := e.collectProjectMemoryCandidateInbox(ctx, wr, stage.ID)
+	if err != nil {
+		return report.Report{}, err
+	}
+	existingEntries, err := e.store.ListProjectMemoryEntries(ctx, wr.Run.ProjectID)
+	if err != nil {
+		return report.Report{}, err
+	}
+
+	input := e.stageDispatchInput(runtime, runtimeStage.Template, map[string]any{
+		"memory_update_mode":              "agent_curator",
+		"memory_update_policy":            projectMemoryPolicyPayload(),
+		"project_memory_inbox":            projectMemoryInboxPayload(candidates, extractionRejections),
+		"project_memory_existing_entries": projectMemoryEntriesPayload(existingEntries),
+	})
+	if lastReport.StageID != "" {
+		input["previous_stage_id"] = lastReport.StageID
+		input["previous_stage_type"] = lastReport.StageType
+		input["previous_status"] = lastReport.Status
+	}
+	input = withStageBriefInput(input, briefMarkdown, briefArtifact.ID)
+	adapterName := stage.Adapter
+	if strings.TrimSpace(adapterName) == "" {
+		adapterName = e.implementationAdapter
+	}
+	disp := contract.Dispatch{
+		ProjectID:    wr.Run.ProjectID,
+		RepositoryID: wr.Task.RepositoryID,
+		RunID:        wr.Run.ID,
+		TaskID:       wr.Task.ID,
+		AttemptID:    wr.Attempt.ID,
+		StageID:      stage.ID,
+		StageType:    stage.StageType,
+		Adapter:      adapterName,
+		Input:        input,
+	}
+	curatorReport, err := e.dispatchWithReportRepair(ctx, wr, stage, disp, reportRepairOptions{
+		AdapterName:   adapterName,
+		StageType:     stage.StageType,
+		EmitLifecycle: adapterName != "",
+		LifecycleData: map[string]any{"adapter": adapterName, "curator": "memory_update_agent"},
+		Validator:     memoryCuratorReportValidator(wr, stage, stage.StageType, adapterName),
+	})
+	if err != nil {
+		return report.Report{}, err
+	}
+	if curatorReport.Status != report.StatusCompleted {
+		if err := e.completeStage(context.Background(), wr, stage, curatorReport); err != nil {
+			return report.Report{}, err
+		}
+		return curatorReport, nil
+	}
+	proposal, err := report.MemoryUpdateOutputFromPayload(curatorReport.Payload)
+	if err != nil {
+		invalid := invalidAdapterReport(wr, stage, adapterName, "memory curator returned invalid structured output", curatorReport, err)
+		if err := e.completeStage(context.Background(), wr, stage, invalid); err != nil {
+			return report.Report{}, err
+		}
+		return invalid, nil
+	}
+	result, output, err := e.applyMemoryCuratorProposal(ctx, wr, stage, candidates, extractionRejections, proposal, curatorReport.Actor)
+	if err != nil {
+		return report.Report{}, err
+	}
+
+	finalReport := curatorReport
+	finalReport.Summary = output.StopReportSummary
+	finalReport.EvidenceRefs = memoryUpdateEvidenceRefs(briefArtifact.ID, output)
+	finalReport.Payload = memoryUpdatePayload(runtime, runtimeStage, output, result, "agent_memory_curator")
+	if lastReport.StageID != "" {
+		finalReport.Payload["previous_stage_id"] = lastReport.StageID
+		finalReport.Payload["previous_stage_type"] = lastReport.StageType
+		finalReport.Payload["previous_status"] = lastReport.Status
+	}
+	if err := e.completeStage(context.Background(), wr, stage, finalReport); err != nil {
+		return report.Report{}, err
+	}
+	return finalReport, nil
+}
+
+func (e *Engine) runHarnessMemoryUpdateStage(ctx context.Context, wr store.WorkflowRun, runtime runtimeWorkflow, runtimeStage runtimeStage, lastReport report.Report) (report.Report, error) {
 	stage := runtimeStage.Stage
 	_, briefArtifact, err := e.prepareStageBrief(ctx, wr, stage)
 	if err != nil {
@@ -23,15 +163,13 @@ func (e *Engine) runMemoryUpdateStage(ctx context.Context, wr store.WorkflowRun,
 		return report.Report{}, err
 	}
 
-	candidates, extractionRejections, err := e.collectProjectMemoryCandidates(ctx, wr, stage.ID)
+	inbox, extractionRejections, err := e.collectProjectMemoryCandidateInbox(ctx, wr, stage.ID)
 	if err != nil {
 		return report.Report{}, err
 	}
-	if runtimeStage.Template.Actor == workflow.ActorHuman {
-		if err := e.suspendForHumanMemoryApproval(context.Background(), wr, stage, runtimeStage.Template, briefArtifact, candidates, extractionRejections); err != nil {
-			return report.Report{}, err
-		}
-		return report.Report{}, errRunAwaitingHuman
+	candidates := make([]store.ProjectMemoryInput, 0, len(inbox))
+	for _, candidate := range inbox {
+		candidates = append(candidates, candidate.Input)
 	}
 	result, err := e.store.ApplyProjectMemoryUpdate(ctx, store.ProjectMemoryUpdate{
 		ProjectID:      wr.Run.ProjectID,
@@ -43,24 +181,13 @@ func (e *Engine) runMemoryUpdateStage(ctx context.Context, wr store.WorkflowRun,
 	if err != nil {
 		return report.Report{}, err
 	}
+	output := harnessMemoryUpdateOutput(wr, inbox, extractionRejections, result)
 	result.Rejections = append(extractionRejections, result.Rejections...)
-
-	entryIDs := make([]string, 0, len(result.Entries))
-	evidenceRefs := []string{briefArtifact.ID}
-	for _, entry := range result.Entries {
-		entryIDs = append(entryIDs, entry.ID)
-		evidenceRefs = append(evidenceRefs, entry.SourceArtifactID)
-	}
-	for _, rejection := range result.Rejections {
-		if rejection.SourceArtifactID != "" {
-			evidenceRefs = append(evidenceRefs, rejection.SourceArtifactID)
-		}
-	}
-	evidenceRefs = uniqueStrings(evidenceRefs)
-
-	summary := fmt.Sprintf("project memory update completed: %d applied, %d rejected", len(result.Entries), len(result.Rejections))
-	if len(candidates) == 0 && len(result.Rejections) == 0 {
-		summary = "project memory update completed: no candidates"
+	payload := memoryUpdatePayload(runtime, runtimeStage, output, result, "memory_update_gatekeeper")
+	if lastReport.StageID != "" {
+		payload["previous_stage_id"] = lastReport.StageID
+		payload["previous_stage_type"] = lastReport.StageType
+		payload["previous_status"] = lastReport.Status
 	}
 	rep := report.Report{
 		SchemaVersion: report.SchemaVersion,
@@ -71,28 +198,10 @@ func (e *Engine) runMemoryUpdateStage(ctx context.Context, wr store.WorkflowRun,
 		StageType:     stage.StageType,
 		Actor:         report.Actor{Kind: report.ActorKindHarness, ID: "memory_curator"},
 		Status:        report.StatusCompleted,
-		Summary:       summary,
-		EvidenceRefs:  evidenceRefs,
-		Payload: map[string]any{
-			"workflow_template_id":       runtime.Template.ID,
-			"workflow_stage_id":          runtimeStage.Template.ID,
-			"workflow_stage_label":       runtimeStage.Template.Label,
-			"workflow_stage_actor":       runtimeStage.Template.Actor,
-			"candidate_count":            len(candidates) + len(extractionRejections),
-			"applied_count":              len(result.Entries),
-			"rejected_count":             len(result.Rejections),
-			"project_memory_entry_ids":   entryIDs,
-			"project_memory_rejections":  result.Rejections,
-			"curator":                    "memory_update_gatekeeper",
-			"writes_private_sqlite_only": true,
-			"repo_export_performed":      false,
-		},
-		Errors: []string{},
-	}
-	if lastReport.StageID != "" {
-		rep.Payload["previous_stage_id"] = lastReport.StageID
-		rep.Payload["previous_stage_type"] = lastReport.StageType
-		rep.Payload["previous_status"] = lastReport.Status
+		Summary:       output.StopReportSummary,
+		EvidenceRefs:  memoryUpdateEvidenceRefs(briefArtifact.ID, output),
+		Payload:       payload,
+		Errors:        []string{},
 	}
 	if err := e.completeStage(context.Background(), wr, stage, rep); err != nil {
 		return report.Report{}, err
@@ -241,12 +350,103 @@ func (candidate memoryApprovalCandidate) projectMemoryInput() store.ProjectMemor
 	}
 }
 
+func memoryCuratorReportValidator(wr store.WorkflowRun, stage store.Stage, stageType, adapterName string) reportRepairValidator {
+	base := baseReportValidator(wr, stage, stageType, adapterName)
+	return func(rep report.Report) (report.Report, error) {
+		stamped, err := base(rep)
+		if err != nil {
+			return stamped, err
+		}
+		if stamped.Status != report.StatusCompleted {
+			return stamped, nil
+		}
+		if _, err := report.MemoryUpdateOutputFromPayload(stamped.Payload); err != nil {
+			return invalidAdapterReport(wr, stage, adapterName, "memory curator returned invalid structured output", stamped, err), err
+		}
+		return stamped, nil
+	}
+}
+
+func (e *Engine) applyMemoryCuratorProposal(ctx context.Context, wr store.WorkflowRun, stage store.Stage, inbox []projectMemoryInboxCandidate, extractionRejections []store.ProjectMemoryRejection, proposal report.MemoryUpdateOutput, actor report.Actor) (store.ProjectMemoryUpdateResult, report.MemoryUpdateOutput, error) {
+	actions, preflightRejected := projectMemoryApplyDecisions(wr, inbox, proposal)
+	entries := make([]store.ProjectMemoryInput, 0, len(actions))
+	for _, action := range actions {
+		entries = append(entries, action.Input)
+	}
+	result, err := e.store.ApplyProjectMemoryUpdate(ctx, store.ProjectMemoryUpdate{
+		ProjectID:      wr.Run.ProjectID,
+		RunID:          wr.Run.ID,
+		TaskID:         wr.Task.ID,
+		CuratorStageID: stage.ID,
+		Entries:        entries,
+	})
+	if err != nil {
+		return store.ProjectMemoryUpdateResult{}, report.MemoryUpdateOutput{}, err
+	}
+	output := baseMemoryUpdateOutput(wr, inbox, extractionRejections, actor, "agent curator approved automatically and store guardrails applied the approved writes")
+	output.SafetyNotes = append(output.SafetyNotes, proposal.SafetyNotes...)
+	output.Rejected = append(output.Rejected, rejectedDecisionsFromExtraction(wr, extractionRejections)...)
+	output.Rejected = append(output.Rejected, normalizeMemoryDecisions(wr, inbox, proposal.Rejected, report.MemoryCandidateRejected)...)
+	output.Rejected = append(output.Rejected, preflightRejected...)
+	output.Deferred = append(output.Deferred, normalizeMemoryDecisions(wr, inbox, proposal.Deferred, report.MemoryCandidateDeferred)...)
+
+	for i, action := range actions {
+		if i >= len(result.Outcomes) {
+			decision := action.Decision
+			decision.State = report.MemoryCandidateRejected
+			decision.Rationale = appendRationale(decision.Rationale, "memory guardrail outcome was not returned")
+			decision.SourceArtifactRefs = action.SourceArtifactRefs
+			decision.Freshness = freshnessFromRefs(wr, action.Input.SourceStageID, action.SourceArtifactRefs, "")
+			output.Rejected = append(output.Rejected, decision)
+			continue
+		}
+		outcome := result.Outcomes[i]
+		if outcome.Entry != nil {
+			decision := appliedMemoryDecision(wr, action, *outcome.Entry)
+			switch action.State {
+			case report.MemoryCandidateEdited:
+				output.Edited = append(output.Edited, decision)
+			case report.MemoryCandidateMerged:
+				output.Merged = append(output.Merged, decision)
+			default:
+				output.Applied = append(output.Applied, decision)
+			}
+			output.MemoryChanges = append(output.MemoryChanges, memoryChangeFromEntry(wr, action, *outcome.Entry))
+			continue
+		}
+		if outcome.Rejection != nil {
+			output.Rejected = append(output.Rejected, rejectedDecisionFromGuardrail(wr, action, *outcome.Rejection))
+			continue
+		}
+	}
+	output.InboxSummary.CandidatesCurated = countMemoryDecisions(output)
+	output.StopReportSummary = memoryUpdateSummary(output)
+	storeRejectionCount := len(result.Rejections)
+	if storeRejectionCount > 0 {
+		output.SafetyNotes = append(output.SafetyNotes, fmt.Sprintf("store guardrails rejected %d curator-approved candidate(s)", storeRejectionCount))
+	}
+	result.Rejections = append(extractionRejections, result.Rejections...)
+	return result, output, nil
+}
+
 func (e *Engine) collectProjectMemoryCandidates(ctx context.Context, wr store.WorkflowRun, memoryStageID string) ([]store.ProjectMemoryInput, []store.ProjectMemoryRejection, error) {
+	inbox, rejections, err := e.collectProjectMemoryCandidateInbox(ctx, wr, memoryStageID)
+	if err != nil {
+		return nil, nil, err
+	}
+	candidates := make([]store.ProjectMemoryInput, 0, len(inbox))
+	for _, candidate := range inbox {
+		candidates = append(candidates, candidate.Input)
+	}
+	return candidates, rejections, nil
+}
+
+func (e *Engine) collectProjectMemoryCandidateInbox(ctx context.Context, wr store.WorkflowRun, memoryStageID string) ([]projectMemoryInboxCandidate, []store.ProjectMemoryRejection, error) {
 	events, err := e.store.ListEvents(ctx, wr.Run.ID)
 	if err != nil {
 		return nil, nil, err
 	}
-	var candidates []store.ProjectMemoryInput
+	var candidates []projectMemoryInboxCandidate
 	var rejections []store.ProjectMemoryRejection
 	seenArtifacts := map[string]bool{}
 	for _, ev := range events {
@@ -279,7 +479,9 @@ func (e *Engine) collectProjectMemoryCandidates(ctx context.Context, wr store.Wo
 			continue
 		}
 		extracted, rejected := projectMemoryCandidatesFromReport(rep, artifact.ID)
-		candidates = append(candidates, extracted...)
+		for _, candidate := range extracted {
+			candidates = append(candidates, projectMemoryInboxCandidate{ID: fmt.Sprintf("candidate-%03d", len(candidates)+1), Input: candidate})
+		}
 		rejections = append(rejections, rejected...)
 	}
 	return candidates, rejections, nil
@@ -342,6 +544,420 @@ func projectMemoryCandidateFromValue(value any, rep report.Report, artifactID st
 		return store.ProjectMemoryInput{}, fmt.Errorf("memory candidate must be an object or string")
 	}
 	return candidate, nil
+}
+
+func projectMemoryApplyDecisions(wr store.WorkflowRun, inbox []projectMemoryInboxCandidate, proposal report.MemoryUpdateOutput) ([]projectMemoryApplyDecision, []report.MemoryCandidateDecision) {
+	byID := map[string]projectMemoryInboxCandidate{}
+	for _, candidate := range inbox {
+		byID[candidate.ID] = candidate
+	}
+	var actions []projectMemoryApplyDecision
+	var rejected []report.MemoryCandidateDecision
+	for _, item := range []struct {
+		state     report.MemoryCandidateState
+		decisions []report.MemoryCandidateDecision
+	}{
+		{report.MemoryCandidateApplied, proposal.Applied},
+		{report.MemoryCandidateEdited, proposal.Edited},
+		{report.MemoryCandidateMerged, proposal.Merged},
+	} {
+		for _, decision := range item.decisions {
+			decision.State = item.state
+			ids := memoryDecisionCandidateIDs(decision)
+			known := make([]projectMemoryInboxCandidate, 0, len(ids))
+			missing := []string{}
+			for _, id := range ids {
+				candidate, ok := byID[id]
+				if !ok {
+					missing = append(missing, id)
+					continue
+				}
+				known = append(known, candidate)
+			}
+			if len(known) == 0 || len(missing) > 0 {
+				decision.State = report.MemoryCandidateRejected
+				decision.Body = ""
+				decision.Rationale = appendRationale(decision.Rationale, "curator decision references unknown candidate id(s): "+strings.Join(missing, ", "))
+				decision.SourceArtifactRefs = uniqueStrings(decision.SourceArtifactRefs)
+				decision.Freshness = freshnessFromRefs(wr, "", decision.SourceArtifactRefs, "")
+				rejected = append(rejected, decision)
+				continue
+			}
+			primary := known[0].Input
+			input := store.ProjectMemoryInput{
+				Kind:             firstNonEmpty(decision.Kind, primary.Kind),
+				Title:            firstNonEmpty(decision.Title, primary.Title),
+				Body:             firstNonEmpty(decision.Body, primary.Body),
+				SourceStageID:    primary.SourceStageID,
+				SourceArtifactID: primary.SourceArtifactID,
+				SourceSummary:    firstNonEmpty(decision.Rationale, primary.SourceSummary),
+			}
+			sourceRefs := append([]string{}, decision.SourceArtifactRefs...)
+			for _, candidate := range known {
+				sourceRefs = append(sourceRefs, candidate.Input.SourceArtifactID)
+			}
+			sourceRefs = uniqueStrings(sourceRefs)
+			actions = append(actions, projectMemoryApplyDecision{State: item.state, Decision: decision, Input: input, CandidateIDs: ids, SourceArtifactRefs: sourceRefs})
+		}
+	}
+	return actions, rejected
+}
+
+func harnessMemoryUpdateOutput(wr store.WorkflowRun, inbox []projectMemoryInboxCandidate, extractionRejections []store.ProjectMemoryRejection, result store.ProjectMemoryUpdateResult) report.MemoryUpdateOutput {
+	output := baseMemoryUpdateOutput(wr, inbox, extractionRejections, report.Actor{Kind: report.ActorKindHarness, ID: "memory_curator"}, "harness gatekeeper applied deterministic curation and store guardrails")
+	output.Rejected = append(output.Rejected, rejectedDecisionsFromExtraction(wr, extractionRejections)...)
+	for i, candidate := range inbox {
+		decision := report.MemoryCandidateDecision{
+			CandidateID:        candidate.ID,
+			CandidateIDs:       []string{candidate.ID},
+			State:              report.MemoryCandidateApplied,
+			Kind:               candidate.Input.Kind,
+			Title:              candidate.Input.Title,
+			Body:               candidate.Input.Body,
+			Rationale:          "deterministic memory gatekeeper accepted candidate",
+			SourceArtifactRefs: []string{candidate.Input.SourceArtifactID},
+			Freshness:          freshnessFromRefs(wr, candidate.Input.SourceStageID, []string{candidate.Input.SourceArtifactID}, ""),
+		}
+		if i < len(result.Outcomes) && result.Outcomes[i].Entry != nil {
+			decision = appliedMemoryDecision(wr, projectMemoryApplyDecision{State: report.MemoryCandidateApplied, Decision: decision, Input: candidate.Input, CandidateIDs: []string{candidate.ID}, SourceArtifactRefs: []string{candidate.Input.SourceArtifactID}}, *result.Outcomes[i].Entry)
+			output.Applied = append(output.Applied, decision)
+			output.MemoryChanges = append(output.MemoryChanges, memoryChangeFromEntry(wr, projectMemoryApplyDecision{State: report.MemoryCandidateApplied, Decision: decision, Input: candidate.Input, CandidateIDs: []string{candidate.ID}, SourceArtifactRefs: []string{candidate.Input.SourceArtifactID}}, *result.Outcomes[i].Entry))
+			continue
+		}
+		if i < len(result.Outcomes) && result.Outcomes[i].Rejection != nil {
+			output.Rejected = append(output.Rejected, rejectedDecisionFromGuardrail(wr, projectMemoryApplyDecision{State: report.MemoryCandidateApplied, Decision: decision, Input: candidate.Input, CandidateIDs: []string{candidate.ID}, SourceArtifactRefs: []string{candidate.Input.SourceArtifactID}}, *result.Outcomes[i].Rejection))
+		}
+	}
+	output.InboxSummary.CandidatesCurated = countMemoryDecisions(output)
+	output.StopReportSummary = memoryUpdateSummary(output)
+	return output
+}
+
+func baseMemoryUpdateOutput(wr store.WorkflowRun, inbox []projectMemoryInboxCandidate, extractionRejections []store.ProjectMemoryRejection, actor report.Actor, authority string) report.MemoryUpdateOutput {
+	if actor.Kind == "" {
+		actor.Kind = report.ActorKindHarness
+	}
+	if actor.ID == "" {
+		actor.ID = "memory_curator"
+	}
+	sourceRefs := memoryInboxSourceRefs(inbox, extractionRejections)
+	return report.MemoryUpdateOutput{
+		InboxSummary: report.MemoryInboxSummary{
+			LearningOpportunities: len(inbox) + len(extractionRejections),
+			CandidatesGenerated:   len(inbox) + len(extractionRejections),
+			CandidatesCurated:     0,
+			SourceArtifactRefs:    sourceRefs,
+		},
+		Applied:       []report.MemoryCandidateDecision{},
+		Rejected:      []report.MemoryCandidateDecision{},
+		Edited:        []report.MemoryCandidateDecision{},
+		Merged:        []report.MemoryCandidateDecision{},
+		Deferred:      []report.MemoryCandidateDecision{},
+		MemoryChanges: []report.MemoryChange{},
+		ActorAuthority: report.MemoryActorAuthority{
+			Kind:      actor.Kind,
+			ID:        actor.ID,
+			Authority: authority,
+		},
+		SafetyNotes:       []string{},
+		StopReportSummary: "project memory update completed",
+	}
+}
+
+func memoryUpdatePayload(runtime runtimeWorkflow, runtimeStage runtimeStage, output report.MemoryUpdateOutput, result store.ProjectMemoryUpdateResult, curator string) map[string]any {
+	entryIDs := make([]string, 0, len(result.Entries))
+	for _, entry := range result.Entries {
+		entryIDs = append(entryIDs, entry.ID)
+	}
+	return map[string]any{
+		"workflow_template_id":              runtime.Template.ID,
+		"workflow_stage_id":                 runtimeStage.Template.ID,
+		"workflow_stage_label":              runtimeStage.Template.Label,
+		"workflow_stage_actor":              runtimeStage.Template.Actor,
+		"candidate_count":                   output.InboxSummary.CandidatesGenerated,
+		"applied_count":                     len(result.Entries),
+		"rejected_count":                    len(output.Rejected),
+		"edited_count":                      len(output.Edited),
+		"merged_count":                      len(output.Merged),
+		"deferred_count":                    len(output.Deferred),
+		"project_memory_entry_ids":          uniqueStrings(entryIDs),
+		"project_memory_rejections":         result.Rejections,
+		"curator":                           curator,
+		"writes_private_sqlite_only":        true,
+		"repo_export_performed":             false,
+		report.MemoryUpdateOutputPayloadKey: output,
+	}
+}
+
+func projectMemoryInboxPayload(candidates []projectMemoryInboxCandidate, rejections []store.ProjectMemoryRejection) map[string]any {
+	items := make([]map[string]any, 0, len(candidates))
+	for _, candidate := range candidates {
+		items = append(items, map[string]any{
+			"candidate_id":       candidate.ID,
+			"kind":               candidate.Input.Kind,
+			"title":              candidate.Input.Title,
+			"body":               candidate.Input.Body,
+			"source_stage_id":    candidate.Input.SourceStageID,
+			"source_artifact_id": candidate.Input.SourceArtifactID,
+			"source_summary":     candidate.Input.SourceSummary,
+		})
+	}
+	rejected := make([]store.ProjectMemoryRejection, len(rejections))
+	copy(rejected, rejections)
+	return map[string]any{
+		"candidates":            items,
+		"extraction_rejections": rejected,
+		"candidate_count":       len(candidates) + len(rejections),
+	}
+}
+
+func projectMemoryEntriesPayload(entries []store.ProjectMemoryEntry) []map[string]any {
+	out := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, map[string]any{
+			"id":                 entry.ID,
+			"kind":               entry.Kind,
+			"title":              entry.Title,
+			"body":               entry.Body,
+			"source_run_id":      entry.SourceRunID,
+			"source_task_id":     entry.SourceTaskID,
+			"source_stage_id":    entry.SourceStageID,
+			"source_artifact_id": entry.SourceArtifactID,
+			"curator_stage_id":   entry.CuratorStageID,
+			"source_summary":     entry.SourceSummary,
+			"created_at":         entry.CreatedAt,
+			"updated_at":         entry.UpdatedAt,
+		})
+	}
+	return out
+}
+
+func projectMemoryPolicyPayload() map[string]any {
+	return map[string]any{
+		"candidate_kinds": projectMemoryCandidateKinds(),
+		"allowed_states": []string{
+			string(report.MemoryCandidateApplied),
+			string(report.MemoryCandidateRejected),
+			string(report.MemoryCandidateEdited),
+			string(report.MemoryCandidateMerged),
+			string(report.MemoryCandidateDeferred),
+		},
+		"max_applied_entries": store.ProjectMemoryMaxEntriesPerUpdate,
+		"source_linking":      "every applied, edited, or merged decision must reference candidate_id or candidate_ids from project_memory_inbox.candidates; the manager chooses the source stage/artifact from those candidates",
+		"durable_writes":      "do not write project memory directly; return memory_update_output and the manager writes approved entries through deterministic guardrails",
+		"forbidden_content":   []string{"secrets or credentials", "standing instructions", "raw logs or transcripts", "speculative plans", "current code truth"},
+	}
+}
+
+func appliedMemoryDecision(wr store.WorkflowRun, action projectMemoryApplyDecision, entry store.ProjectMemoryEntry) report.MemoryCandidateDecision {
+	decision := action.Decision
+	decision.State = action.State
+	decision.CandidateIDs = action.CandidateIDs
+	if len(action.CandidateIDs) == 1 {
+		decision.CandidateID = action.CandidateIDs[0]
+	}
+	decision.Kind = entry.Kind
+	decision.Title = entry.Title
+	decision.Body = entry.Body
+	decision.EntryID = entry.ID
+	decision.EntryIDs = uniqueStrings(append(decision.EntryIDs, entry.ID))
+	decision.SourceArtifactRefs = uniqueStrings(action.SourceArtifactRefs)
+	decision.Freshness = report.MemoryFreshness{
+		SourceRunID:        entry.SourceRunID,
+		SourceTaskID:       entry.SourceTaskID,
+		SourceStageID:      entry.SourceStageID,
+		SourceArtifactRefs: decision.SourceArtifactRefs,
+		VerifiedAt:         entry.UpdatedAt,
+		UpdatedAt:          entry.UpdatedAt,
+	}
+	return decision
+}
+
+func memoryChangeFromEntry(wr store.WorkflowRun, action projectMemoryApplyDecision, entry store.ProjectMemoryEntry) report.MemoryChange {
+	refs := uniqueStrings(action.SourceArtifactRefs)
+	return report.MemoryChange{
+		Action:             report.MemoryChangeApplied,
+		EntryID:            entry.ID,
+		CandidateIDs:       action.CandidateIDs,
+		Kind:               entry.Kind,
+		Title:              entry.Title,
+		SourceArtifactRefs: refs,
+		Freshness: report.MemoryFreshness{
+			SourceRunID:        entry.SourceRunID,
+			SourceTaskID:       entry.SourceTaskID,
+			SourceStageID:      entry.SourceStageID,
+			SourceArtifactRefs: refs,
+			VerifiedAt:         entry.UpdatedAt,
+			UpdatedAt:          entry.UpdatedAt,
+		},
+	}
+}
+
+func rejectedDecisionFromGuardrail(wr store.WorkflowRun, action projectMemoryApplyDecision, rejection store.ProjectMemoryRejection) report.MemoryCandidateDecision {
+	return report.MemoryCandidateDecision{
+		CandidateID:        firstCandidateID(action.CandidateIDs),
+		CandidateIDs:       action.CandidateIDs,
+		State:              report.MemoryCandidateRejected,
+		Kind:               action.Input.Kind,
+		Title:              firstNonEmpty(rejection.Title, action.Input.Title),
+		Rationale:          "deterministic guardrail rejected curator-approved candidate: " + rejection.Reason,
+		SourceArtifactRefs: uniqueStrings(action.SourceArtifactRefs),
+		Freshness:          freshnessFromRefs(wr, action.Input.SourceStageID, action.SourceArtifactRefs, ""),
+	}
+}
+
+func rejectedDecisionsFromExtraction(wr store.WorkflowRun, rejections []store.ProjectMemoryRejection) []report.MemoryCandidateDecision {
+	out := make([]report.MemoryCandidateDecision, 0, len(rejections))
+	for i, rejection := range rejections {
+		refs := []string{}
+		if rejection.SourceArtifactID != "" {
+			refs = append(refs, rejection.SourceArtifactID)
+		}
+		out = append(out, report.MemoryCandidateDecision{
+			CandidateID:        fmt.Sprintf("extraction-rejection-%03d", i+1),
+			CandidateIDs:       []string{fmt.Sprintf("extraction-rejection-%03d", i+1)},
+			State:              report.MemoryCandidateRejected,
+			Title:              rejection.Title,
+			Rationale:          "candidate extraction rejected source payload: " + rejection.Reason,
+			SourceArtifactRefs: refs,
+			Freshness:          freshnessFromRefs(wr, rejection.SourceStageID, refs, ""),
+		})
+	}
+	return out
+}
+
+func normalizeMemoryDecisions(wr store.WorkflowRun, inbox []projectMemoryInboxCandidate, decisions []report.MemoryCandidateDecision, state report.MemoryCandidateState) []report.MemoryCandidateDecision {
+	byID := map[string]projectMemoryInboxCandidate{}
+	for _, candidate := range inbox {
+		byID[candidate.ID] = candidate
+	}
+	out := make([]report.MemoryCandidateDecision, 0, len(decisions))
+	for _, decision := range decisions {
+		decision.State = state
+		ids := memoryDecisionCandidateIDs(decision)
+		decision.CandidateIDs = ids
+		if len(ids) == 1 {
+			decision.CandidateID = ids[0]
+		}
+		refs := append([]string{}, decision.SourceArtifactRefs...)
+		stageID := ""
+		for _, id := range ids {
+			candidate, ok := byID[id]
+			if !ok {
+				continue
+			}
+			refs = append(refs, candidate.Input.SourceArtifactID)
+			if stageID == "" {
+				stageID = candidate.Input.SourceStageID
+			}
+			if decision.Title == "" {
+				decision.Title = candidate.Input.Title
+			}
+			if decision.Kind == "" {
+				decision.Kind = candidate.Input.Kind
+			}
+		}
+		decision.SourceArtifactRefs = uniqueStrings(refs)
+		if state == report.MemoryCandidateRejected || state == report.MemoryCandidateDeferred {
+			decision.Body = ""
+		}
+		decision.Freshness = freshnessFromRefs(wr, stageID, decision.SourceArtifactRefs, "")
+		out = append(out, decision)
+	}
+	return out
+}
+
+func memoryDecisionCandidateIDs(decision report.MemoryCandidateDecision) []string {
+	ids := append([]string{}, decision.CandidateIDs...)
+	if decision.CandidateID != "" {
+		ids = append(ids, decision.CandidateID)
+	}
+	return uniqueStrings(ids)
+}
+
+func firstCandidateID(ids []string) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	return ids[0]
+}
+
+func memoryInboxSourceRefs(inbox []projectMemoryInboxCandidate, rejections []store.ProjectMemoryRejection) []string {
+	refs := []string{}
+	for _, candidate := range inbox {
+		refs = append(refs, candidate.Input.SourceArtifactID)
+	}
+	for _, rejection := range rejections {
+		refs = append(refs, rejection.SourceArtifactID)
+	}
+	return uniqueStrings(refs)
+}
+
+func memoryUpdateEvidenceRefs(briefArtifactID string, output report.MemoryUpdateOutput) []string {
+	refs := []string{briefArtifactID}
+	refs = append(refs, output.InboxSummary.SourceArtifactRefs...)
+	for _, decision := range append(append(append(append(output.Applied, output.Edited...), output.Merged...), output.Rejected...), output.Deferred...) {
+		refs = append(refs, decision.SourceArtifactRefs...)
+	}
+	for _, change := range output.MemoryChanges {
+		refs = append(refs, change.SourceArtifactRefs...)
+	}
+	return uniqueStrings(refs)
+}
+
+func freshnessFromRefs(wr store.WorkflowRun, sourceStageID string, refs []string, updatedAt string) report.MemoryFreshness {
+	return report.MemoryFreshness{
+		SourceRunID:        wr.Run.ID,
+		SourceTaskID:       wr.Task.ID,
+		SourceStageID:      sourceStageID,
+		SourceArtifactRefs: uniqueStrings(refs),
+		VerifiedAt:         updatedAt,
+		UpdatedAt:          updatedAt,
+	}
+}
+
+func countMemoryDecisions(output report.MemoryUpdateOutput) int {
+	return len(output.Applied) + len(output.Rejected) + len(output.Edited) + len(output.Merged) + len(output.Deferred)
+}
+
+func memoryUpdateSummary(output report.MemoryUpdateOutput) string {
+	applied := len(output.Applied) + len(output.Edited) + len(output.Merged)
+	if output.InboxSummary.CandidatesGenerated == 0 && applied == 0 && len(output.Rejected) == 0 && len(output.Deferred) == 0 {
+		return "project memory update completed: no candidates"
+	}
+	parts := []string{fmt.Sprintf("%d applied", applied)}
+	if len(output.Edited) > 0 {
+		parts = append(parts, fmt.Sprintf("%d edited", len(output.Edited)))
+	}
+	if len(output.Merged) > 0 {
+		parts = append(parts, fmt.Sprintf("%d merged", len(output.Merged)))
+	}
+	parts = append(parts, fmt.Sprintf("%d rejected", len(output.Rejected)))
+	if len(output.Deferred) > 0 {
+		parts = append(parts, fmt.Sprintf("%d deferred", len(output.Deferred)))
+	}
+	return "project memory update completed: " + strings.Join(parts, ", ")
+}
+
+func appendRationale(existing, addition string) string {
+	existing = strings.TrimSpace(existing)
+	addition = strings.TrimSpace(addition)
+	if existing == "" {
+		return addition
+	}
+	if addition == "" {
+		return existing
+	}
+	return existing + "; " + addition
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func firstPayloadValue(payload map[string]any, keys ...string) (any, bool) {

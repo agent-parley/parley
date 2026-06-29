@@ -104,6 +104,14 @@ func (r Report) Validate() error {
 			errs = append(errs, err)
 		}
 	}
+	// Agent and harness memory curators must emit the typed curation output.
+	// The human-approval path produces its own human-authoritative decision
+	// payload instead, so it is exempt from this structured-output requirement.
+	if r.StageType == contract.StageTypeMemoryUpdate && r.Status == StatusCompleted && r.Actor.Kind != ActorKindHuman {
+		if _, err := MemoryUpdateOutputFromPayload(r.Payload); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	return errors.Join(errs...)
 }
 

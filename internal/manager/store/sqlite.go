@@ -293,6 +293,12 @@ type ProjectMemoryUpdateResult struct {
 	Entries    []ProjectMemoryEntry
 	Rejections []ProjectMemoryRejection
 	Decisions  []ProjectMemoryDecisionRecord
+	Outcomes   []ProjectMemoryWriteOutcome
+}
+
+type ProjectMemoryWriteOutcome struct {
+	Entry     *ProjectMemoryEntry     `json:"entry,omitempty"`
+	Rejection *ProjectMemoryRejection `json:"rejection,omitempty"`
 }
 
 type ProjectMemoryExportRequest struct {
@@ -1571,8 +1577,6 @@ func defaultStageAdapter(stage workflow.StageTemplate) string {
 	switch {
 	case stage.Type == workflow.StageTypeValidation:
 		return "validation"
-	case stage.Type == workflow.StageTypeMemoryUpdate:
-		return ""
 	case stage.Actor == workflow.ActorAgent:
 		return "noop"
 	default:

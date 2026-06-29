@@ -286,6 +286,22 @@ func expectedReportSchema(disp contract.Dispatch) map[string]any {
 			},
 		}
 	}
+	if disp.StageType == contract.StageTypeMemoryUpdate {
+		schema["payload"] = map[string]any{
+			report.MemoryUpdateOutputPayloadKey: map[string]any{
+				"inbox_summary":       map[string]any{"learning_opportunities": "number", "candidates_generated": "number", "candidates_curated": "number", "source_artifact_refs": []string{}},
+				"applied":             []map[string]any{{"candidate_id": "candidate-001", "state": string(report.MemoryCandidateApplied), "kind": store.ProjectMemoryKindLesson, "title": "entry title", "body": "entry body", "rationale": "why this should be written", "source_artifact_refs": []string{}}},
+				"rejected":            []map[string]any{{"candidate_id": "candidate-002", "state": string(report.MemoryCandidateRejected), "title": "candidate title", "rationale": "why this should not be saved", "source_artifact_refs": []string{}}},
+				"edited":              []map[string]any{{"candidate_id": "candidate-003", "state": string(report.MemoryCandidateEdited), "kind": store.ProjectMemoryKindGotcha, "title": "edited title", "body": "edited body", "rationale": "what changed and why", "source_artifact_refs": []string{}}},
+				"merged":              []map[string]any{{"candidate_ids": []string{"candidate-004", "candidate-005"}, "state": string(report.MemoryCandidateMerged), "kind": store.ProjectMemoryKindLesson, "title": "merged title", "body": "merged body", "rationale": "why these candidates belong together", "source_artifact_refs": []string{}}},
+				"deferred":            []map[string]any{{"candidate_id": "candidate-006", "state": string(report.MemoryCandidateDeferred), "title": "candidate title", "rationale": "why this needs later/human review", "source_artifact_refs": []string{}}},
+				"memory_changes":      []map[string]any{},
+				"actor_authority":     map[string]string{"kind": report.ActorKindAgent, "id": disp.Adapter, "authority": "agent curator approved automatically; manager applies writes through guardrails"},
+				"safety_notes":        []string{},
+				"stop_report_summary": "short memory update summary",
+			},
+		}
+	}
 	if memoryCaptureInputEnabled(disp.Input) {
 		payload, _ := schema["payload"].(map[string]any)
 		if payload == nil {

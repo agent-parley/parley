@@ -40,23 +40,26 @@ func (s *Store) ApplyProjectMemoryUpdate(ctx context.Context, update ProjectMemo
 			rejectedByCandidate[rejection.CandidateID] = rejection
 		}
 	}
-	if len(update.Entries) > ProjectMemoryMaxEntriesPerUpdate {
-		for _, entry := range update.Entries[ProjectMemoryMaxEntriesPerUpdate:] {
-			appendRejection(projectMemoryRejectionForInput(entry, fmt.Sprintf("memory update is bounded to %d entries", ProjectMemoryMaxEntriesPerUpdate)))
-		}
-		update.Entries = update.Entries[:ProjectMemoryMaxEntriesPerUpdate]
-	}
-
 	now := nowRFC3339()
-	for _, raw := range update.Entries {
+	for i, raw := range update.Entries {
 		raw.CandidateID = strings.TrimSpace(raw.CandidateID)
+		if i >= ProjectMemoryMaxEntriesPerUpdate {
+			rejection := projectMemoryRejectionForInput(raw, fmt.Sprintf("memory update is bounded to %d entries", ProjectMemoryMaxEntriesPerUpdate))
+			appendRejection(rejection)
+			result.Outcomes = append(result.Outcomes, ProjectMemoryWriteOutcome{Rejection: &rejection})
+			continue
+		}
 		entry, err := normalizeProjectMemoryInput(raw)
 		if err != nil {
-			appendRejection(projectMemoryRejectionForInput(raw, err.Error()))
+			rejection := projectMemoryRejectionForInput(raw, err.Error())
+			appendRejection(rejection)
+			result.Outcomes = append(result.Outcomes, ProjectMemoryWriteOutcome{Rejection: &rejection})
 			continue
 		}
 		if err := validateProjectMemorySourceTx(ctx, tx, update, entry); err != nil {
-			appendRejection(projectMemoryRejectionForInput(entry, err.Error()))
+			rejection := projectMemoryRejectionForInput(entry, err.Error())
+			appendRejection(rejection)
+			result.Outcomes = append(result.Outcomes, ProjectMemoryWriteOutcome{Rejection: &rejection})
 			continue
 		}
 		id := ids.New("memory")
@@ -71,6 +74,7 @@ ON CONFLICT(project_id, kind, title) DO UPDATE SET body = excluded.body, source_
 			return ProjectMemoryUpdateResult{}, err
 		}
 		result.Entries = append(result.Entries, persisted)
+		result.Outcomes = append(result.Outcomes, ProjectMemoryWriteOutcome{Entry: &persisted})
 		if entry.CandidateID != "" {
 			appliedByCandidate[entry.CandidateID] = persisted.ID
 		}
