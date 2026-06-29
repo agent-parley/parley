@@ -294,6 +294,27 @@ type ProjectMemoryUpdateResult struct {
 	Rejections []ProjectMemoryRejection
 	Decisions  []ProjectMemoryDecisionRecord
 	Outcomes   []ProjectMemoryWriteOutcome
+	Revert     ProjectMemoryUpdateRevert `json:"-"`
+}
+
+type ProjectMemoryUpdateRevert struct {
+	Entries   []ProjectMemoryEntryRevert
+	Decisions []ProjectMemoryDecisionRevert
+}
+
+type ProjectMemoryEntryRevert struct {
+	ProjectID string
+	Kind      string
+	Title     string
+	AppliedID string
+	Previous  *ProjectMemoryEntry
+}
+
+type ProjectMemoryDecisionRevert struct {
+	CuratorStageID string
+	CandidateID    string
+	AppliedID      string
+	Previous       *ProjectMemoryDecisionRecord
 }
 
 type ProjectMemoryWriteOutcome struct {

@@ -925,6 +925,9 @@ func TestHumanMemoryUpdateSuspendsApprovesEditsRejectsDefersAndResumesOnce(t *te
 	if rep.Status != report.StatusCompleted || rep.Actor.Kind != report.ActorKindHuman || rep.Actor.ID != "alice" {
 		t.Fatalf("human memory report = %#v", rep)
 	}
+	if rep.Summary != "memory decisions approved" {
+		t.Fatalf("human memory report summary = %q, want submitted summary", rep.Summary)
+	}
 	if got := reportPayloadInt(rep.Payload, "applied_count"); got != 2 {
 		t.Fatalf("applied_count = %d; payload=%#v", got, rep.Payload)
 	}

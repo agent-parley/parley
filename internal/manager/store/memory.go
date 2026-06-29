@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,12 @@ import (
 	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/ids"
 )
+
+type projectMemoryEntryUniqueKey struct {
+	ProjectID string
+	Kind      string
+	Title     string
+}
 
 func (s *Store) ApplyProjectMemoryUpdate(ctx context.Context, update ProjectMemoryUpdate) (ProjectMemoryUpdateResult, error) {
 	update.ProjectID = strings.TrimSpace(update.ProjectID)
@@ -32,6 +39,7 @@ func (s *Store) ApplyProjectMemoryUpdate(ctx context.Context, update ProjectMemo
 	}
 
 	result := ProjectMemoryUpdateResult{}
+	entryRevertByKey := map[projectMemoryEntryUniqueKey]int{}
 	appliedByCandidate := map[string]string{}
 	rejectedByCandidate := map[string]ProjectMemoryRejection{}
 	appendRejection := func(rejection ProjectMemoryRejection) {
@@ -62,6 +70,22 @@ func (s *Store) ApplyProjectMemoryUpdate(ctx context.Context, update ProjectMemo
 			result.Outcomes = append(result.Outcomes, ProjectMemoryWriteOutcome{Rejection: &rejection})
 			continue
 		}
+		key := projectMemoryEntryUniqueKey{ProjectID: update.ProjectID, Kind: entry.Kind, Title: entry.Title}
+		revertIndex, ok := entryRevertByKey[key]
+		if !ok {
+			previous, found, err := lookupProjectMemoryEntryTx(ctx, tx, update.ProjectID, entry.Kind, entry.Title)
+			if err != nil {
+				return ProjectMemoryUpdateResult{}, err
+			}
+			var previousPtr *ProjectMemoryEntry
+			if found {
+				previousCopy := previous
+				previousPtr = &previousCopy
+			}
+			result.Revert.Entries = append(result.Revert.Entries, ProjectMemoryEntryRevert{ProjectID: update.ProjectID, Kind: entry.Kind, Title: entry.Title, Previous: previousPtr})
+			revertIndex = len(result.Revert.Entries) - 1
+			entryRevertByKey[key] = revertIndex
+		}
 		id := ids.New("memory")
 		_, err = tx.ExecContext(ctx, `INSERT INTO project_memory_entries(id, project_id, kind, title, body, source_run_id, source_task_id, source_stage_id, source_artifact_id, curator_stage_id, source_summary, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -73,6 +97,7 @@ ON CONFLICT(project_id, kind, title) DO UPDATE SET body = excluded.body, source_
 		if err != nil {
 			return ProjectMemoryUpdateResult{}, err
 		}
+		result.Revert.Entries[revertIndex].AppliedID = persisted.ID
 		result.Entries = append(result.Entries, persisted)
 		result.Outcomes = append(result.Outcomes, ProjectMemoryWriteOutcome{Entry: &persisted})
 		if entry.CandidateID != "" {
@@ -80,7 +105,7 @@ ON CONFLICT(project_id, kind, title) DO UPDATE SET body = excluded.body, source_
 		}
 	}
 	if len(update.Decisions) > 0 {
-		decisions, err := recordProjectMemoryDecisionsTx(ctx, tx, update, update.Decisions, appliedByCandidate, rejectedByCandidate, now)
+		decisions, err := recordProjectMemoryDecisionsTx(ctx, tx, update, update.Decisions, appliedByCandidate, rejectedByCandidate, now, &result.Revert)
 		if err != nil {
 			return ProjectMemoryUpdateResult{}, err
 		}
@@ -90,6 +115,48 @@ ON CONFLICT(project_id, kind, title) DO UPDATE SET body = excluded.body, source_
 		return ProjectMemoryUpdateResult{}, fmt.Errorf("commit project memory update: %w", err)
 	}
 	return result, nil
+}
+
+func (s *Store) RollbackProjectMemoryUpdate(ctx context.Context, revert ProjectMemoryUpdateRevert) error {
+	if len(revert.Entries) == 0 && len(revert.Decisions) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin project memory update rollback: %w", err)
+	}
+	defer rollback(tx)
+
+	for i := len(revert.Decisions) - 1; i >= 0; i-- {
+		decision := revert.Decisions[i]
+		if decision.Previous == nil {
+			if err := deleteProjectMemoryDecisionRevertTx(ctx, tx, decision); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := restoreProjectMemoryDecisionTx(ctx, tx, *decision.Previous); err != nil {
+			return err
+		}
+	}
+	for i := len(revert.Entries) - 1; i >= 0; i-- {
+		entry := revert.Entries[i]
+		if entry.Previous == nil {
+			if err := deleteProjectMemoryEntryRevertTx(ctx, tx, entry); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := restoreProjectMemoryEntryTx(ctx, tx, *entry.Previous); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit project memory update rollback: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) ListProjectMemoryEntries(ctx context.Context, projectID string) ([]ProjectMemoryEntry, error) {
@@ -378,7 +445,7 @@ func validateProjectMemoryCuratorStageTx(ctx context.Context, tx *sql.Tx, update
 	return nil
 }
 
-func recordProjectMemoryDecisionsTx(ctx context.Context, tx *sql.Tx, update ProjectMemoryUpdate, decisions []ProjectMemoryDecisionInput, appliedByCandidate map[string]string, rejectedByCandidate map[string]ProjectMemoryRejection, now string) ([]ProjectMemoryDecisionRecord, error) {
+func recordProjectMemoryDecisionsTx(ctx context.Context, tx *sql.Tx, update ProjectMemoryUpdate, decisions []ProjectMemoryDecisionInput, appliedByCandidate map[string]string, rejectedByCandidate map[string]ProjectMemoryRejection, now string, revert *ProjectMemoryUpdateRevert) ([]ProjectMemoryDecisionRecord, error) {
 	records := make([]ProjectMemoryDecisionRecord, 0, len(decisions))
 	seen := map[string]bool{}
 	for _, raw := range decisions {
@@ -392,6 +459,20 @@ func recordProjectMemoryDecisionsTx(ctx context.Context, tx *sql.Tx, update Proj
 		seen[decision.CandidateID] = true
 		if err := validateProjectMemorySourceRefsTx(ctx, tx, update, decision.SourceStageID, decision.SourceArtifactID); err != nil {
 			return nil, fmt.Errorf("memory decision %s source invalid: %w", decision.CandidateID, err)
+		}
+		revertIndex := -1
+		if revert != nil {
+			previous, found, err := lookupProjectMemoryDecisionTx(ctx, tx, update.CuratorStageID, decision.CandidateID)
+			if err != nil {
+				return nil, err
+			}
+			var previousPtr *ProjectMemoryDecisionRecord
+			if found {
+				previousCopy := previous
+				previousPtr = &previousCopy
+			}
+			revert.Decisions = append(revert.Decisions, ProjectMemoryDecisionRevert{CuratorStageID: update.CuratorStageID, CandidateID: decision.CandidateID, Previous: previousPtr})
+			revertIndex = len(revert.Decisions) - 1
 		}
 		outcome := ProjectMemoryDecisionOutcomeRejected
 		entryID := ""
@@ -433,6 +514,9 @@ ON CONFLICT(curator_stage_id, candidate_id) DO UPDATE SET action = excluded.acti
 		record, err := getProjectMemoryDecisionTx(ctx, tx, update.CuratorStageID, decision.CandidateID)
 		if err != nil {
 			return nil, err
+		}
+		if revert != nil && revertIndex >= 0 {
+			revert.Decisions[revertIndex].AppliedID = record.ID
 		}
 		records = append(records, record)
 	}
@@ -618,11 +702,50 @@ func rejectionTitle(input ProjectMemoryInput) string {
 	return title
 }
 
-func getProjectMemoryEntryTx(ctx context.Context, tx *sql.Tx, projectID, kind, title string) (ProjectMemoryEntry, error) {
+func deleteProjectMemoryEntryRevertTx(ctx context.Context, tx *sql.Tx, revert ProjectMemoryEntryRevert) error {
+	if revert.AppliedID != "" {
+		_, err := tx.ExecContext(ctx, `DELETE FROM project_memory_entries WHERE id = ?`, revert.AppliedID)
+		if err != nil {
+			return fmt.Errorf("delete rolled-back project memory entry: %w", err)
+		}
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM project_memory_entries WHERE project_id = ? AND kind = ? AND title = ?`, revert.ProjectID, revert.Kind, revert.Title)
+	if err != nil {
+		return fmt.Errorf("delete rolled-back project memory entry: %w", err)
+	}
+	return nil
+}
+
+func restoreProjectMemoryEntryTx(ctx context.Context, tx *sql.Tx, entry ProjectMemoryEntry) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO project_memory_entries(id, project_id, kind, title, body, source_run_id, source_task_id, source_stage_id, source_artifact_id, curator_stage_id, source_summary, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(project_id, kind, title) DO UPDATE SET id = excluded.id, body = excluded.body, source_run_id = excluded.source_run_id, source_task_id = excluded.source_task_id, source_stage_id = excluded.source_stage_id, source_artifact_id = excluded.source_artifact_id, curator_stage_id = excluded.curator_stage_id, source_summary = excluded.source_summary, created_at = excluded.created_at, updated_at = excluded.updated_at`, entry.ID, entry.ProjectID, entry.Kind, entry.Title, entry.Body, entry.SourceRunID, entry.SourceTaskID, entry.SourceStageID, entry.SourceArtifactID, entry.CuratorStageID, entry.SourceSummary, entry.CreatedAt, entry.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("restore project memory entry: %w", err)
+	}
+	return nil
+}
+
+func lookupProjectMemoryEntryTx(ctx context.Context, tx *sql.Tx, projectID, kind, title string) (ProjectMemoryEntry, bool, error) {
 	row := tx.QueryRowContext(ctx, `SELECT id, project_id, kind, title, body, source_run_id, source_task_id, source_stage_id, source_artifact_id, curator_stage_id, source_summary, created_at, updated_at FROM project_memory_entries WHERE project_id = ? AND kind = ? AND title = ?`, projectID, kind, title)
 	entry, err := scanProjectMemoryEntry(row)
 	if err != nil {
-		return ProjectMemoryEntry{}, fmt.Errorf("get project memory entry: %w", err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ProjectMemoryEntry{}, false, nil
+		}
+		return ProjectMemoryEntry{}, false, fmt.Errorf("lookup project memory entry: %w", err)
+	}
+	return entry, true, nil
+}
+
+func getProjectMemoryEntryTx(ctx context.Context, tx *sql.Tx, projectID, kind, title string) (ProjectMemoryEntry, error) {
+	entry, found, err := lookupProjectMemoryEntryTx(ctx, tx, projectID, kind, title)
+	if err != nil {
+		return ProjectMemoryEntry{}, err
+	}
+	if !found {
+		return ProjectMemoryEntry{}, fmt.Errorf("get project memory entry: %w", sql.ErrNoRows)
 	}
 	return entry, nil
 }
@@ -639,11 +762,50 @@ func scanProjectMemoryEntry(scanner memoryEntryScanner) (ProjectMemoryEntry, err
 	return entry, nil
 }
 
-func getProjectMemoryDecisionTx(ctx context.Context, tx *sql.Tx, curatorStageID, candidateID string) (ProjectMemoryDecisionRecord, error) {
+func deleteProjectMemoryDecisionRevertTx(ctx context.Context, tx *sql.Tx, revert ProjectMemoryDecisionRevert) error {
+	if revert.AppliedID != "" {
+		_, err := tx.ExecContext(ctx, `DELETE FROM project_memory_candidate_decisions WHERE id = ?`, revert.AppliedID)
+		if err != nil {
+			return fmt.Errorf("delete rolled-back project memory decision: %w", err)
+		}
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM project_memory_candidate_decisions WHERE curator_stage_id = ? AND candidate_id = ?`, revert.CuratorStageID, revert.CandidateID)
+	if err != nil {
+		return fmt.Errorf("delete rolled-back project memory decision: %w", err)
+	}
+	return nil
+}
+
+func restoreProjectMemoryDecisionTx(ctx context.Context, tx *sql.Tx, decision ProjectMemoryDecisionRecord) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO project_memory_candidate_decisions(id, project_id, run_id, task_id, curator_stage_id, candidate_id, action, outcome, kind, title, body, reason, source_stage_id, source_artifact_id, source_summary, entry_id, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?)
+ON CONFLICT(curator_stage_id, candidate_id) DO UPDATE SET id = excluded.id, project_id = excluded.project_id, run_id = excluded.run_id, task_id = excluded.task_id, action = excluded.action, outcome = excluded.outcome, kind = excluded.kind, title = excluded.title, body = excluded.body, reason = excluded.reason, source_stage_id = excluded.source_stage_id, source_artifact_id = excluded.source_artifact_id, source_summary = excluded.source_summary, entry_id = excluded.entry_id, created_at = excluded.created_at`, decision.ID, decision.ProjectID, decision.RunID, decision.TaskID, decision.CuratorStageID, decision.CandidateID, decision.Action, decision.Outcome, decision.Kind, decision.Title, decision.Body, decision.Reason, decision.SourceStageID, decision.SourceArtifactID, decision.SourceSummary, decision.EntryID, decision.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("restore project memory decision: %w", err)
+	}
+	return nil
+}
+
+func lookupProjectMemoryDecisionTx(ctx context.Context, tx *sql.Tx, curatorStageID, candidateID string) (ProjectMemoryDecisionRecord, bool, error) {
 	row := tx.QueryRowContext(ctx, `SELECT id, project_id, run_id, task_id, curator_stage_id, candidate_id, action, outcome, kind, title, body, reason, source_stage_id, source_artifact_id, source_summary, COALESCE(entry_id, ''), created_at FROM project_memory_candidate_decisions WHERE curator_stage_id = ? AND candidate_id = ?`, curatorStageID, candidateID)
 	decision, err := scanProjectMemoryDecision(row)
 	if err != nil {
-		return ProjectMemoryDecisionRecord{}, fmt.Errorf("get project memory decision: %w", err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ProjectMemoryDecisionRecord{}, false, nil
+		}
+		return ProjectMemoryDecisionRecord{}, false, fmt.Errorf("lookup project memory decision: %w", err)
+	}
+	return decision, true, nil
+}
+
+func getProjectMemoryDecisionTx(ctx context.Context, tx *sql.Tx, curatorStageID, candidateID string) (ProjectMemoryDecisionRecord, error) {
+	decision, found, err := lookupProjectMemoryDecisionTx(ctx, tx, curatorStageID, candidateID)
+	if err != nil {
+		return ProjectMemoryDecisionRecord{}, err
+	}
+	if !found {
+		return ProjectMemoryDecisionRecord{}, fmt.Errorf("get project memory decision: %w", sql.ErrNoRows)
 	}
 	return decision, nil
 }

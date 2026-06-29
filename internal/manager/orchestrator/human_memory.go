@@ -61,17 +61,21 @@ func (e *Engine) submitHumanMemoryApproval(ctx context.Context, wr store.Workflo
 		rollbackResume()
 		return report.Report{}, err
 	}
+	rollbackAppliedUpdate := func() {
+		_ = e.store.RollbackProjectMemoryUpdate(context.Background(), result.Revert)
+		rollbackResume()
+	}
 	rep, err := humanMemoryApprovalReport(wr, runtimeStage.Stage, runtimeStage.Template, submission, plan, result)
 	if err != nil {
-		rollbackResume()
+		rollbackAppliedUpdate()
 		return report.Report{}, err
 	}
 	if err := rep.Validate(); err != nil {
-		rollbackResume()
+		rollbackAppliedUpdate()
 		return report.Report{}, fmt.Errorf("%w: %v", ErrInvalidHumanReview, err)
 	}
 	if err := e.completeStage(ctx, wr, runtimeStage.Stage, rep); err != nil {
-		rollbackResume()
+		rollbackAppliedUpdate()
 		return report.Report{}, err
 	}
 	if _, err := e.emit(ctx, runEvent(wr, "run.resumed", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "run resumed from human memory approval", map[string]any{
@@ -83,7 +87,7 @@ func (e *Engine) submitHumanMemoryApproval(ctx context.Context, wr store.Workflo
 		"deferred_count":      plan.deferredCount,
 		"human_authoritative": true,
 	})); err != nil {
-		rollbackResume()
+		rollbackAppliedUpdate()
 		return report.Report{}, err
 	}
 	e.resumeRunAfterHumanStage(wr.Run.ID, runtimeStage.Template.ID)
@@ -248,12 +252,6 @@ func humanMemoryApprovalReport(wr store.WorkflowRun, stage store.Stage, template
 	for _, entry := range result.Entries {
 		entryIDs = append(entryIDs, entry.ID)
 	}
-	completedSummary := fmt.Sprintf("project memory update completed after human approval: %d applied, %d rejected, %d deferred", len(result.Entries), plan.rejectedCount+len(result.Rejections)+len(plan.packet.ExtractionRejections), plan.deferredCount)
-	if len(plan.packet.Candidates) == 0 && len(plan.packet.ExtractionRejections) == 0 {
-		completedSummary = "project memory update completed after human approval: no candidates"
-	} else if summary != "" {
-		completedSummary = summary
-	}
 	payload := map[string]any{
 		"workflow_stage_id":          templateStage.ID,
 		"workflow_stage_label":       templateStage.Label,
@@ -286,7 +284,7 @@ func humanMemoryApprovalReport(wr store.WorkflowRun, stage store.Stage, template
 		StageType:     stage.StageType,
 		Actor:         report.Actor{Kind: report.ActorKindHuman, ID: actorID},
 		Status:        report.StatusCompleted,
-		Summary:       completedSummary,
+		Summary:       summary,
 		EvidenceRefs:  plan.evidenceRefs,
 		Payload:       payload,
 		Errors:        []string{},
