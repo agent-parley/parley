@@ -97,6 +97,9 @@ func TestSendArtifactWritesBinaryFrameContent(t *testing.T) {
 			return
 		}
 		serverDone <- nil
+		// Keep the connection open until the client initiates close, so the
+		// teardown does not race the client's in-flight SendArtifact return.
+		_, _, _ = conn.Read(ctx)
 	}))
 	defer ts.Close()
 

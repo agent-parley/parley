@@ -234,10 +234,19 @@ func (s *Session) send(ctx context.Context, msg Message, binary []byte, hasBinar
 	select {
 	case err := <-req.done:
 		return err
-	case <-s.done:
-		return ErrSessionClosed
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-s.done:
+		// A peer close can race a write that already completed (e.g. a
+		// receiver that closes the connection immediately after reading the
+		// frame). The writer always reports the outcome on req.done, so honor a
+		// finished write instead of returning a spurious ErrSessionClosed.
+		select {
+		case err := <-req.done:
+			return err
+		default:
+			return ErrSessionClosed
+		}
 	}
 }
 
