@@ -149,7 +149,7 @@ func TestReRunStageStartsAtValidationTargetWhenPrerequisitesExist(t *testing.T) 
 	}
 	waitForRunStatus(t, st, wr.Run.ID, store.RunStatusCompleted)
 	got := runner.stageTypes()
-	want := []string{contract.StageTypeValidation, contract.StageTypeReview, contract.StageTypeReview}
+	want := []string{contract.StageTypeValidation, contract.StageTypeReview, contract.StageTypeReview, contract.StageTypeMemoryUpdate}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatched stage types = %#v, want %#v", got, want)
 	}

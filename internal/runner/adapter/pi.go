@@ -930,6 +930,9 @@ func workerInputMarkdown(disp contract.Dispatch, reportPath string) string {
 	if disp.StageType == contract.StageTypeReview {
 		appendReviewWorkerContract(&b, disp)
 	}
+	if disp.StageType == contract.StageTypeMemoryUpdate {
+		appendMemoryUpdateWorkerContract(&b, disp)
+	}
 	if memoryCaptureEnabled(disp) {
 		appendMemoryCaptureWorkerContract(&b, disp)
 	}
@@ -940,6 +943,8 @@ func workerInputMarkdown(disp contract.Dispatch, reportPath string) string {
 		b.WriteString("- Do not modify repository files during planning; inspect `/project/repo` only.\n")
 	} else if disp.StageType == contract.StageTypeReview {
 		b.WriteString("- Do not modify repository files during review; inspect `/project/repo` only.\n")
+	} else if disp.StageType == contract.StageTypeMemoryUpdate {
+		b.WriteString("- Do not modify repository files during memory curation; inspect `/project/repo` only.\n")
 	} else {
 		b.WriteString("- Edit repository files only under `/project/repo`.\n")
 	}
@@ -955,6 +960,8 @@ func workerInputMarkdown(disp contract.Dispatch, reportPath string) string {
 		appendReviewRequiredReport(&b, disp, reportPath)
 	} else if disp.StageType == contract.StageTypeValidation {
 		appendValidationRequiredReport(&b, reportPath)
+	} else if disp.StageType == contract.StageTypeMemoryUpdate {
+		appendMemoryUpdateRequiredReport(&b, disp, reportPath)
 	} else {
 		appendDefaultRequiredReport(&b, disp, reportPath)
 	}
@@ -1119,6 +1126,21 @@ func appendConversationRequiredReport(b *strings.Builder, reportPath string) {
 	b.WriteString("Allowed status values: `completed`, `failed`, `needs_input`, `invalid`. If status is `failed` or `invalid`, `errors` must be non-empty. If you include `payload.actions`, it must contain exactly one object from `allowed_actions`. `create-Task` requires a non-empty sectioned-brief `idea` using exactly the required Markdown headings and may include optional string `template` from `workflow_template_selection.selectable_templates`; omit `template` for the default. `re-run-stage` requires string `run_id` and string `stage` only; use a run and compute-stage ID from the orchestration snapshot, and rely on the harness to reject invalid target/state fail-closed. Do not include top-level action fields.\n")
 }
 
+func appendMemoryUpdateWorkerContract(b *strings.Builder, disp contract.Dispatch) {
+	b.WriteString("## Project Memory Curator Contract\n\n")
+	b.WriteString("You are the Memory update agent curator. Review the workflow-local memory inbox, synthesize durable project-memory entries, deduplicate candidates against each other and existing memory, merge overlapping candidates, edit noisy candidates into bounded reusable lessons, reject unsafe/low-value/current-code-truth candidates, and defer candidates that need human or later evidence.\n\n")
+	b.WriteString("Do not write durable memory yourself. Return only structured curation decisions under `payload.memory_update_output`; the manager will apply approved entries through deterministic guardrails for source-linking, kind allowlist, bounded size, and forbidden-content rejection.\n\n")
+	b.WriteString("### Memory inbox\n\n```json\n")
+	b.WriteString(inputJSON(disp.Input, "project_memory_inbox", map[string]any{}))
+	b.WriteString("\n```\n\n")
+	b.WriteString("### Existing project memory\n\n```json\n")
+	b.WriteString(inputJSON(disp.Input, "project_memory_existing_entries", []any{}))
+	b.WriteString("\n```\n\n")
+	b.WriteString("### Curation policy\n\n```json\n")
+	b.WriteString(inputJSON(disp.Input, "memory_update_policy", map[string]any{}))
+	b.WriteString("\n```\n\n")
+}
+
 func appendMemoryCaptureWorkerContract(b *strings.Builder, disp contract.Dispatch) {
 	key := memoryCapturePayloadKey(disp)
 	b.WriteString("## Project Memory Candidate Capture\n\n")
@@ -1140,6 +1162,15 @@ func appendDefaultRequiredReport(b *strings.Builder, disp contract.Dispatch, rep
 	b.WriteString("```\n\n")
 	b.WriteString("Allowed status values: `completed`, `failed`, `needs_input`, `invalid`. If status is `failed` or `invalid`, `errors` must be non-empty.\n")
 	appendMemoryCaptureRequiredReportNote(b, disp)
+}
+
+func appendMemoryUpdateRequiredReport(b *strings.Builder, disp contract.Dispatch, reportPath string) {
+	fmt.Fprintf(b, "Write exactly one report file at `%s`. The report must include typed memory curation output under `payload.%s`:\n\n", reportPath, report.MemoryUpdateOutputPayloadKey)
+	b.WriteString("```json\n")
+	b.WriteString("{\n  \"status\": \"completed\",\n  \"summary\": \"curated project memory candidates\",\n  \"evidence_refs\": [],\n  \"payload\": {\n    \"memory_update_output\": {\n      \"inbox_summary\": {\n        \"learning_opportunities\": 2,\n        \"candidates_generated\": 2,\n        \"candidates_curated\": 2,\n        \"source_artifact_refs\": []\n      },\n      \"applied\": [\n        {\n          \"candidate_id\": \"candidate-001\",\n          \"state\": \"applied\",\n          \"kind\": \"lesson\",\n          \"title\": \"concise reusable learning\",\n          \"body\": \"durable lesson synthesized from the candidate\",\n          \"rationale\": \"why this should become project memory\",\n          \"source_artifact_refs\": [],\n          \"freshness\": {\"source_artifact_refs\": []}\n        }\n      ],\n      \"rejected\": [],\n      \"edited\": [],\n      \"merged\": [\n        {\n          \"candidate_ids\": [\"candidate-002\", \"candidate-003\"],\n          \"state\": \"merged\",\n          \"kind\": \"gotcha\",\n          \"title\": \"merged reusable gotcha\",\n          \"body\": \"one bounded entry merging overlapping candidates\",\n          \"rationale\": \"why these candidates are duplicates or complementary\",\n          \"source_artifact_refs\": [],\n          \"freshness\": {\"source_artifact_refs\": []}\n        }\n      ],\n      \"deferred\": [],\n      \"memory_changes\": [],\n      \"actor_authority\": {\n        \"kind\": \"agent\",\n        \"id\": \"pi\",\n        \"authority\": \"agent curator approved automatically; manager applies writes through guardrails\"\n      },\n      \"safety_notes\": [],\n      \"stop_report_summary\": \"project memory curation complete\"\n    }\n  },\n  \"errors\": []\n}\n")
+	b.WriteString("```\n\n")
+	b.WriteString("Allowed status values: `completed`, `failed`, `needs_input`, `invalid`. If status is `completed`, `payload.memory_update_output` is required and must include all five candidate state arrays: `applied`, `rejected`, `edited`, `merged`, and `deferred`. Use empty arrays for states with no candidates.\n")
+	b.WriteString("For `applied`, `edited`, and `merged`, include `kind`, `title`, `body`, `rationale`, and candidate IDs from `project_memory_inbox.candidates`. For `rejected` and `deferred`, include a clear `rationale`. Every inbox candidate ID must appear in exactly one of `applied`, `rejected`, `edited`, `merged`, or `deferred`; use `deferred` when evidence is not strong enough yet. Do not invent entry IDs; the manager fills `entry_id`, `memory_changes`, and final freshness metadata after guardrail writes.\n")
 }
 
 func appendValidationRequiredReport(b *strings.Builder, reportPath string) {

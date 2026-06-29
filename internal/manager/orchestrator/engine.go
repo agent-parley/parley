@@ -361,9 +361,6 @@ func (e *Engine) adapterForTemplateStage(stage workflow.StageTemplate) string {
 	if stage.Type == workflow.StageTypeValidation {
 		return e.validationAdapter
 	}
-	if stage.Type == workflow.StageTypeMemoryUpdate {
-		return ""
-	}
 	if stage.Actor == workflow.ActorAgent {
 		return e.implementationAdapter
 	}

@@ -32,22 +32,25 @@ func (s *Store) ApplyProjectMemoryUpdate(ctx context.Context, update ProjectMemo
 	}
 
 	result := ProjectMemoryUpdateResult{}
-	if len(update.Entries) > ProjectMemoryMaxEntriesPerUpdate {
-		for _, entry := range update.Entries[ProjectMemoryMaxEntriesPerUpdate:] {
-			result.Rejections = append(result.Rejections, ProjectMemoryRejection{Title: rejectionTitle(entry), Reason: fmt.Sprintf("memory update is bounded to %d entries", ProjectMemoryMaxEntriesPerUpdate), SourceStageID: strings.TrimSpace(entry.SourceStageID), SourceArtifactID: strings.TrimSpace(entry.SourceArtifactID)})
-		}
-		update.Entries = update.Entries[:ProjectMemoryMaxEntriesPerUpdate]
-	}
-
 	now := nowRFC3339()
-	for _, raw := range update.Entries {
+	for i, raw := range update.Entries {
+		if i >= ProjectMemoryMaxEntriesPerUpdate {
+			rejection := ProjectMemoryRejection{Title: rejectionTitle(raw), Reason: fmt.Sprintf("memory update is bounded to %d entries", ProjectMemoryMaxEntriesPerUpdate), SourceStageID: strings.TrimSpace(raw.SourceStageID), SourceArtifactID: strings.TrimSpace(raw.SourceArtifactID)}
+			result.Rejections = append(result.Rejections, rejection)
+			result.Outcomes = append(result.Outcomes, ProjectMemoryWriteOutcome{Rejection: &rejection})
+			continue
+		}
 		entry, err := normalizeProjectMemoryInput(raw)
 		if err != nil {
-			result.Rejections = append(result.Rejections, ProjectMemoryRejection{Title: rejectionTitle(raw), Reason: err.Error(), SourceStageID: strings.TrimSpace(raw.SourceStageID), SourceArtifactID: strings.TrimSpace(raw.SourceArtifactID)})
+			rejection := ProjectMemoryRejection{Title: rejectionTitle(raw), Reason: err.Error(), SourceStageID: strings.TrimSpace(raw.SourceStageID), SourceArtifactID: strings.TrimSpace(raw.SourceArtifactID)}
+			result.Rejections = append(result.Rejections, rejection)
+			result.Outcomes = append(result.Outcomes, ProjectMemoryWriteOutcome{Rejection: &rejection})
 			continue
 		}
 		if err := validateProjectMemorySourceTx(ctx, tx, update, entry); err != nil {
-			result.Rejections = append(result.Rejections, ProjectMemoryRejection{Title: entry.Title, Reason: err.Error(), SourceStageID: entry.SourceStageID, SourceArtifactID: entry.SourceArtifactID})
+			rejection := ProjectMemoryRejection{Title: entry.Title, Reason: err.Error(), SourceStageID: entry.SourceStageID, SourceArtifactID: entry.SourceArtifactID}
+			result.Rejections = append(result.Rejections, rejection)
+			result.Outcomes = append(result.Outcomes, ProjectMemoryWriteOutcome{Rejection: &rejection})
 			continue
 		}
 		id := ids.New("memory")
@@ -62,6 +65,7 @@ ON CONFLICT(project_id, kind, title) DO UPDATE SET body = excluded.body, source_
 			return ProjectMemoryUpdateResult{}, err
 		}
 		result.Entries = append(result.Entries, persisted)
+		result.Outcomes = append(result.Outcomes, ProjectMemoryWriteOutcome{Entry: &persisted})
 	}
 	if err := tx.Commit(); err != nil {
 		return ProjectMemoryUpdateResult{}, fmt.Errorf("commit project memory update: %w", err)

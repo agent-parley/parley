@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -606,7 +607,7 @@ func TestAgentStageDispatchReceivesTemplateActorTargetSettings(t *testing.T) {
 	}
 }
 
-func TestMemoryUpdateStageAppliesCuratedCandidatesWithoutDispatchingWorkflowAgent(t *testing.T) {
+func TestMemoryUpdateStageDispatchesAgentCuratorAndAppliesGuardrailedCandidates(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
 	if err != nil {
@@ -650,11 +651,21 @@ func TestMemoryUpdateStageAppliesCuratedCandidatesWithoutDispatchingWorkflowAgen
 	if rep.Status != report.StatusCompleted {
 		t.Fatalf("memory update status = %s", rep.Status)
 	}
-	if len(runner.disps) != 0 {
-		t.Fatalf("memory update dispatched arbitrary workflow agent %d time(s)", len(runner.disps))
+	if len(runner.disps) != 1 || runner.disps[0].StageType != contract.StageTypeMemoryUpdate {
+		t.Fatalf("memory update dispatches = %#v, want one memory_update curator dispatch", runner.disps)
 	}
 	if rep.Payload["applied_count"] != 1 || rep.Payload["rejected_count"] != 1 || rep.Payload["writes_private_sqlite_only"] != true {
 		t.Fatalf("memory update payload = %#v", rep.Payload)
+	}
+	memoryOutput, err := report.MemoryUpdateOutputFromPayload(rep.Payload)
+	if err != nil {
+		t.Fatalf("memory_update_output invalid: %v", err)
+	}
+	if len(memoryOutput.Applied) != 1 || len(memoryOutput.Rejected) != 1 || len(memoryOutput.MemoryChanges) != 1 {
+		t.Fatalf("memory_update_output = %#v", memoryOutput)
+	}
+	if memoryOutput.Applied[0].EntryID == "" || len(memoryOutput.Applied[0].SourceArtifactRefs) == 0 || memoryOutput.Applied[0].Freshness.UpdatedAt == "" {
+		t.Fatalf("applied decision missing entry/source/freshness metadata: %#v", memoryOutput.Applied[0])
 	}
 	entries, err := st.ListProjectMemoryEntries(ctx, wr.Run.ProjectID)
 	if err != nil {
@@ -662,6 +673,141 @@ func TestMemoryUpdateStageAppliesCuratedCandidatesWithoutDispatchingWorkflowAgen
 	}
 	if len(entries) != 1 || entries[0].Title != "Validation needs git" || entries[0].CuratorStageID != memoryStage.Stage.ID {
 		t.Fatalf("project memory entries = %#v", entries)
+	}
+}
+
+func TestMemoryUpdateAgentCuratorAuditsOmittedCandidatesAsDeferred(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "audit omitted memory candidates", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	runner := &omittingMemoryCuratorRunner{}
+	engine := newRecordingEngine(t, st, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
+	runtime, err := engine.loadRuntimeWorkflow(ctx, wr)
+	if err != nil {
+		t.Fatalf("load runtime workflow: %v", err)
+	}
+	implementation := runtime.ByID["implementation"]
+	sourceReport := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		StageID:       implementation.Stage.ID,
+		StageType:     implementation.Stage.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: "impl"},
+		Status:        report.StatusCompleted,
+		Summary:       "implementation emitted memory candidates",
+		Payload: map[string]any{"memory_candidates": []any{
+			map[string]any{"kind": "lesson", "title": "Useful lesson", "body": "Apply this durable lesson in future runs.", "source_summary": "implementation report"},
+			map[string]any{"kind": "gotcha", "title": "Needs audit", "body": "This candidate is omitted by the curator and must remain visible.", "source_summary": "implementation report"},
+		}},
+		Errors: []string{},
+	}
+	if err := engine.completeStage(ctx, wr, implementation.Stage, sourceReport); err != nil {
+		t.Fatalf("complete source stage: %v", err)
+	}
+	memoryStage := runtime.ByID["memory_update"]
+	rep, err := engine.runWorkflowStage(ctx, wr, runtime, memoryStage, sourceReport, report.Report{}, report.Report{}, workerSnapshot{}, nil)
+	if err != nil {
+		t.Fatalf("run memory update stage: %v", err)
+	}
+	output, err := report.MemoryUpdateOutputFromPayload(rep.Payload)
+	if err != nil {
+		t.Fatalf("memory_update_output invalid: %v", err)
+	}
+	if len(output.Applied) != 1 || len(output.Deferred) != 1 {
+		t.Fatalf("memory_update_output states = applied:%d deferred:%d output=%#v", len(output.Applied), len(output.Deferred), output)
+	}
+	if output.InboxSummary.CandidatesGenerated != 2 || output.InboxSummary.CandidatesCurated != 2 {
+		t.Fatalf("memory curation counts = generated:%d curated:%d output=%#v", output.InboxSummary.CandidatesGenerated, output.InboxSummary.CandidatesCurated, output)
+	}
+	deferred := output.Deferred[0]
+	if deferred.CandidateID != "candidate-002" || !strings.Contains(deferred.Rationale, "omitted") || len(deferred.SourceArtifactRefs) == 0 {
+		t.Fatalf("omitted candidate was not audited as source-linked deferred decision: %#v", deferred)
+	}
+	if rep.Payload["deferred_count"] != 1 {
+		t.Fatalf("memory update payload = %#v", rep.Payload)
+	}
+	entries, err := st.ListProjectMemoryEntries(ctx, wr.Run.ProjectID)
+	if err != nil {
+		t.Fatalf("list project memory: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Title != "Useful lesson" {
+		t.Fatalf("project memory entries = %#v", entries)
+	}
+}
+
+func TestMemoryUpdateAgentCuratorSupportsEditedMergedDeferredOutput(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "curate memory states", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	runner := &scriptedMemoryCuratorRunner{}
+	engine := newRecordingEngine(t, st, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
+	runtime, err := engine.loadRuntimeWorkflow(ctx, wr)
+	if err != nil {
+		t.Fatalf("load runtime workflow: %v", err)
+	}
+	implementation := runtime.ByID["implementation"]
+	sourceReport := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		StageID:       implementation.Stage.ID,
+		StageType:     implementation.Stage.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: "impl"},
+		Status:        report.StatusCompleted,
+		Summary:       "implementation emitted mergeable memory candidates",
+		Payload: map[string]any{"memory_candidates": []any{
+			map[string]any{"kind": "lesson", "title": "Noisy title", "body": "Candidate needs a concise edited form for future runs.", "source_summary": "edit source"},
+			map[string]any{"kind": "gotcha", "title": "Duplicate A", "body": "Validation containers need git before inspecting worktrees.", "source_summary": "merge source A"},
+			map[string]any{"kind": "gotcha", "title": "Duplicate B", "body": "Install git in validation images before worktree diff inspection.", "source_summary": "merge source B"},
+			map[string]any{"kind": "lesson", "title": "Needs human", "body": "This may be useful but needs more evidence.", "source_summary": "defer source"},
+		}},
+		Errors: []string{},
+	}
+	if err := engine.completeStage(ctx, wr, implementation.Stage, sourceReport); err != nil {
+		t.Fatalf("complete source stage: %v", err)
+	}
+	memoryStage := runtime.ByID["memory_update"]
+	rep, err := engine.runWorkflowStage(ctx, wr, runtime, memoryStage, sourceReport, report.Report{}, report.Report{}, workerSnapshot{}, nil)
+	if err != nil {
+		t.Fatalf("run memory update stage: %v", err)
+	}
+	if rep.Status != report.StatusCompleted {
+		t.Fatalf("memory update status = %s payload=%#v", rep.Status, rep.Payload)
+	}
+	output, err := report.MemoryUpdateOutputFromPayload(rep.Payload)
+	if err != nil {
+		t.Fatalf("memory_update_output invalid: %v", err)
+	}
+	if len(output.Edited) != 1 || len(output.Merged) != 1 || len(output.Deferred) != 1 || len(output.MemoryChanges) != 2 {
+		t.Fatalf("memory_update_output states = edited:%d merged:%d deferred:%d changes:%d output=%#v", len(output.Edited), len(output.Merged), len(output.Deferred), len(output.MemoryChanges), output)
+	}
+	if output.Edited[0].EntryID == "" || output.Merged[0].EntryID == "" || len(output.Merged[0].CandidateIDs) != 2 {
+		t.Fatalf("edited/merged decisions missing entry IDs or candidate IDs: %#v %#v", output.Edited[0], output.Merged[0])
+	}
+	if output.InboxSummary.CandidatesGenerated != 4 || output.InboxSummary.CandidatesCurated != 4 {
+		t.Fatalf("memory curation counts = generated:%d curated:%d output=%#v", output.InboxSummary.CandidatesGenerated, output.InboxSummary.CandidatesCurated, output)
+	}
+	entries, err := st.ListProjectMemoryEntries(ctx, wr.Run.ProjectID)
+	if err != nil {
+		t.Fatalf("list project memory: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("project memory entries = %d, want 2: %#v", len(entries), entries)
 	}
 }
 
@@ -1034,6 +1180,82 @@ func reportPayloadInt(payload map[string]any, key string) int {
 	}
 }
 
+func memoryUpdateOutputEmpty(disp contract.Dispatch) report.MemoryUpdateOutput {
+	candidates := memoryInboxCandidatesForTest(disp)
+	return report.MemoryUpdateOutput{
+		InboxSummary: report.MemoryInboxSummary{
+			LearningOpportunities: len(candidates),
+			CandidatesGenerated:   len(candidates),
+			CandidatesCurated:     0,
+			SourceArtifactRefs:    memoryInboxSourceRefsForTest(candidates),
+		},
+		Applied:       []report.MemoryCandidateDecision{},
+		Rejected:      []report.MemoryCandidateDecision{},
+		Edited:        []report.MemoryCandidateDecision{},
+		Merged:        []report.MemoryCandidateDecision{},
+		Deferred:      []report.MemoryCandidateDecision{},
+		MemoryChanges: []report.MemoryChange{},
+		ActorAuthority: report.MemoryActorAuthority{
+			Kind:      report.ActorKindAgent,
+			ID:        disp.Adapter,
+			Authority: "test memory curator returned no approved writes",
+		},
+		SafetyNotes:       []string{},
+		StopReportSummary: "project memory curation complete",
+	}
+}
+
+func memoryUpdateOutputApplyAll(disp contract.Dispatch) report.MemoryUpdateOutput {
+	out := memoryUpdateOutputEmpty(disp)
+	candidates := memoryInboxCandidatesForTest(disp)
+	out.Applied = make([]report.MemoryCandidateDecision, 0, len(candidates))
+	for _, candidate := range candidates {
+		id := candidate["candidate_id"]
+		ref := candidate["source_artifact_id"]
+		out.Applied = append(out.Applied, report.MemoryCandidateDecision{
+			CandidateID:        id,
+			CandidateIDs:       []string{id},
+			State:              report.MemoryCandidateApplied,
+			Kind:               candidate["kind"],
+			Title:              candidate["title"],
+			Body:               candidate["body"],
+			Rationale:          "test curator approved candidate",
+			SourceArtifactRefs: []string{ref},
+			Freshness:          report.MemoryFreshness{SourceArtifactRefs: []string{ref}},
+		})
+	}
+	out.InboxSummary.CandidatesCurated = len(out.Applied)
+	return out
+}
+
+func memoryInboxCandidatesForTest(disp contract.Dispatch) []map[string]string {
+	inbox, _ := disp.Input["project_memory_inbox"].(map[string]any)
+	raw, _ := inbox["candidates"].([]map[string]any)
+	out := make([]map[string]string, 0, len(raw))
+	for _, item := range raw {
+		candidate := map[string]string{}
+		for _, key := range []string{"candidate_id", "kind", "title", "body", "source_stage_id", "source_artifact_id", "source_summary"} {
+			candidate[key] = fmt.Sprint(item[key])
+		}
+		out = append(out, candidate)
+	}
+	return out
+}
+
+func memoryInboxSourceRefsForTest(candidates []map[string]string) []string {
+	refs := make([]string, 0, len(candidates))
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		ref := strings.TrimSpace(candidate["source_artifact_id"])
+		if ref == "" || seen[ref] {
+			continue
+		}
+		seen[ref] = true
+		refs = append(refs, ref)
+	}
+	return refs
+}
+
 type reviewVerdictRunner struct {
 	verdict report.Verdict
 	disps   []contract.Dispatch
@@ -1102,10 +1324,106 @@ func (r *capturingRunner) Dispatch(_ context.Context, disp contract.Dispatch) (r
 			}
 		}
 	}
+	if disp.StageType == contract.StageTypeMemoryUpdate {
+		rep.Payload = map[string]any{report.MemoryUpdateOutputPayloadKey: memoryUpdateOutputApplyAll(disp)}
+	}
 	return rep, nil
 }
 
 func (r *capturingRunner) CancelAttempt(context.Context, string, string, string) error { return nil }
+
+type omittingMemoryCuratorRunner struct {
+	disps []contract.Dispatch
+}
+
+func (r *omittingMemoryCuratorRunner) Dispatch(_ context.Context, disp contract.Dispatch) (report.Report, error) {
+	r.disps = append(r.disps, disp)
+	rep := validAdapterReport(disp, "omitting memory curator")
+	if disp.StageType != contract.StageTypeMemoryUpdate {
+		return rep, nil
+	}
+	candidates := memoryInboxCandidatesForTest(disp)
+	output := memoryUpdateOutputEmpty(disp)
+	if len(candidates) > 0 {
+		candidate := candidates[0]
+		output.Applied = []report.MemoryCandidateDecision{{
+			CandidateID:        candidate["candidate_id"],
+			CandidateIDs:       []string{candidate["candidate_id"]},
+			State:              report.MemoryCandidateApplied,
+			Kind:               candidate["kind"],
+			Title:              candidate["title"],
+			Body:               candidate["body"],
+			Rationale:          "test curator approved only the first candidate",
+			SourceArtifactRefs: []string{candidate["source_artifact_id"]},
+			Freshness:          report.MemoryFreshness{SourceArtifactRefs: []string{candidate["source_artifact_id"]}},
+		}}
+		output.InboxSummary.CandidatesCurated = 1
+	}
+	rep.Payload = map[string]any{report.MemoryUpdateOutputPayloadKey: output}
+	return rep, nil
+}
+
+func (r *omittingMemoryCuratorRunner) CancelAttempt(context.Context, string, string, string) error {
+	return nil
+}
+
+type scriptedMemoryCuratorRunner struct {
+	disps []contract.Dispatch
+}
+
+func (r *scriptedMemoryCuratorRunner) Dispatch(_ context.Context, disp contract.Dispatch) (report.Report, error) {
+	r.disps = append(r.disps, disp)
+	rep := validAdapterReport(disp, "scripted memory curator")
+	if disp.StageType != contract.StageTypeMemoryUpdate {
+		return rep, nil
+	}
+	candidates := memoryInboxCandidatesForTest(disp)
+	if len(candidates) < 4 {
+		rep.Status = report.StatusFailed
+		rep.Summary = "missing memory candidates"
+		rep.Errors = []string{"scripted runner expected four candidates"}
+		return rep, nil
+	}
+	refs := memoryInboxSourceRefsForTest(candidates)
+	output := memoryUpdateOutputEmpty(disp)
+	output.InboxSummary.CandidatesCurated = 4
+	output.Edited = []report.MemoryCandidateDecision{{
+		CandidateID:        candidates[0]["candidate_id"],
+		CandidateIDs:       []string{candidates[0]["candidate_id"]},
+		State:              report.MemoryCandidateEdited,
+		Kind:               store.ProjectMemoryKindLesson,
+		Title:              "Edited concise lesson",
+		Body:               "Memory candidates should be edited into concise reusable lessons before persistence.",
+		Rationale:          "candidate was useful but noisy",
+		SourceArtifactRefs: []string{candidates[0]["source_artifact_id"]},
+		Freshness:          report.MemoryFreshness{SourceArtifactRefs: []string{candidates[0]["source_artifact_id"]}},
+	}}
+	output.Merged = []report.MemoryCandidateDecision{{
+		CandidateIDs:       []string{candidates[1]["candidate_id"], candidates[2]["candidate_id"]},
+		State:              report.MemoryCandidateMerged,
+		Kind:               store.ProjectMemoryKindGotcha,
+		Title:              "Validation image needs git",
+		Body:               "Validation containers need git installed before worktree diff inspection succeeds.",
+		Rationale:          "two candidates described the same validation-image gotcha",
+		SourceArtifactRefs: refs,
+		Freshness:          report.MemoryFreshness{SourceArtifactRefs: refs},
+	}}
+	output.Deferred = []report.MemoryCandidateDecision{{
+		CandidateID:        candidates[3]["candidate_id"],
+		CandidateIDs:       []string{candidates[3]["candidate_id"]},
+		State:              report.MemoryCandidateDeferred,
+		Title:              candidates[3]["title"],
+		Rationale:          "candidate needs more evidence before becoming durable memory",
+		SourceArtifactRefs: []string{candidates[3]["source_artifact_id"]},
+		Freshness:          report.MemoryFreshness{SourceArtifactRefs: []string{candidates[3]["source_artifact_id"]}},
+	}}
+	rep.Payload = map[string]any{report.MemoryUpdateOutputPayloadKey: output}
+	return rep, nil
+}
+
+func (r *scriptedMemoryCuratorRunner) CancelAttempt(context.Context, string, string, string) error {
+	return nil
+}
 
 type memoryLearningRunner struct {
 	emitEvenWhenDisabled bool
@@ -1118,6 +1436,8 @@ func (r *memoryLearningRunner) Dispatch(_ context.Context, disp contract.Dispatc
 	switch disp.StageType {
 	case contract.StageTypeImplementation:
 		r.addLearning(&rep, disp, store.ProjectMemoryKindGotcha, "Implementation fixture layout", "Implementation discovered that generated fixtures should be kept under internal testdata for this repo.", "implementation report")
+	case contract.StageTypeMemoryUpdate:
+		rep.Payload = map[string]any{report.MemoryUpdateOutputPayloadKey: memoryUpdateOutputApplyAll(disp)}
 	case contract.StageTypeReview:
 		switch disp.Input["review_role"] {
 		case contract.ReviewRoleCritic:
@@ -1268,6 +1588,9 @@ func validAdapterReport(disp contract.Dispatch, summary string) report.Report {
 			Confidence:          report.ValidationConfidenceHigh,
 			SuggestedNextAction: "continue",
 		}
+	}
+	if disp.StageType == contract.StageTypeMemoryUpdate {
+		payload[report.MemoryUpdateOutputPayloadKey] = memoryUpdateOutputEmpty(disp)
 	}
 	return report.Report{
 		SchemaVersion: report.SchemaVersion,
