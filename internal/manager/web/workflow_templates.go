@@ -40,6 +40,17 @@ type WorkflowTemplateEditData struct {
 	Title         string
 }
 
+type NewRunWorkflowData struct {
+	Templates          []WorkflowTemplateSummaryData
+	SelectedTemplateID string
+	Template           workflow.Template
+	Settings           WorkflowTemplateSettingsData
+	StageRows          []WorkflowTemplateStageRowData
+	ReviewTargets      []contract.ReviewTargetOption
+	AgentProfiles      []agentregistry.Profile
+	Error              string
+}
+
 type WorkflowTemplateSettingsData struct {
 	BranchPolicy     string
 	PRBehavior       string

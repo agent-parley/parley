@@ -10,6 +10,7 @@ import (
 	"github.com/agent-parley/parley/internal/manager/secrets"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
+	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/report"
@@ -18,6 +19,7 @@ import (
 type RunController interface {
 	StartProjectRun(context.Context, string, string) (string, error)
 	StartProjectRunInput(context.Context, string, contract.TaskInput) (string, error)
+	StartProjectRunWithWorkflow(context.Context, string, contract.TaskInput, workflow.Template) (string, error)
 	SubmitConversationMessage(context.Context, string, string) (store.Message, error)
 	StartQueuedRun(context.Context, string) error
 	CancelRun(context.Context, string) error

@@ -259,6 +259,14 @@ func (e *Engine) StartRunInput(ctx context.Context, input contract.TaskInput) (s
 }
 
 func (e *Engine) StartProjectRunInput(ctx context.Context, projectID string, input contract.TaskInput) (string, error) {
+	return e.startProjectRunInput(ctx, projectID, input, nil)
+}
+
+func (e *Engine) StartProjectRunWithWorkflow(ctx context.Context, projectID string, input contract.TaskInput, template workflow.Template) (string, error) {
+	return e.startProjectRunInput(ctx, projectID, input, &template)
+}
+
+func (e *Engine) startProjectRunInput(ctx context.Context, projectID string, input contract.TaskInput, workflowOverride *workflow.Template) (string, error) {
 	if projectID == "" {
 		projectID = e.projectID
 	}
@@ -277,7 +285,7 @@ func (e *Engine) StartProjectRunInput(ctx context.Context, projectID string, inp
 		e.queueMu.Unlock()
 		return "", QueueBacklogFullError{Pending: pending, Cap: e.queuePolicy.BacklogCap}
 	}
-	wr, err := e.createQueuedRun(ctx, projectID, input)
+	wr, err := e.createQueuedRun(ctx, projectID, input, workflowOverride)
 	if err != nil {
 		e.queueMu.Unlock()
 		return "", err
@@ -305,7 +313,7 @@ func (e *Engine) StartProjectRunInput(ctx context.Context, projectID string, inp
 	return wr.Run.ID, nil
 }
 
-func (e *Engine) createQueuedRun(ctx context.Context, projectID string, input contract.TaskInput) (store.WorkflowRun, error) {
+func (e *Engine) createQueuedRun(ctx context.Context, projectID string, input contract.TaskInput, workflowOverride *workflow.Template) (store.WorkflowRun, error) {
 	if _, err := e.store.GetProject(ctx, projectID); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return store.WorkflowRun{}, err
@@ -314,13 +322,30 @@ func (e *Engine) createQueuedRun(ctx context.Context, projectID string, input co
 			return store.WorkflowRun{}, err
 		}
 	}
-	wr, err := e.store.CreateWorkflowRunForProjectInput(ctx, projectID, input)
+	var (
+		wr       store.WorkflowRun
+		template workflow.Template
+		err      error
+	)
+	if workflowOverride != nil {
+		wr, err = e.store.CreateWorkflowRunForProjectInputWithTemplate(ctx, projectID, input, *workflowOverride)
+		template = workflow.NormalizeTemplate(*workflowOverride)
+	} else {
+		wr, err = e.store.CreateWorkflowRunForProjectInput(ctx, projectID, input)
+		if err == nil {
+			template, err = e.store.GetWorkflowTemplate(ctx, wr.Run.WorkflowTemplateID)
+		}
+	}
 	if err != nil {
 		return store.WorkflowRun{}, err
 	}
-	template, err := e.store.GetWorkflowTemplate(ctx, wr.Run.WorkflowTemplateID)
-	if err != nil {
-		return store.WorkflowRun{}, err
+	if workflowOverride != nil {
+		template.ID = wr.Run.WorkflowTemplateID
+		template.Predefined = false
+		template.Recommended = false
+		template.Editable = true
+		template.Edges = workflow.DeriveTemplateEdges(template)
+		template = workflow.NormalizeTemplate(template)
 	}
 	wr, err = e.configureRuntimeStageAdapters(ctx, wr, template)
 	if err != nil {

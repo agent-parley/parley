@@ -1,0 +1,147 @@
+{{define "new_run_workflow_fields"}}
+<input type="hidden" name="name" value="{{.Template.Name}}">
+<input type="hidden" name="description" value="{{.Template.Description}}">
+<section class="workflow-customization-panel">
+  {{if .Error}}
+  <section class="settings-inline-notice warning" role="alert">{{.Error}}</section>
+  {{end}}
+  <section class="card nested-card">
+    <h3>Delivery settings</h3>
+    <div class="template-settings-grid">
+      <label>Branch policy
+        <select name="branch_policy">
+          <option value="" {{if eq .Settings.BranchPolicy ""}}selected{{end}}>Unspecified</option>
+          <option value="feature_branch" {{if eq .Settings.BranchPolicy "feature_branch"}}selected{{end}}>Feature branch</option>
+          <option value="target_branch" {{if eq .Settings.BranchPolicy "target_branch"}}selected{{end}}>Target branch</option>
+        </select>
+      </label>
+      <label>PR behavior
+        <select name="pr_behavior">
+          <option value="" {{if eq .Settings.PRBehavior ""}}selected{{end}}>Unspecified</option>
+          <option value="create_pr" {{if eq .Settings.PRBehavior "create_pr"}}selected{{end}}>Create PR</option>
+          <option value="none" {{if eq .Settings.PRBehavior "none"}}selected{{end}}>No PR</option>
+        </select>
+      </label>
+      <label>Merge policy
+        <select name="merge_policy">
+          <option value="" {{if eq .Settings.MergePolicy ""}}selected{{end}}>Unspecified</option>
+          <option value="human_stop" {{if eq .Settings.MergePolicy "human_stop"}}selected{{end}}>Human stop</option>
+          <option value="no_auto_merge" {{if eq .Settings.MergePolicy "no_auto_merge"}}selected{{end}}>No auto-merge</option>
+          <option value="manual" {{if eq .Settings.MergePolicy "manual"}}selected{{end}}>Manual</option>
+          <option value="auto_merge" {{if eq .Settings.MergePolicy "auto_merge"}}selected{{end}}>Auto-merge</option>
+          <option value="merge_when_green" {{if eq .Settings.MergePolicy "merge_when_green"}}selected{{end}}>Merge when green</option>
+        </select>
+      </label>
+      <label>Required checks
+        <input name="required_checks" value="{{.Settings.RequiredChecks}}" placeholder="ci/test, lint">
+      </label>
+      <label>Forge credential ref
+        <input name="forge_credential" value="{{.Settings.ForgeCredential}}" placeholder="stored credential ID, e.g. fcr_...">
+      </label>
+      <label>Merge wait timeout
+        <input name="merge_wait_timeout" value="{{.Settings.MergeWaitTimeout}}" placeholder="5m (max 30m)">
+      </label>
+      <label>Max fix loops
+        <input type="number" min="0" name="max_fix_loops" value="{{.Settings.MaxFixLoops}}">
+      </label>
+    </div>
+    <label class="checkbox-line"><input type="checkbox" name="fix_loop" value="1" {{if .Settings.FixLoop}}checked{{end}}> Enable validation/review fix-loop edges back to implementation</label>
+  </section>
+  <section class="card nested-card">
+    <h3>Stage sequence</h3>
+    <p class="muted">Enable optional stages, set numeric order for compute stages, and edit stage-specific settings. Edges are derived at creation.</p>
+    <div class="stage-editor-list">
+      {{range .StageRows}}
+      <fieldset class="stage-editor-row {{if not .Enabled}}stage-disabled{{end}}">
+        <legend>{{stageLabel .Type}} {{if .Existing}}<span class="safety-tag small">current</span>{{else}}<span class="safety-tag small">optional</span>{{end}}</legend>
+        <input type="hidden" name="stage_id" value="{{.ID}}">
+        <input type="hidden" name="stage_type_{{.ID}}" value="{{.Type}}">
+        <div class="stage-editor-controls">
+          <div>
+            {{if .Disableable}}
+            <label class="checkbox-line"><input type="checkbox" name="enabled_{{.ID}}" value="1" {{if .Enabled}}checked{{end}}> Enabled</label>
+            {{else}}
+            <input type="hidden" name="enabled_{{.ID}}" value="1">
+            <span class="safety-tag small">required</span>
+            {{end}}
+          </div>
+          <label>Order
+            {{if .Reorderable}}
+            <input type="number" name="order_{{.ID}}" value="{{.Order}}">
+            {{else}}
+            <input type="number" name="order_{{.ID}}" value="{{.Order}}" readonly>
+            {{end}}
+          </label>
+          <label>Stage ID
+            <input value="{{.ID}}" readonly>
+          </label>
+          <label>Label
+            <input name="label_{{.ID}}" value="{{.Label}}">
+          </label>
+          <label>Actor
+            <select name="actor_{{.ID}}">
+              <option value="harness" {{if eq .Actor "harness"}}selected{{end}}>Harness</option>
+              <option value="agent" {{if eq .Actor "agent"}}selected{{end}}>Agent</option>
+              <option value="human" {{if eq .Actor "human"}}selected{{end}}>Human</option>
+            </select>
+          </label>
+          {{if .Agent}}
+          <label>Agent profile
+            <select name="profile_id_{{.ID}}">
+              {{$row := .}}
+              {{range $.AgentProfiles}}
+              <option value="{{.ID}}" {{if eq $row.ProfileID .ID}}selected{{end}}>{{.Name}}</option>
+              {{end}}
+            </select>
+          </label>
+          {{end}}
+        </div>
+        <div class="stage-settings-grid">
+          <label class="checkbox-line"><input type="checkbox" name="required_{{.ID}}" value="1" {{if .Required}}checked{{end}}> Required to continue</label>
+          <label>Timeout
+            <input name="timeout_{{.ID}}" value="{{.Timeout}}" placeholder="e.g. 30m">
+          </label>
+          <label>Max attempts
+            <input type="number" min="1" name="max_attempts_{{.ID}}" value="{{.MaxAttempts}}">
+          </label>
+        </div>
+        <label>Context settings JSON
+          <textarea name="context_settings_{{.ID}}" rows="2" placeholder="Optional JSON object for advanced context toggles.">{{.ContextSettings}}</textarea>
+        </label>
+        {{if .Review}}
+        <div class="stage-settings-grid">
+          <label>Review target
+            <select name="target_{{.ID}}">
+              {{$row := .}}
+              {{range $.ReviewTargets}}
+              <option value="{{.ID}}" {{if eq $row.Target .ID}}selected{{end}}>{{.Label}}</option>
+              {{end}}
+            </select>
+          </label>
+          <label>Reviewer profile
+            <select name="profile_{{.ID}}">
+              <option value="generalist" {{if eq .Profile "generalist"}}selected{{end}}>Generalist</option>
+              <option value="security" {{if eq .Profile "security"}}selected{{end}}>Security</option>
+              <option value="tests" {{if eq .Profile "tests"}}selected{{end}}>Tests</option>
+              <option value="adversarial" {{if eq .Profile "adversarial"}}selected{{end}}>Adversarial</option>
+            </select>
+          </label>
+          <label>Intensity
+            <select name="intensity_{{.ID}}">
+              <option value="light" {{if eq .Intensity "light"}}selected{{end}}>Light</option>
+              <option value="normal" {{if eq .Intensity "normal"}}selected{{end}}>Normal</option>
+              <option value="strict" {{if eq .Intensity "strict"}}selected{{end}}>Strict</option>
+              <option value="adversarial" {{if eq .Intensity "adversarial"}}selected{{end}}>Adversarial</option>
+            </select>
+          </label>
+        </div>
+        {{end}}
+        <label>Instructions
+          <textarea name="instructions_{{.ID}}" rows="2" placeholder="Optional per-stage instructions.">{{.Instructions}}</textarea>
+        </label>
+      </fieldset>
+      {{end}}
+    </div>
+  </section>
+</section>
+{{end}}

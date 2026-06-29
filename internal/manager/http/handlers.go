@@ -15,6 +15,7 @@ import (
 	"github.com/agent-parley/parley/internal/manager/orchestrator"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
+	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
 )
@@ -118,6 +119,10 @@ func (s *Server) handleProjectIndex(w http.ResponseWriter, r *http.Request, proj
 }
 
 func (s *Server) indexData(r *http.Request, projectID string) (web.IndexData, error) {
+	return s.indexDataWithNewRunWorkflow(r, projectID, "", "")
+}
+
+func (s *Server) indexDataWithNewRunWorkflow(r *http.Request, projectID, selectedTemplateID, newRunError string) (web.IndexData, error) {
 	project, err := s.store.GetProject(r.Context(), projectID)
 	if err != nil {
 		return web.IndexData{}, err
@@ -153,7 +158,11 @@ func (s *Server) indexData(r *http.Request, projectID string) (web.IndexData, er
 	if err != nil {
 		return web.IndexData{}, err
 	}
-	return web.IndexData{Project: project, Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, Queue: queue, Tasks: tasks, Chat: chat, Notifications: notifications, CSRF: csrf, Title: "Parley · " + project.Name}, nil
+	newRunWorkflow, err := s.newRunWorkflowData(r, projectID, selectedTemplateID, newRunError)
+	if err != nil {
+		return web.IndexData{}, err
+	}
+	return web.IndexData{Project: project, Runs: runs, Runners: runners, RunnerEventPage: runnerEventPage, Queue: queue, Tasks: tasks, Chat: chat, NewRunWorkflow: newRunWorkflow, Notifications: notifications, CSRF: csrf, Title: "Parley · " + project.Name}, nil
 }
 
 func (s *Server) projectsIndexData(r *http.Request) (web.ProjectsIndexData, error) {
@@ -739,11 +748,27 @@ func (s *Server) handleProjectRuns(w http.ResponseWriter, r *http.Request, proje
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	runID, err := s.engine.StartProjectRunInput(r.Context(), projectID, input)
+	workflowOverride, err := s.workflowOverrideFromRunForm(r, projectID, input.WorkflowTemplateID)
+	if err != nil {
+		data, pageErr := s.indexDataWithNewRunWorkflow(r, projectID, input.WorkflowTemplateID, err.Error())
+		if pageErr != nil {
+			http.Error(w, pageErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		data.Notice = &web.Notice{Title: "Run workflow customization invalid", Message: err.Error()}
+		s.writePageStatus(w, "index.html", data, http.StatusBadRequest)
+		return
+	}
+	var runID string
+	if workflowOverride != nil {
+		runID, err = s.engine.StartProjectRunWithWorkflow(r.Context(), projectID, input, *workflowOverride)
+	} else {
+		runID, err = s.engine.StartProjectRunInput(r.Context(), projectID, input)
+	}
 	if err != nil {
 		var backlogErr orchestrator.QueueBacklogFullError
 		if errors.As(err, &backlogErr) {
-			data, pageErr := s.indexData(r, projectID)
+			data, pageErr := s.indexDataWithNewRunWorkflow(r, projectID, input.WorkflowTemplateID, "")
 			if pageErr != nil {
 				http.Error(w, pageErr.Error(), http.StatusInternalServerError)
 				return
@@ -756,6 +781,38 @@ func (s *Server) handleProjectRuns(w http.ResponseWriter, r *http.Request, proje
 		return
 	}
 	http.Redirect(w, r, projectRunPath(projectID, runID), http.StatusSeeOther)
+}
+
+func (s *Server) workflowOverrideFromRunForm(r *http.Request, projectID, templateID string) (*workflow.Template, error) {
+	if r.Form.Get("customize_workflow") == "" {
+		return nil, nil
+	}
+	templateID = strings.TrimSpace(templateID)
+	if templateID == "" {
+		templateID = workflow.DefaultTemplateID
+	}
+	current, err := s.store.GetWorkflowTemplate(r.Context(), templateID)
+	if err != nil {
+		return nil, err
+	}
+	registry, err := s.store.ResolveAgentRegistry(r.Context(), projectID)
+	if err != nil {
+		return nil, err
+	}
+	updated, err := workflowTemplateFromForm(r, current, registry)
+	if err != nil {
+		return nil, err
+	}
+	updated.ID = templateID
+	updated.Predefined = false
+	updated.Recommended = false
+	updated.Editable = true
+	updated.Edges = workflow.DeriveTemplateEdges(updated)
+	updated = workflow.NormalizeTemplateWithRegistry(updated, registry)
+	if err := workflow.ValidateTemplateWithRegistry(updated, registry); err != nil {
+		return nil, err
+	}
+	return &updated, nil
 }
 
 func (s *Server) handleRunPath(w http.ResponseWriter, r *http.Request) {
