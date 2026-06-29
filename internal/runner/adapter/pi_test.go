@@ -148,7 +148,7 @@ func TestPiPrepareIncludesMemoryUpdateCuratorContract(t *testing.T) {
 		t.Fatalf("Prepare() error = %v", err)
 	}
 	workerInput := readTestFile(t, prepared.WorkerInputPath)
-	for _, want := range []string{"Project Memory Curator Contract", "candidate-001", "payload.memory_update_output", "\"edited\"", "\"merged\"", "\"deferred\"", "manager applies writes through guardrails"} {
+	for _, want := range []string{"Project Memory Curator Contract", "candidate-001", "payload.memory_update_output", "\"edited\"", "\"merged\"", "\"deferred\"", "Every inbox candidate ID", "manager applies writes through guardrails"} {
 		if !strings.Contains(workerInput, want) {
 			t.Fatalf("memory update worker input missing %q:\n%s", want, workerInput)
 		}

@@ -86,6 +86,27 @@ type MemoryFreshness struct {
 	UpdatedAt          string   `json:"updated_at,omitempty"`
 }
 
+func (o *MemoryUpdateOutput) Normalize() {
+	if o == nil {
+		return
+	}
+	o.InboxSummary.SourceArtifactRefs = cleanMemoryStrings(o.InboxSummary.SourceArtifactRefs)
+	for i := range o.MemoryChanges {
+		change := &o.MemoryChanges[i]
+		if change.Action == "" {
+			change.Action = MemoryChangeApplied
+		}
+		change.CandidateIDs = cleanMemoryStrings(change.CandidateIDs)
+		refs := memoryChangeSourceArtifactRefs(*change)
+		change.SourceArtifactRefs = refs
+		if len(change.Freshness.SourceArtifactRefs) == 0 {
+			change.Freshness.SourceArtifactRefs = refs
+		} else {
+			change.Freshness.SourceArtifactRefs = cleanMemoryStrings(change.Freshness.SourceArtifactRefs)
+		}
+	}
+}
+
 func (o MemoryUpdateOutput) Validate() error {
 	var errs []error
 	if o.InboxSummary.CandidatesGenerated < 0 {
@@ -121,7 +142,7 @@ func (o MemoryUpdateOutput) Validate() error {
 		if strings.TrimSpace(change.Title) == "" {
 			errs = append(errs, fmt.Errorf("memory_changes[%d].title is required", i))
 		}
-		if len(cleanMemoryStrings(change.SourceArtifactRefs)) == 0 {
+		if len(memoryChangeSourceArtifactRefs(change)) == 0 {
 			errs = append(errs, fmt.Errorf("memory_changes[%d].source_artifact_refs must contain at least one artifact ref", i))
 		}
 	}
@@ -157,6 +178,7 @@ func MemoryUpdateOutputFromPayload(payload map[string]any) (MemoryUpdateOutput, 
 			return MemoryUpdateOutput{}, fmt.Errorf("parse %s: %w", MemoryUpdateOutputPayloadKey, err)
 		}
 	}
+	out.Normalize()
 	if err := out.Validate(); err != nil {
 		return MemoryUpdateOutput{}, fmt.Errorf("%s is invalid: %w", MemoryUpdateOutputPayloadKey, err)
 	}
@@ -189,6 +211,14 @@ func validateMemoryDecisions(errs *[]error, field string, decisions []MemoryCand
 			}
 		}
 	}
+}
+
+func memoryChangeSourceArtifactRefs(change MemoryChange) []string {
+	refs := cleanMemoryStrings(change.SourceArtifactRefs)
+	if len(refs) == 0 {
+		refs = cleanMemoryStrings(change.Freshness.SourceArtifactRefs)
+	}
+	return refs
 }
 
 func cleanMemoryStrings(values []string) []string {

@@ -221,6 +221,11 @@ func (e *Engine) applyMemoryCuratorProposal(ctx context.Context, wr store.Workfl
 	output.Rejected = append(output.Rejected, normalizeMemoryDecisions(wr, inbox, proposal.Rejected, report.MemoryCandidateRejected)...)
 	output.Rejected = append(output.Rejected, preflightRejected...)
 	output.Deferred = append(output.Deferred, normalizeMemoryDecisions(wr, inbox, proposal.Deferred, report.MemoryCandidateDeferred)...)
+	omitted := omittedMemoryCandidateDecisions(wr, inbox, proposal)
+	if len(omitted) > 0 {
+		output.Deferred = append(output.Deferred, omitted...)
+		output.SafetyNotes = append(output.SafetyNotes, fmt.Sprintf("curator omitted %d candidate(s); recorded as deferred without writing project memory", len(omitted)))
+	}
 
 	for i, action := range actions {
 		if i >= len(result.Outcomes) {
@@ -251,7 +256,7 @@ func (e *Engine) applyMemoryCuratorProposal(ctx context.Context, wr store.Workfl
 			continue
 		}
 	}
-	output.InboxSummary.CandidatesCurated = countMemoryDecisions(output)
+	output.InboxSummary.CandidatesCurated = countMemoryCuratedCandidates(output)
 	output.StopReportSummary = memoryUpdateSummary(output)
 	storeRejectionCount := len(result.Rejections)
 	if storeRejectionCount > 0 {
@@ -409,9 +414,21 @@ func projectMemoryApplyDecisions(wr store.WorkflowRun, inbox []projectMemoryInbo
 			if len(known) == 0 || len(missing) > 0 {
 				decision.State = report.MemoryCandidateRejected
 				decision.Body = ""
-				decision.Rationale = appendRationale(decision.Rationale, "curator decision references unknown candidate id(s): "+strings.Join(missing, ", "))
-				decision.SourceArtifactRefs = uniqueStrings(decision.SourceArtifactRefs)
-				decision.Freshness = freshnessFromRefs(wr, "", decision.SourceArtifactRefs, "")
+				reason := "curator decision did not reference a known candidate id"
+				if len(missing) > 0 {
+					reason = "curator decision references unknown candidate id(s): " + strings.Join(missing, ", ")
+				}
+				decision.Rationale = appendRationale(decision.Rationale, reason)
+				sourceRefs := append([]string{}, decision.SourceArtifactRefs...)
+				stageID := ""
+				for _, candidate := range known {
+					sourceRefs = append(sourceRefs, candidate.Input.SourceArtifactID)
+					if stageID == "" {
+						stageID = candidate.Input.SourceStageID
+					}
+				}
+				decision.SourceArtifactRefs = uniqueStrings(sourceRefs)
+				decision.Freshness = freshnessFromRefs(wr, stageID, decision.SourceArtifactRefs, "")
 				rejected = append(rejected, decision)
 				continue
 			}
@@ -433,6 +450,35 @@ func projectMemoryApplyDecisions(wr store.WorkflowRun, inbox []projectMemoryInbo
 		}
 	}
 	return actions, rejected
+}
+
+func omittedMemoryCandidateDecisions(wr store.WorkflowRun, inbox []projectMemoryInboxCandidate, proposal report.MemoryUpdateOutput) []report.MemoryCandidateDecision {
+	referenced := map[string]bool{}
+	for _, decisions := range [][]report.MemoryCandidateDecision{proposal.Applied, proposal.Rejected, proposal.Edited, proposal.Merged, proposal.Deferred} {
+		for _, decision := range decisions {
+			for _, id := range memoryDecisionCandidateIDs(decision) {
+				referenced[id] = true
+			}
+		}
+	}
+	out := make([]report.MemoryCandidateDecision, 0)
+	for _, candidate := range inbox {
+		if referenced[candidate.ID] {
+			continue
+		}
+		refs := uniqueStrings([]string{candidate.Input.SourceArtifactID})
+		out = append(out, report.MemoryCandidateDecision{
+			CandidateID:        candidate.ID,
+			CandidateIDs:       []string{candidate.ID},
+			State:              report.MemoryCandidateDeferred,
+			Kind:               candidate.Input.Kind,
+			Title:              candidate.Input.Title,
+			Rationale:          "curator omitted candidate from memory_update_output; recorded as deferred without writing project memory",
+			SourceArtifactRefs: refs,
+			Freshness:          freshnessFromRefs(wr, candidate.Input.SourceStageID, refs, ""),
+		})
+	}
+	return out
 }
 
 func harnessMemoryUpdateOutput(wr store.WorkflowRun, inbox []projectMemoryInboxCandidate, extractionRejections []store.ProjectMemoryRejection, result store.ProjectMemoryUpdateResult) report.MemoryUpdateOutput {
@@ -460,7 +506,7 @@ func harnessMemoryUpdateOutput(wr store.WorkflowRun, inbox []projectMemoryInboxC
 			output.Rejected = append(output.Rejected, rejectedDecisionFromGuardrail(wr, projectMemoryApplyDecision{State: report.MemoryCandidateApplied, Decision: decision, Input: candidate.Input, CandidateIDs: []string{candidate.ID}, SourceArtifactRefs: []string{candidate.Input.SourceArtifactID}}, *result.Outcomes[i].Rejection))
 		}
 	}
-	output.InboxSummary.CandidatesCurated = countMemoryDecisions(output)
+	output.InboxSummary.CandidatesCurated = countMemoryCuratedCandidates(output)
 	output.StopReportSummary = memoryUpdateSummary(output)
 	return output
 }
@@ -607,6 +653,9 @@ func appliedMemoryDecision(wr store.WorkflowRun, action projectMemoryApplyDecisi
 
 func memoryChangeFromEntry(wr store.WorkflowRun, action projectMemoryApplyDecision, entry store.ProjectMemoryEntry) report.MemoryChange {
 	refs := uniqueStrings(action.SourceArtifactRefs)
+	if len(refs) == 0 {
+		refs = uniqueStrings([]string{entry.SourceArtifactID})
+	}
 	return report.MemoryChange{
 		Action:             report.MemoryChangeApplied,
 		EntryID:            entry.ID,
@@ -748,8 +797,26 @@ func freshnessFromRefs(wr store.WorkflowRun, sourceStageID string, refs []string
 	}
 }
 
-func countMemoryDecisions(output report.MemoryUpdateOutput) int {
-	return len(output.Applied) + len(output.Rejected) + len(output.Edited) + len(output.Merged) + len(output.Deferred)
+func countMemoryCuratedCandidates(output report.MemoryUpdateOutput) int {
+	seen := map[string]bool{}
+	count := 0
+	for _, decisions := range [][]report.MemoryCandidateDecision{output.Applied, output.Rejected, output.Edited, output.Merged, output.Deferred} {
+		for _, decision := range decisions {
+			ids := memoryDecisionCandidateIDs(decision)
+			if len(ids) == 0 {
+				count++
+				continue
+			}
+			for _, id := range ids {
+				if seen[id] {
+					continue
+				}
+				seen[id] = true
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func memoryUpdateSummary(output report.MemoryUpdateOutput) string {
