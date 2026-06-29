@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"fmt"
 
+	"github.com/agent-parley/parley/internal/manager/agentregistry"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/workflow"
 )
@@ -26,8 +27,9 @@ type runtimeGraph struct {
 }
 
 func newRuntimeWorkflow(template workflow.Template, stages []store.Stage) (runtimeWorkflow, error) {
-	template = workflow.NormalizeTemplate(template)
-	if err := workflow.ValidateTemplate(template); err != nil {
+	registry := registryForRuntimeTemplate(template)
+	template = workflow.NormalizeTemplateWithRegistry(template, registry)
+	if err := workflow.ValidateTemplateWithRegistry(template, registry); err != nil {
 		return runtimeWorkflow{}, err
 	}
 	graph, err := newRuntimeGraph(template)
@@ -64,6 +66,28 @@ func newRuntimeWorkflow(template workflow.Template, stages []store.Stage) (runti
 		byID[templateStage.ID] = runtimeStage
 	}
 	return runtimeWorkflow{Template: template, Stages: runtimeStages, ByID: byID, Graph: graph}, nil
+}
+
+func registryForRuntimeTemplate(template workflow.Template) agentregistry.Registry {
+	registry := agentregistry.Defaults()
+	for _, stage := range template.Stages {
+		if stage.Actor != workflow.ActorAgent || stage.ProfileID == "" {
+			continue
+		}
+		if _, ok := agentregistry.ProfileByID(registry, stage.ProfileID); ok {
+			continue
+		}
+		registry.Profiles = append(registry.Profiles, agentregistry.Profile{
+			ID:            stage.ProfileID,
+			FamilyID:      agentregistry.FamilyPi,
+			Name:          stage.ProfileID,
+			Role:          "runtime-template-reference",
+			Headless:      true,
+			ContextPolicy: "task_contract_only",
+			OutputStyle:   "structured_report",
+		})
+	}
+	return registry
 }
 
 func newRuntimeGraph(template workflow.Template) (runtimeGraph, error) {

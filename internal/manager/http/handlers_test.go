@@ -127,6 +127,107 @@ func TestHandleRunsCoercesLegacyRefinementLevel(t *testing.T) {
 	}
 }
 
+func TestProjectHomeLoadsSelectedWorkflowTemplateControls(t *testing.T) {
+	st := openRouteTestStore(t)
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/projects/default?workflow_template_id="+workflow.QuickFixDeliveryID, nil)
+	srv.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET project selected template status = %d want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	assertContains(t, body, "Selected workflow template: <strong>Quick Fix Delivery</strong>")
+	assertContains(t, body, `name="workflow_template_id" value="`+workflow.QuickFixDeliveryID+`"`)
+	assertContains(t, body, `option value="`+workflow.QuickFixDeliveryID+`" selected`)
+	assertContains(t, body, "Load template controls")
+	assertContains(t, body, "Commit to feature branch")
+}
+
+func TestHandleRunsPassesRunLocalWorkflowCustomization(t *testing.T) {
+	st := openRouteTestStore(t)
+	controller := &fakeRunController{state: defaultRouteQueueState()}
+	called := false
+	controller.startRunWithWorkflowFunc = func(_ context.Context, projectID string, input contract.TaskInput, template workflow.Template) (string, error) {
+		called = true
+		if projectID != store.DefaultProjectID {
+			t.Fatalf("projectID = %q", projectID)
+		}
+		if input.WorkflowTemplateID != workflow.BalancedPRDeliveryID {
+			t.Fatalf("workflow template id = %q", input.WorkflowTemplateID)
+		}
+		if template.Predefined || !template.Editable {
+			t.Fatalf("custom template flags predefined=%v editable=%v, want run-local editable", template.Predefined, template.Editable)
+		}
+		if len(template.Stages) != 4 {
+			t.Fatalf("custom stages = %d, want 4: %+v", len(template.Stages), template.Stages)
+		}
+		if template.Stages[1].ID != "validation" || template.Stages[2].ID != "implementation" {
+			t.Fatalf("custom stage order = %s, %s; want validation before implementation", template.Stages[1].ID, template.Stages[2].ID)
+		}
+		implementation := template.Stages[2]
+		if implementation.Instructions != "Use focused edits." {
+			t.Fatalf("implementation instructions = %q", implementation.Instructions)
+		}
+		if implementation.ProfileID != agentregistry.ProfilePiHeadlessWorker {
+			t.Fatalf("implementation profile = %q", implementation.ProfileID)
+		}
+		return "run_custom", nil
+	}
+
+	srv := newRouteTestServer(t, st, controller)
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/projects/default/runs", cookie, customRunWorkflowForm(csrf, true))
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST custom run status = %d want %d body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
+	}
+	if got := rec.Header().Get("Location"); got != "/projects/default/runs/run_custom" {
+		t.Fatalf("Location = %q", got)
+	}
+	if !called {
+		t.Fatal("StartProjectRunWithWorkflow was not called")
+	}
+}
+
+func TestHandleRunsRejectsInvalidRunLocalWorkflowBeforeCreatingRun(t *testing.T) {
+	st := openRouteTestStore(t)
+	controller := &fakeRunController{state: defaultRouteQueueState()}
+	controller.startRunWithWorkflowFunc = func(context.Context, string, contract.TaskInput, workflow.Template) (string, error) {
+		t.Fatal("StartProjectRunWithWorkflow should not be called for invalid customization")
+		return "", nil
+	}
+	controller.startRunInputFunc = func(context.Context, string, contract.TaskInput) (string, error) {
+		t.Fatal("StartProjectRunInput should not be called for invalid customization")
+		return "", nil
+	}
+
+	srv := newRouteTestServer(t, st, controller)
+	cookie, csrf := getCSRFToken(t, srv)
+	form := url.Values{
+		"idea":                        {"build the thing"},
+		"refinement_level":            {contract.RefinementLevelDirect},
+		"workflow_template_id":        {workflow.BalancedPRDeliveryID},
+		"customize_workflow":          {"1"},
+		"name":                        {"Invalid run workflow"},
+		"description":                 {"Missing start/end"},
+		"stage_id":                    {"implementation"},
+		"stage_type_implementation":   {workflow.StageTypeImplementation},
+		"enabled_implementation":      {"1"},
+		"actor_implementation":        {workflow.ActorAgent},
+		"profile_id_implementation":   {agentregistry.ProfilePiHeadlessWorker},
+		"max_attempts_implementation": {"1"},
+		"_csrf":                       {csrf},
+	}
+	rec := postForm(t, srv, "/runs", cookie, form)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST invalid custom run status = %d want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	body := rec.Body.String()
+	assertContains(t, body, "Run workflow customization invalid")
+	assertContains(t, body, "exactly one idea_refinement")
+}
+
 func TestHandleProjectChatMessageSubmitsConversationTurn(t *testing.T) {
 	st := openRouteTestStore(t)
 	controller := &fakeRunController{state: defaultRouteQueueState()}
@@ -1501,6 +1602,7 @@ type fakeRunController struct {
 	queueStateFunc                func(context.Context) (orchestrator.QueueState, error)
 	startRunFunc                  func(context.Context, string, string) (string, error)
 	startRunInputFunc             func(context.Context, string, contract.TaskInput) (string, error)
+	startRunWithWorkflowFunc      func(context.Context, string, contract.TaskInput, workflow.Template) (string, error)
 	submitConversationMessageFunc func(context.Context, string, string) (store.Message, error)
 	startQueuedRunFunc            func(context.Context, string) error
 	cancelRunFunc                 func(context.Context, string) error
@@ -1523,6 +1625,13 @@ func (f *fakeRunController) StartProjectRunInput(ctx context.Context, projectID 
 		return f.startRunFunc(ctx, projectID, input.Idea)
 	}
 	return "", errors.New("unexpected StartProjectRunInput call")
+}
+
+func (f *fakeRunController) StartProjectRunWithWorkflow(ctx context.Context, projectID string, input contract.TaskInput, template workflow.Template) (string, error) {
+	if f.startRunWithWorkflowFunc != nil {
+		return f.startRunWithWorkflowFunc(ctx, projectID, input, template)
+	}
+	return "", errors.New("unexpected StartProjectRunWithWorkflow call")
 }
 
 func (f *fakeRunController) SubmitConversationMessage(ctx context.Context, projectID, body string) (store.Message, error) {
@@ -1613,6 +1722,47 @@ func seedRouteProjectMemoryEntries(t *testing.T, st *store.Store) []store.Projec
 		t.Fatalf("route memory entries = %d, want 2", len(result.Entries))
 	}
 	return result.Entries
+}
+
+func customRunWorkflowForm(csrf string, includeCustomization bool) url.Values {
+	form := url.Values{
+		"idea":                 {"build the thing"},
+		"refinement_level":     {contract.RefinementLevelDirect},
+		"workflow_template_id": {workflow.BalancedPRDeliveryID},
+		"name":                 {"Run-local Balanced"},
+		"description":          {"Customized for this run only"},
+		"branch_policy":        {"feature_branch"},
+		"pr_behavior":          {"none"},
+		"fix_loop":             {"1"},
+		"max_fix_loops":        {"1"},
+		"stage_id":             {"idea_refinement", "validation", "implementation", "stop_report"},
+		"_csrf":                {csrf},
+	}
+	if includeCustomization {
+		form.Set("customize_workflow", "1")
+	}
+	addWorkflowStageForm(form, "idea_refinement", workflow.StageTypeIdeaRefinement, workflow.ActorHarness, 1, "", "", "")
+	addWorkflowStageForm(form, "validation", workflow.StageTypeValidation, workflow.ActorHarness, 2, "Run focused validation.", "", "")
+	addWorkflowStageForm(form, "implementation", workflow.StageTypeImplementation, workflow.ActorAgent, 3, "Use focused edits.", agentregistry.ProfilePiHeadlessWorker, "")
+	addWorkflowStageForm(form, "stop_report", workflow.StageTypeStopReport, workflow.ActorHarness, 4, "", "", "")
+	return form
+}
+
+func addWorkflowStageForm(form url.Values, id, stageType, actor string, order int, instructions, profileID, target string) {
+	form.Set("stage_type_"+id, stageType)
+	form.Set("enabled_"+id, "1")
+	form.Set("order_"+id, strconv.Itoa(order))
+	form.Set("label_"+id, id)
+	form.Set("actor_"+id, actor)
+	form.Set("instructions_"+id, instructions)
+	form.Set("max_attempts_"+id, "1")
+	form.Set("required_"+id, "1")
+	if profileID != "" {
+		form.Set("profile_id_"+id, profileID)
+	}
+	if target != "" {
+		form.Set("target_"+id, target)
+	}
 }
 
 func openRouteTestStore(t *testing.T) *store.Store {

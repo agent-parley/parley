@@ -21,8 +21,19 @@
     {{template "project_chat.html" .Chat}}
     <section class="card">
       <h2>New task run</h2>
+      <form method="get" action="/projects/{{.Project.ID}}" class="template-picker-form">
+        <label for="workflow_template_picker">Workflow template</label>
+        <select id="workflow_template_picker" name="workflow_template_id">
+          {{range .NewRunWorkflow.Templates}}
+          <option value="{{.ID}}" {{if eq $.NewRunWorkflow.SelectedTemplateID .ID}}selected{{end}}>{{.Name}}</option>
+          {{end}}
+        </select>
+        <button class="secondary" type="submit">Load template controls</button>
+      </form>
       <form method="post" action="/projects/{{.Project.ID}}/runs">
         <input type="hidden" name="_csrf" value="{{.CSRF}}">
+        <input type="hidden" name="workflow_template_id" value="{{.NewRunWorkflow.SelectedTemplateID}}">
+        <p class="muted">Selected workflow template: <strong>{{.NewRunWorkflow.Template.Name}}</strong></p>
         <label for="idea">Software idea</label>
         <textarea id="idea" name="idea" required rows="5" placeholder="Describe the change you want Parley to drive through the workflow."></textarea>
         <label for="refinement_level">Refinement</label>
@@ -30,6 +41,12 @@
           <option value="direct">Direct</option>
           <option value="standard" selected>Standard</option>
         </select>
+        <details class="workflow-customization">
+          <summary>Customize this run</summary>
+          <label class="checkbox-line"><input type="checkbox" name="customize_workflow" value="1"> Apply these workflow edits only to this run</label>
+          <p class="muted">Optional. The project template is not changed; the submitted run starts from this edited snapshot and executes without an automatic adjustment stop.</p>
+          {{template "new_run_workflow_fields" .NewRunWorkflow}}
+        </details>
         <button type="submit">Queue run</button>
       </form>
     </section>

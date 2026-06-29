@@ -192,6 +192,63 @@ func (s *Server) workflowTemplateEditData(r *http.Request, template workflow.Tem
 	}, nil
 }
 
+func (s *Server) newRunWorkflowData(r *http.Request, projectID, selectedTemplateID, message string) (web.NewRunWorkflowData, error) {
+	templates, err := s.store.ListWorkflowTemplates(r.Context())
+	if err != nil {
+		return web.NewRunWorkflowData{}, err
+	}
+	selectedTemplateID = strings.TrimSpace(selectedTemplateID)
+	if selectedTemplateID == "" {
+		selectedTemplateID = strings.TrimSpace(r.URL.Query().Get("workflow_template_id"))
+	}
+	if selectedTemplateID == "" {
+		selectedTemplateID = workflow.DefaultTemplateID
+	}
+	summaries := make([]web.WorkflowTemplateSummaryData, 0, len(templates))
+	var selected workflow.Template
+	for _, template := range templates {
+		summaries = append(summaries, web.WorkflowTemplateSummaryData{
+			ID:          template.ID,
+			Name:        template.Name,
+			Description: template.Description,
+			Predefined:  template.Predefined,
+			Recommended: template.Recommended,
+			Editable:    template.Editable,
+			StageCount:  len(template.Stages),
+		})
+		if template.ID == selectedTemplateID {
+			selected = template
+		}
+	}
+	if selected.ID == "" {
+		selectedTemplateID = workflow.DefaultTemplateID
+		for _, template := range templates {
+			if template.ID == selectedTemplateID {
+				selected = template
+				break
+			}
+		}
+	}
+	if selected.ID == "" {
+		return web.NewRunWorkflowData{}, fmt.Errorf("workflow template %s not found", selectedTemplateID)
+	}
+	registry, err := s.store.ResolveAgentRegistry(r.Context(), projectID)
+	if err != nil {
+		return web.NewRunWorkflowData{}, err
+	}
+	selected = workflow.NormalizeTemplateWithRegistry(selected, registry)
+	return web.NewRunWorkflowData{
+		Templates:          summaries,
+		SelectedTemplateID: selectedTemplateID,
+		Template:           selected,
+		Settings:           workflowTemplateSettingsData(selected.Settings),
+		StageRows:          workflowTemplateStageRowsWithRegistry(selected, registry),
+		ReviewTargets:      contract.ReviewTargetOptions(),
+		AgentProfiles:      registry.Profiles,
+		Error:              message,
+	}, nil
+}
+
 func workflowTemplateFromForm(r *http.Request, current workflow.Template, registry agentregistry.Registry) (workflow.Template, error) {
 	current = workflow.NormalizeTemplateWithRegistry(current, registry)
 	updated := current

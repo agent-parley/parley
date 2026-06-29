@@ -11,12 +11,117 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-parley/parley/internal/manager/agentregistry"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
 	"github.com/agent-parley/parley/internal/shared/report"
 )
+
+func TestStartProjectRunWithWorkflowExecutesCustomizedSnapshotWithoutTemplateMutation(t *testing.T) {
+	ctx := context.Background()
+	runner := &capturingRunner{}
+	env := newTestEnv(t, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 100}})
+	custom := runLocalWorkflowTemplate()
+
+	runID, err := env.engine.StartProjectRunWithWorkflow(ctx, store.DefaultProjectID, contract.TaskInput{Idea: "ship custom workflow", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: workflow.BalancedPRDeliveryID}, custom)
+	if err != nil {
+		t.Fatalf("StartProjectRunWithWorkflow() error = %v", err)
+	}
+	waitForRunStatus(t, env.store, runID, store.RunStatusCompleted)
+
+	snapshot, err := env.store.LatestWorkflowTemplateSnapshot(ctx, runID)
+	if err != nil {
+		t.Fatalf("latest workflow snapshot: %v", err)
+	}
+	if snapshot.Predefined || !snapshot.Editable {
+		t.Fatalf("snapshot flags predefined=%v editable=%v, want run-local editable", snapshot.Predefined, snapshot.Editable)
+	}
+	if len(snapshot.Stages) != 3 {
+		t.Fatalf("snapshot stages = %d, want 3: %+v", len(snapshot.Stages), snapshot.Stages)
+	}
+	if snapshot.Stages[1].ID != "implementation" || snapshot.Stages[1].Instructions != "Use focused edits." {
+		t.Fatalf("implementation snapshot stage = %+v", snapshot.Stages[1])
+	}
+	if len(runner.disps) != 1 {
+		t.Fatalf("dispatch count = %d, want implementation only", len(runner.disps))
+	}
+	if got := runner.disps[0].Input["workflow_stage_instructions"]; got != "Use focused edits." {
+		t.Fatalf("dispatch instructions = %#v", got)
+	}
+	events, err := env.store.ListEvents(ctx, runID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	for _, ev := range events {
+		if strings.Contains(ev.Type, "workflow_adjustment") {
+			t.Fatalf("unexpected workflow adjustment event: %s", ev.Type)
+		}
+	}
+	source, err := env.store.GetWorkflowTemplate(ctx, workflow.BalancedPRDeliveryID)
+	if err != nil {
+		t.Fatalf("get source template: %v", err)
+	}
+	if !source.Predefined || source.Editable {
+		t.Fatalf("source template mutated flags predefined=%v editable=%v", source.Predefined, source.Editable)
+	}
+	if len(source.Stages) == len(snapshot.Stages) {
+		t.Fatalf("source template appears replaced by run-local snapshot: %+v", source.Stages)
+	}
+}
+
+func TestStartProjectRunInputKeepsPlainTemplateSnapshotUnchanged(t *testing.T) {
+	ctx := context.Background()
+	env := newTestEnv(t, &capturingRunner{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 100}})
+
+	runID, err := env.engine.StartProjectRunInput(ctx, store.DefaultProjectID, contract.TaskInput{Idea: "plain workflow", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: workflow.QuickFixDeliveryID})
+	if err != nil {
+		t.Fatalf("StartProjectRunInput() error = %v", err)
+	}
+	run, err := env.store.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Status != store.RunStatusPending {
+		t.Fatalf("plain run status = %s, want pending", run.Status)
+	}
+	snapshot, err := env.store.LatestWorkflowTemplateSnapshot(ctx, runID)
+	if err != nil {
+		t.Fatalf("latest workflow snapshot: %v", err)
+	}
+	source, err := env.store.GetWorkflowTemplate(ctx, workflow.QuickFixDeliveryID)
+	if err != nil {
+		t.Fatalf("get source template: %v", err)
+	}
+	if snapshot.ID != source.ID || snapshot.Name != source.Name || snapshot.Predefined != source.Predefined || snapshot.Editable != source.Editable || len(snapshot.Stages) != len(source.Stages) {
+		t.Fatalf("plain snapshot diverged from source: snapshot=%+v source=%+v", snapshot, source)
+	}
+	for i := range source.Stages {
+		if snapshot.Stages[i].ID != source.Stages[i].ID || snapshot.Stages[i].Type != source.Stages[i].Type {
+			t.Fatalf("plain snapshot stage %d = %+v, want %+v", i, snapshot.Stages[i], source.Stages[i])
+		}
+	}
+}
+
+func runLocalWorkflowTemplate() workflow.Template {
+	template := workflow.Template{
+		SchemaVersion: workflow.SchemaVersion,
+		ID:            workflow.BalancedPRDeliveryID,
+		Name:          "Run-local Balanced",
+		Description:   "Customized for one run.",
+		Predefined:    false,
+		Editable:      true,
+		Stages: []workflow.StageTemplate{
+			{ID: "idea_refinement", Type: workflow.StageTypeIdeaRefinement, Label: "Idea refinement", Actor: workflow.ActorHarness},
+			{ID: "implementation", Type: workflow.StageTypeImplementation, Label: "Implementation", Actor: workflow.ActorAgent, ProfileID: agentregistry.ProfilePiHeadlessWorker, Instructions: "Use focused edits."},
+			{ID: "stop_report", Type: workflow.StageTypeStopReport, Label: "Stop/report", Actor: workflow.ActorHarness},
+		},
+		Settings: map[string]any{"pr_behavior": "none"},
+	}
+	template.Edges = workflow.DeriveTemplateEdges(template)
+	return workflow.NormalizeTemplate(template)
+}
 
 func TestCompletionEventType(t *testing.T) {
 	cases := []struct {

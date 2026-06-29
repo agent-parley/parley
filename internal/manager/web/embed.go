@@ -41,6 +41,7 @@ type IndexData struct {
 	Queue           QueueView
 	Tasks           ProjectTasksData
 	Chat            ProjectChatData
+	NewRunWorkflow  NewRunWorkflowData
 	Notice          *Notice
 	Notifications   NotificationCenterData
 	CSRF            string

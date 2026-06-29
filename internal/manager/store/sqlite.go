@@ -1649,6 +1649,14 @@ func (s *Store) CreateWorkflowRunInput(ctx context.Context, input contract.TaskI
 }
 
 func (s *Store) CreateWorkflowRunForProjectInput(ctx context.Context, projectID string, input contract.TaskInput) (WorkflowRun, error) {
+	return s.createWorkflowRunForProjectInput(ctx, projectID, input, nil)
+}
+
+func (s *Store) CreateWorkflowRunForProjectInputWithTemplate(ctx context.Context, projectID string, input contract.TaskInput, template workflow.Template) (WorkflowRun, error) {
+	return s.createWorkflowRunForProjectInput(ctx, projectID, input, &template)
+}
+
+func (s *Store) createWorkflowRunForProjectInput(ctx context.Context, projectID string, input contract.TaskInput, templateOverride *workflow.Template) (WorkflowRun, error) {
 	project, err := s.GetProject(ctx, projectID)
 	if err != nil {
 		return WorkflowRun{}, err
@@ -1674,9 +1682,26 @@ func (s *Store) CreateWorkflowRunForProjectInput(ctx context.Context, projectID 
 			return WorkflowRun{}, fmt.Errorf("conversation %s does not belong to project %s", input.ConversationID, project.ID)
 		}
 	}
-	template, err := s.GetWorkflowTemplate(ctx, input.WorkflowTemplateID)
-	if err != nil {
-		return WorkflowRun{}, err
+	var template workflow.Template
+	if templateOverride != nil {
+		if _, err := s.GetWorkflowTemplate(ctx, input.WorkflowTemplateID); err != nil {
+			return WorkflowRun{}, err
+		}
+		template = workflow.NormalizeTemplate(*templateOverride)
+		template.ID = input.WorkflowTemplateID
+		template.Predefined = false
+		template.Recommended = false
+		template.Editable = true
+		template.Edges = workflow.DeriveTemplateEdges(template)
+		template = workflow.NormalizeTemplate(template)
+		if err := workflow.ValidateTemplateWithRegistry(template, storedWorkflowTemplateRegistry(template)); err != nil {
+			return WorkflowRun{}, fmt.Errorf("workflow template override is invalid: %w", err)
+		}
+	} else {
+		template, err = s.GetWorkflowTemplate(ctx, input.WorkflowTemplateID)
+		if err != nil {
+			return WorkflowRun{}, err
+		}
 	}
 	repositoryID, err := s.DefaultRepositoryID(ctx, projectID)
 	if err != nil {
@@ -1749,7 +1774,7 @@ func (s *Store) CreateAttemptForRun(ctx context.Context, runID string, template 
 		return Attempt{}, nil, fmt.Errorf("get task for run %s: %w", runID, err)
 	}
 	template = workflow.NormalizeTemplate(template)
-	if err := workflow.ValidateTemplate(template); err != nil {
+	if err := workflow.ValidateTemplateWithRegistry(template, storedWorkflowTemplateRegistry(template)); err != nil {
 		return Attempt{}, nil, err
 	}
 	now := nowRFC3339()
@@ -2412,7 +2437,7 @@ func (s *Store) LatestWorkflowTemplateSnapshot(ctx context.Context, runID string
 		return workflow.Template{}, fmt.Errorf("decode workflow template snapshot: %w", err)
 	}
 	template = workflow.NormalizeTemplate(template)
-	if err := workflow.ValidateTemplate(template); err != nil {
+	if err := workflow.ValidateTemplateWithRegistry(template, storedWorkflowTemplateRegistry(template)); err != nil {
 		return workflow.Template{}, fmt.Errorf("workflow template snapshot is invalid: %w", err)
 	}
 	return template, nil
