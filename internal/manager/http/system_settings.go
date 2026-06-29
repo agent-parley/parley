@@ -46,6 +46,14 @@ func (s *Server) handleSystemSettingsPath(w http.ResponseWriter, r *http.Request
 		s.handleForgeCredentialPath(w, r, parts)
 		return
 	}
+	if parts[0] == "agent-profiles" {
+		if len(parts) == 1 {
+			s.handleGlobalAgentProfileSave(w, r)
+			return
+		}
+		http.NotFound(w, r)
+		return
+	}
 	if parts[0] != "notification-sinks" {
 		http.NotFound(w, r)
 		return
@@ -359,11 +367,15 @@ func (s *Server) systemSettingsData(r *http.Request, notice, status, oneTimeSecr
 	if err != nil {
 		return web.SystemSettingsData{}, err
 	}
+	agentProfiles, err := s.globalAgentProfileEditorData(r, "", "")
+	if err != nil {
+		return web.SystemSettingsData{}, err
+	}
 	center, err := s.notificationCenterData(r.Context(), csrf)
 	if err != nil {
 		return web.SystemSettingsData{}, err
 	}
-	return web.SystemSettingsData{Sinks: sinks, ForgeCredentials: forgeCredentials, Center: center, CSRF: csrf, Title: "Parley · System Settings"}, nil
+	return web.SystemSettingsData{Sinks: sinks, ForgeCredentials: forgeCredentials, AgentProfiles: agentProfiles, Center: center, CSRF: csrf, Title: "Parley · System Settings"}, nil
 }
 
 func (s *Server) externalNotificationSinksData(r *http.Request, notice, status, oneTimeSecret string) (web.ExternalNotificationSinksData, error) {

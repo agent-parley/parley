@@ -356,6 +356,82 @@ func TestWorkflowTemplateAuthoringCopyEditSaveReloadAndRejectsMalformed(t *testi
 	assertContains(t, badRec.Body.String(), "exactly one idea_refinement")
 }
 
+func TestAgentProfileEditorPersistsOverridesAndFeedsTemplateDropdown(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	cookie, csrf := getCSRFToken(t, srv)
+
+	body := getSettingsBody(t, srv, "/settings")
+	assertContains(t, body, "Global agent profiles")
+	assertContains(t, body, "Pi headless worker")
+
+	globalRec := postForm(t, srv, "/settings/agent-profiles", cookie, agentProfileForm(csrf, "global_builder", "Global builder", "implementation", "global-model", "global persona", "global instructions", "implementation"))
+	if globalRec.Code != http.StatusAccepted {
+		t.Fatalf("POST global agent profile status = %d want %d body=%s", globalRec.Code, http.StatusAccepted, globalRec.Body.String())
+	}
+	assertContains(t, globalRec.Body.String(), "Global builder")
+	globalRegistry, err := st.ResolveGlobalAgentRegistry(ctx)
+	if err != nil {
+		t.Fatalf("resolve global registry: %v", err)
+	}
+	globalProfile, ok := agentregistry.ProfileByID(globalRegistry, "global_builder")
+	if !ok || globalProfile.Model != "global-model" || globalProfile.Prompt != "global persona" || globalProfile.DefaultInstructions != "global instructions" {
+		t.Fatalf("global profile = %+v/%v, want persisted fields", globalProfile, ok)
+	}
+
+	copied, err := st.CopyWorkflowTemplate(ctx, workflow.BalancedPRDeliveryID, "profile_dropdown_template", "Profile Dropdown Template")
+	if err != nil {
+		t.Fatalf("copy workflow template: %v", err)
+	}
+	editBody := getSettingsBody(t, srv, "/templates/"+copied.ID+"/edit")
+	assertContains(t, editBody, "Global builder")
+
+	projectRec := postForm(t, srv, "/projects/default/settings/agent-profiles", cookie, agentProfileForm(csrf, "global_builder", "Project builder", "implementation", "project-model", "project persona", "project instructions", "implementation"))
+	if projectRec.Code != http.StatusAccepted {
+		t.Fatalf("POST project agent profile status = %d want %d body=%s", projectRec.Code, http.StatusAccepted, projectRec.Body.String())
+	}
+	assertContains(t, projectRec.Body.String(), "Project builder")
+	projectRegistry, err := st.ResolveAgentRegistry(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("resolve project registry: %v", err)
+	}
+	projectProfile, ok := agentregistry.ProfileByID(projectRegistry, "global_builder")
+	if !ok || projectProfile.Model != "project-model" || projectProfile.Prompt != "project persona" || projectProfile.DefaultInstructions != "project instructions" {
+		t.Fatalf("project profile = %+v/%v, want project override fields", projectProfile, ok)
+	}
+
+	projectOnlyRec := postForm(t, srv, "/projects/default/settings/agent-profiles", cookie, agentProfileForm(csrf, "project_validator", "Project validator", "validation-support", "validator-model", "validator persona", "validator instructions", "implementation, validation"))
+	if projectOnlyRec.Code != http.StatusAccepted {
+		t.Fatalf("POST project-only agent profile status = %d want %d body=%s", projectOnlyRec.Code, http.StatusAccepted, projectOnlyRec.Body.String())
+	}
+	projectRegistry, err = st.ResolveAgentRegistry(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("resolve project registry after create: %v", err)
+	}
+	if _, ok := agentregistry.ProfileByID(projectRegistry, "project_validator"); !ok {
+		t.Fatalf("project_validator missing from resolved project registry: %+v", projectRegistry.Profiles)
+	}
+	editBody = getSettingsBody(t, srv, "/templates/"+copied.ID+"/edit")
+	assertContains(t, editBody, "Project builder")
+	assertContains(t, editBody, "Project validator")
+
+	saveForm := workflowTemplateSaveForm(copied, csrf)
+	saveForm.Set("profile_id_implementation", "project_validator")
+	saveRec := postForm(t, srv, "/templates/"+copied.ID+"/save", cookie, saveForm)
+	if saveRec.Code != http.StatusSeeOther {
+		t.Fatalf("POST template save with project profile status = %d want %d body=%s", saveRec.Code, http.StatusSeeOther, saveRec.Body.String())
+	}
+	saved, err := st.GetWorkflowTemplate(ctx, copied.ID)
+	if err != nil {
+		t.Fatalf("get saved template: %v", err)
+	}
+	implementation := saved.Stages[workflowTemplateStageIndex(saved, "implementation")]
+	if implementation.ProfileID != "project_validator" {
+		t.Fatalf("implementation profile_id = %q, want project_validator", implementation.ProfileID)
+	}
+}
+
 func TestSystemSettingsExternalSinkCreationSealsSecretAndShowsWebhookSecretOnce(t *testing.T) {
 	ctx := context.Background()
 	st := openRouteTestStore(t)
@@ -1614,6 +1690,23 @@ func assertBefore(t *testing.T, body, first, second string) {
 	secondIndex := strings.Index(body, second)
 	if firstIndex < 0 || secondIndex < 0 || firstIndex >= secondIndex {
 		t.Fatalf("body order want %q before %q (indexes %d, %d):\n%s", first, second, firstIndex, secondIndex, body)
+	}
+}
+
+func agentProfileForm(csrf, id, name, role, model, prompt, defaultInstructions, suggestedStages string) url.Values {
+	return url.Values{
+		"_csrf":                 {csrf},
+		"profile_id":            {id},
+		"family_id":             {agentregistry.FamilyPi},
+		"name":                  {name},
+		"role":                  {role},
+		"headless":              {"1"},
+		"model":                 {model},
+		"context_policy":        {"task_contract_only"},
+		"output_style":          {"structured_report"},
+		"prompt":                {prompt},
+		"default_instructions":  {defaultInstructions},
+		"suggested_stage_types": {suggestedStages},
 	}
 }
 

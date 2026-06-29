@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS projects (
   queue_auto_when_ready INTEGER NOT NULL DEFAULT 1,
   queue_max_concurrent INTEGER NOT NULL DEFAULT 1,
   queue_backlog_cap INTEGER NOT NULL DEFAULT 100,
+  agent_registry_overrides_json TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -59,6 +60,13 @@ CREATE TABLE IF NOT EXISTS workflow_templates (
   is_recommended INTEGER NOT NULL DEFAULT 0,
   is_editable INTEGER NOT NULL DEFAULT 1,
   template_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_registry_overrides (
+  scope TEXT PRIMARY KEY CHECK (scope = 'global'),
+  overrides_json TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
