@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -291,9 +292,26 @@ func (c *Client) SetLifecycleHandlers(onHeartbeatMissed HeartbeatMissedHandler, 
 
 func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.Report, error) {
 	cancelAttempt := func() {
-		cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = c.CancelAttempt(cancelCtx, disp.RunID, disp.TaskID, disp.AttemptID)
+		// Best effort, but do not silently drop the cancel on a transient send
+		// failure under load: the runner must learn the attempt was cancelled.
+		// The dispatch context is already cancelled, so use a detached context
+		// and retry until the cancel lands or the session is gone. A send that
+		// returns an error did not deliver, so a retry cannot duplicate a cancel
+		// the runner already received.
+		for attempt := 1; attempt <= 3; attempt++ {
+			select {
+			case <-c.session.Done():
+				return
+			default:
+			}
+			cancelCtx, cancelTimeout := context.WithTimeout(context.Background(), 5*time.Second)
+			err := c.CancelAttempt(cancelCtx, disp.RunID, disp.TaskID, disp.AttemptID)
+			cancelTimeout()
+			if err == nil {
+				return
+			}
+			log.Printf("runnerclient: cancel attempt %d/3 for run %s attempt %s failed: %v", attempt, disp.RunID, disp.AttemptID, err)
+		}
 	}
 	waiter := &dispatchWaiter{reportCh: make(chan report.Report, 1), resultCh: make(chan protocol.ResultPayload, 1)}
 	reportKey := disp.StageID
