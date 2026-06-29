@@ -145,6 +145,19 @@ func TestMemoryUpdateOutputFromPayload(t *testing.T) {
 	}
 }
 
+func TestMemoryUpdateOutputFromPayloadNormalizesMemoryChangeSourceRefs(t *testing.T) {
+	out := validMemoryUpdateOutput()
+	out.MemoryChanges[0].SourceArtifactRefs = nil
+	out.MemoryChanges[0].Freshness.SourceArtifactRefs = []string{"artifact_report", "artifact_report", " "}
+	parsed, err := MemoryUpdateOutputFromPayload(map[string]any{MemoryUpdateOutputPayloadKey: out})
+	if err != nil {
+		t.Fatalf("MemoryUpdateOutputFromPayload() error = %v", err)
+	}
+	if got := parsed.MemoryChanges[0].SourceArtifactRefs; len(got) != 1 || got[0] != "artifact_report" {
+		t.Fatalf("memory change source refs = %#v, want normalized artifact_report", got)
+	}
+}
+
 func validMemoryUpdateOutput() MemoryUpdateOutput {
 	return MemoryUpdateOutput{
 		InboxSummary: MemoryInboxSummary{LearningOpportunities: 2, CandidatesGenerated: 2, CandidatesCurated: 2, SourceArtifactRefs: []string{"artifact_report"}},
