@@ -56,6 +56,7 @@ type ProjectSettingsData struct {
 	Project       store.Project
 	Rules         ProjectSettingsSectionData
 	Preferences   ProjectSettingsSectionData
+	AgentProfiles AgentProfileEditorData
 	Memory        ProjectMemoryExportData
 	Notifications NotificationSettingsData
 	Center        NotificationCenterData
@@ -64,10 +65,12 @@ type ProjectSettingsData struct {
 }
 
 type SystemSettingsData struct {
-	Sinks  ExternalNotificationSinksData
-	Center NotificationCenterData
-	CSRF   string
-	Title  string
+	Sinks            ExternalNotificationSinksData
+	ForgeCredentials ForgeCredentialsData
+	AgentProfiles    AgentProfileEditorData
+	Center           NotificationCenterData
+	CSRF             string
+	Title            string
 }
 
 type ExternalNotificationSinksData struct {
@@ -80,6 +83,54 @@ type ExternalNotificationSinksData struct {
 	CreateGotifyPath     string
 	CreateWebhookPath    string
 	CSRF                 string
+}
+
+type ForgeCredentialsData struct {
+	Credentials      []ForgeCredentialData
+	SecretsAvailable bool
+	SecretsMessage   string
+	Notice           string
+	Status           string
+	CreatePath       string
+	CSRF             string
+}
+
+type ForgeCredentialData struct {
+	ID               string
+	Host             string
+	SecretConfigured bool
+	DeletePath       string
+	UpdatedAt        string
+}
+
+type AgentProfileEditorData struct {
+	Scope            string
+	Title            string
+	Help             string
+	Profiles         []AgentProfileFormData
+	Create           AgentProfileFormData
+	SavePath         string
+	DefaultProfileID string
+	Notice           string
+	Status           string
+	CSRF             string
+}
+
+type AgentProfileFormData struct {
+	ID                  string
+	FamilyID            string
+	Name                string
+	Description         string
+	Role                string
+	Headless            bool
+	Prompt              string
+	DefaultInstructions string
+	Model               string
+	ContextPolicy       string
+	OutputStyle         string
+	SuggestedStageTypes string
+	Layer               string
+	IsDefault           bool
 }
 
 type NotificationSinkData struct {

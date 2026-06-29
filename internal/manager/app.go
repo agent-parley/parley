@@ -129,6 +129,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		RunnerSlots:           1,
 		ConversationBudget:    cfg.Settings.Conversation.Budget,
 		ConversationIdleTTL:   cfg.Settings.Conversation.IdleWarmHoldTTL,
+		Secrets:               secretService,
 		NotificationSinks:     []orchestrator.NotificationSink{notificationSink, externalNotificationSink},
 	})
 	app := &App{

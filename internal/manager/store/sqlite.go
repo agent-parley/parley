@@ -15,6 +15,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/agent-parley/parley/internal/manager/agentregistry"
 	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 	"github.com/agent-parley/parley/internal/shared/event"
@@ -406,6 +407,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureProjectNotificationPreferencesSchema(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureAgentRegistrySchema(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureDefaultProject(ctx); err != nil {
 		return err
 	}
@@ -440,6 +444,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureNotificationSinksSchema(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureForgeCredentialsSchema(ctx); err != nil {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, string(schema)); err != nil {
@@ -533,6 +540,27 @@ func (s *Store) ensureProjectNotificationPreferencesSchema(ctx context.Context) 
 	return nil
 }
 
+func (s *Store) ensureAgentRegistrySchema(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS agent_registry_overrides (
+		scope TEXT PRIMARY KEY CHECK (scope = 'global'),
+		overrides_json TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create agent registry overrides table: %w", err)
+	}
+	cols, err := s.tableColumns(ctx, "projects")
+	if err != nil {
+		return err
+	}
+	if _, ok := cols["agent_registry_overrides_json"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE projects ADD COLUMN agent_registry_overrides_json TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add project agent registry overrides column: %w", err)
+		}
+	}
+	return nil
+}
+
 func (s *Store) ensureNotificationSinksSchema(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS notification_sinks (
 		id TEXT PRIMARY KEY,
@@ -568,6 +596,28 @@ func (s *Store) ensureNotificationSinksSchema(ctx context.Context) error {
 	if _, ok := cols["send_finished"]; !ok {
 		if _, err := s.db.ExecContext(ctx, `ALTER TABLE notification_sinks ADD COLUMN send_finished INTEGER NOT NULL DEFAULT 1`); err != nil {
 			return fmt.Errorf("add notification sink finished class column: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureForgeCredentialsSchema(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS forge_credentials (
+		id TEXT PRIMARY KEY,
+		host TEXT NOT NULL DEFAULT 'github.com',
+		secret_ciphertext BLOB NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create forge credentials table: %w", err)
+	}
+	cols, err := s.tableColumns(ctx, "forge_credentials")
+	if err != nil {
+		return err
+	}
+	if _, ok := cols["host"]; !ok {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE forge_credentials ADD COLUMN host TEXT NOT NULL DEFAULT 'github.com'`); err != nil {
+			return fmt.Errorf("add forge credential host column: %w", err)
 		}
 	}
 	return nil
@@ -956,11 +1006,15 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, template.ID, template.Name, template.Descri
 }
 
 func (s *Store) UpdateWorkflowTemplate(ctx context.Context, template workflow.Template) error {
-	template = prepareWorkflowTemplateForSave(template)
+	return s.UpdateWorkflowTemplateWithRegistry(ctx, template, agentregistry.Defaults())
+}
+
+func (s *Store) UpdateWorkflowTemplateWithRegistry(ctx context.Context, template workflow.Template, registry agentregistry.Registry) error {
+	template = prepareWorkflowTemplateForSaveWithRegistry(template, registry)
 	if !template.Editable || template.Predefined {
 		return ErrWorkflowTemplateNotEditable
 	}
-	if err := workflow.ValidateTemplate(template); err != nil {
+	if err := workflow.ValidateTemplateWithRegistry(template, registry); err != nil {
 		return err
 	}
 	var active int
@@ -995,16 +1049,42 @@ func decodeWorkflowTemplate(raw string) (workflow.Template, error) {
 		return workflow.Template{}, fmt.Errorf("decode workflow template: %w", err)
 	}
 	template = workflow.NormalizeTemplate(template)
-	if err := workflow.ValidateTemplate(template); err != nil {
+	if err := workflow.ValidateTemplateWithRegistry(template, storedWorkflowTemplateRegistry(template)); err != nil {
 		return workflow.Template{}, fmt.Errorf("stored workflow template %s is invalid: %w", template.ID, err)
 	}
 	return template, nil
 }
 
+func storedWorkflowTemplateRegistry(template workflow.Template) agentregistry.Registry {
+	registry := agentregistry.Defaults()
+	for _, stage := range template.Stages {
+		if stage.Actor != workflow.ActorAgent || stage.ProfileID == "" {
+			continue
+		}
+		if _, ok := agentregistry.ProfileByID(registry, stage.ProfileID); ok {
+			continue
+		}
+		registry.Profiles = append(registry.Profiles, agentregistry.Profile{
+			ID:            stage.ProfileID,
+			FamilyID:      agentregistry.FamilyPi,
+			Name:          stage.ProfileID,
+			Role:          "stored-template-reference",
+			Headless:      true,
+			ContextPolicy: "task_contract_only",
+			OutputStyle:   "structured_report",
+		})
+	}
+	return registry
+}
+
 func prepareWorkflowTemplateForSave(template workflow.Template) workflow.Template {
-	template = workflow.NormalizeTemplate(template)
+	return prepareWorkflowTemplateForSaveWithRegistry(template, agentregistry.Defaults())
+}
+
+func prepareWorkflowTemplateForSaveWithRegistry(template workflow.Template, registry agentregistry.Registry) workflow.Template {
+	template = workflow.NormalizeTemplateWithRegistry(template, registry)
 	template.Edges = workflow.DeriveTemplateEdges(template)
-	return workflow.NormalizeTemplate(template)
+	return workflow.NormalizeTemplateWithRegistry(template, registry)
 }
 
 func (s *Store) ensureRunnerRegistrySchema(ctx context.Context) error {

@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS projects (
   queue_auto_when_ready INTEGER NOT NULL DEFAULT 1,
   queue_max_concurrent INTEGER NOT NULL DEFAULT 1,
   queue_backlog_cap INTEGER NOT NULL DEFAULT 100,
+  agent_registry_overrides_json TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -59,6 +60,13 @@ CREATE TABLE IF NOT EXISTS workflow_templates (
   is_recommended INTEGER NOT NULL DEFAULT 0,
   is_editable INTEGER NOT NULL DEFAULT 1,
   template_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_registry_overrides (
+  scope TEXT PRIMARY KEY CHECK (scope = 'global'),
+  overrides_json TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -200,6 +208,14 @@ CREATE TABLE IF NOT EXISTS notification_sinks (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS forge_credentials (
+  id TEXT PRIMARY KEY,
+  host TEXT NOT NULL DEFAULT 'github.com',
+  secret_ciphertext BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS project_memory_entries (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -272,6 +288,7 @@ CREATE INDEX IF NOT EXISTS idx_events_scope_sequence ON events(scope, sequence);
 CREATE INDEX IF NOT EXISTS idx_artifacts_run_id ON artifacts(run_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_project_id ON artifacts(project_id);
 CREATE INDEX IF NOT EXISTS idx_notification_sinks_enabled ON notification_sinks(enabled, type, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_forge_credentials_host ON forge_credentials(host, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_project_memory_entries_project ON project_memory_entries(project_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_project_memory_entries_source_run ON project_memory_entries(source_run_id);
 CREATE INDEX IF NOT EXISTS idx_project_memory_decisions_run ON project_memory_candidate_decisions(run_id, curator_stage_id);

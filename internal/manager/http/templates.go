@@ -110,12 +110,17 @@ func (s *Server) handleWorkflowTemplateSave(w http.ResponseWriter, r *http.Reque
 		http.NotFound(w, r)
 		return
 	}
-	updated, err := workflowTemplateFromForm(r, current)
+	registry, err := s.store.ResolveAgentRegistry(r.Context(), store.DefaultProjectID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	updated, err := workflowTemplateFromForm(r, current, registry)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := workflow.ValidateTemplate(updated); err != nil {
+	if err := workflow.ValidateTemplateWithRegistry(updated, registry); err != nil {
 		data, dataErr := s.workflowTemplateEditData(r, updated, nil, err.Error())
 		if dataErr != nil {
 			http.Error(w, dataErr.Error(), http.StatusInternalServerError)
@@ -124,7 +129,7 @@ func (s *Server) handleWorkflowTemplateSave(w http.ResponseWriter, r *http.Reque
 		s.writePageStatus(w, "workflow_template_edit.html", data, http.StatusBadRequest)
 		return
 	}
-	if err := s.store.UpdateWorkflowTemplate(r.Context(), updated); err != nil {
+	if err := s.store.UpdateWorkflowTemplateWithRegistry(r.Context(), updated, registry); err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, store.ErrWorkflowTemplateInUse) {
 			status = http.StatusConflict
@@ -168,12 +173,16 @@ func (s *Server) workflowTemplateEditData(r *http.Request, template workflow.Tem
 	if err != nil {
 		return web.WorkflowTemplateEditData{}, err
 	}
+	registry, err := s.store.ResolveAgentRegistry(r.Context(), store.DefaultProjectID)
+	if err != nil {
+		return web.WorkflowTemplateEditData{}, err
+	}
 	return web.WorkflowTemplateEditData{
-		Template:      workflow.NormalizeTemplate(template),
+		Template:      workflow.NormalizeTemplateWithRegistry(template, registry),
 		Settings:      workflowTemplateSettingsData(template.Settings),
-		StageRows:     workflowTemplateStageRows(template),
+		StageRows:     workflowTemplateStageRowsWithRegistry(template, registry),
 		ReviewTargets: contract.ReviewTargetOptions(),
-		AgentProfiles: agentregistry.Defaults().Profiles,
+		AgentProfiles: registry.Profiles,
 		SavePath:      "/templates/" + url.PathEscape(template.ID) + "/save",
 		Notifications: notifications,
 		Notice:        notice,
@@ -183,8 +192,8 @@ func (s *Server) workflowTemplateEditData(r *http.Request, template workflow.Tem
 	}, nil
 }
 
-func workflowTemplateFromForm(r *http.Request, current workflow.Template) (workflow.Template, error) {
-	current = workflow.NormalizeTemplate(current)
+func workflowTemplateFromForm(r *http.Request, current workflow.Template, registry agentregistry.Registry) (workflow.Template, error) {
+	current = workflow.NormalizeTemplateWithRegistry(current, registry)
 	updated := current
 	updated.Name = strings.TrimSpace(r.Form.Get("name"))
 	updated.Description = strings.TrimSpace(r.Form.Get("description"))
@@ -192,6 +201,9 @@ func workflowTemplateFromForm(r *http.Request, current workflow.Template) (workf
 	setStringSetting(updated.Settings, "branch_policy", r.Form.Get("branch_policy"))
 	setStringSetting(updated.Settings, "pr_behavior", r.Form.Get("pr_behavior"))
 	setStringSetting(updated.Settings, "merge_policy", r.Form.Get("merge_policy"))
+	setStringSetting(updated.Settings, "required_checks", r.Form.Get("required_checks"))
+	setStringSetting(updated.Settings, "forge_credential", r.Form.Get("forge_credential"))
+	setStringSetting(updated.Settings, "merge_wait_timeout", r.Form.Get("merge_wait_timeout"))
 	updated.Settings["fix_loop"] = r.Form.Get("fix_loop") != ""
 	if raw := strings.TrimSpace(r.Form.Get("max_fix_loops")); raw != "" {
 		maxLoops, err := strconv.Atoi(raw)
@@ -297,7 +309,7 @@ func workflowTemplateFromForm(r *http.Request, current workflow.Template) (workf
 	updated.Stages = appendWorkflowStages(updated.Stages, middles)
 	updated.Stages = appendWorkflowStages(updated.Stages, stops)
 	updated.Edges = workflow.DeriveTemplateEdges(updated)
-	return workflow.NormalizeTemplate(updated), nil
+	return workflow.NormalizeTemplateWithRegistry(updated, registry), nil
 }
 
 type orderedWorkflowStage struct {
@@ -361,7 +373,11 @@ func parseWorkflowStageMaxAttempts(raw string) (int, error) {
 }
 
 func workflowTemplateStageRows(template workflow.Template) []web.WorkflowTemplateStageRowData {
-	template = workflow.NormalizeTemplate(template)
+	return workflowTemplateStageRowsWithRegistry(template, agentregistry.Defaults())
+}
+
+func workflowTemplateStageRowsWithRegistry(template workflow.Template, registry agentregistry.Registry) []web.WorkflowTemplateStageRowData {
+	template = workflow.NormalizeTemplateWithRegistry(template, registry)
 	existingIDs := map[string]bool{}
 	existingTypes := map[string]bool{}
 	existingReviews := map[string]bool{}
@@ -373,7 +389,7 @@ func workflowTemplateStageRows(template workflow.Template) []web.WorkflowTemplat
 		} else {
 			existingTypes[stage.Type] = true
 		}
-		row := workflowTemplateStageRow(stage, i+1, true, true)
+		row := workflowTemplateStageRow(stage, registry, i+1, true, true)
 		switch stage.Type {
 		case workflow.StageTypeIdeaRefinement:
 			starts = append(starts, row)
@@ -397,15 +413,15 @@ func workflowTemplateStageRows(template workflow.Template) []web.WorkflowTemplat
 		} else if existingTypes[stage.Type] {
 			continue
 		}
-		rows = append(rows, workflowTemplateStageRow(stage, optionalOrder, false, false))
+		rows = append(rows, workflowTemplateStageRow(stage, registry, optionalOrder, false, false))
 		optionalOrder++
 	}
 	rows = append(rows, stops...)
 	return rows
 }
 
-func workflowTemplateStageRow(stage workflow.StageTemplate, order int, enabled bool, existing bool) web.WorkflowTemplateStageRowData {
-	stage = workflow.NormalizeTemplate(workflow.Template{Stages: []workflow.StageTemplate{stage}}).Stages[0]
+func workflowTemplateStageRow(stage workflow.StageTemplate, registry agentregistry.Registry, order int, enabled bool, existing bool) web.WorkflowTemplateStageRowData {
+	stage = workflow.NormalizeTemplateWithRegistry(workflow.Template{Stages: []workflow.StageTemplate{stage}}, registry).Stages[0]
 	mandatory := workflowStageAlwaysEnabled(stage.Type)
 	return web.WorkflowTemplateStageRowData{
 		ID:              stage.ID,
@@ -512,11 +528,14 @@ func reviewStageKey(stage workflow.StageTemplate) string {
 
 func workflowTemplateSettingsData(settings map[string]any) web.WorkflowTemplateSettingsData {
 	return web.WorkflowTemplateSettingsData{
-		BranchPolicy: settingString(settings, "branch_policy"),
-		PRBehavior:   settingString(settings, "pr_behavior"),
-		MergePolicy:  settingString(settings, "merge_policy"),
-		FixLoop:      settingBool(settings, "fix_loop"),
-		MaxFixLoops:  settingInt(settings, "max_fix_loops"),
+		BranchPolicy:     settingString(settings, "branch_policy"),
+		PRBehavior:       settingString(settings, "pr_behavior"),
+		MergePolicy:      settingString(settings, "merge_policy"),
+		RequiredChecks:   strings.Join(settingStringList(settings, "required_checks"), ", "),
+		ForgeCredential:  firstSettingString(settings, "forge_credential", "forge_credential_id", "credential_ref"),
+		MergeWaitTimeout: settingString(settings, "merge_wait_timeout"),
+		FixLoop:          settingBool(settings, "fix_loop"),
+		MaxFixLoops:      settingInt(settings, "max_fix_loops"),
 	}
 }
 
@@ -546,6 +565,50 @@ func settingString(settings map[string]any, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func firstSettingString(settings map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := settingString(settings, key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func settingStringList(settings map[string]any, key string) []string {
+	if settings == nil {
+		return nil
+	}
+	value, ok := settings[key]
+	if !ok || value == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	add := func(raw string) {
+		for _, part := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ';' || r == '\n' || r == '\r' }) {
+			part = strings.TrimSpace(part)
+			if part == "" || seen[part] {
+				continue
+			}
+			seen[part] = true
+			out = append(out, part)
+		}
+	}
+	switch v := value.(type) {
+	case []string:
+		for _, item := range v {
+			add(item)
+		}
+	case []any:
+		for _, item := range v {
+			add(fmt.Sprint(item))
+		}
+	default:
+		add(fmt.Sprint(v))
+	}
+	return out
 }
 
 func settingBool(settings map[string]any, key string) bool {

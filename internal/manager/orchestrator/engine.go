@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/agent-parley/parley/internal/manager/contextpack"
+	"github.com/agent-parley/parley/internal/manager/secrets"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/runner/worktree"
@@ -106,6 +107,8 @@ type Engine struct {
 	gitAuthorName         string
 	gitAuthorEmail        string
 	gitExecutable         string
+	secrets               *secrets.Service
+	forgeDeliveryClient   ForgeDeliveryClient
 	contextAssembler      *contextpack.Assembler
 }
 
@@ -119,6 +122,8 @@ type EngineOptions struct {
 	GitAuthorName         string
 	GitAuthorEmail        string
 	GitExecutable         string
+	Secrets               *secrets.Service
+	ForgeDeliveryClient   ForgeDeliveryClient
 	QueuePolicy           *QueuePolicy
 	RunnerSlots           int
 	ConversationBudget    int
@@ -203,6 +208,10 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 			},
 		})
 	}
+	forgeDeliveryClient := opts.ForgeDeliveryClient
+	if forgeDeliveryClient == nil {
+		forgeDeliveryClient = newCLIForgeDeliveryClient(opts.GitExecutable, st, opts.Secrets)
+	}
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	return &Engine{
 		store:                 st,
@@ -229,6 +238,8 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 		gitAuthorName:         opts.GitAuthorName,
 		gitAuthorEmail:        opts.GitAuthorEmail,
 		gitExecutable:         opts.GitExecutable,
+		secrets:               opts.Secrets,
+		forgeDeliveryClient:   forgeDeliveryClient,
 		contextAssembler:      contextAssembler,
 		rootCtx:               rootCtx,
 		rootCancel:            rootCancel,
@@ -1402,6 +1413,13 @@ func (e *Engine) runPRReadyStage(ctx context.Context, wr store.WorkflowRun, stag
 	branch := payloadString(commitReport.Payload, "branch")
 	commitSHA := payloadString(commitReport.Payload, "commit_sha")
 	diffID := payloadString(commitReport.Payload, "diff_artifact_id")
+	delivery := e.completePRDelivery(ctx, wr, branch, commitSHA, diffID, template)
+	summary := "PR-ready handoff reached"
+	if delivery.Status == report.StatusCompleted && delivery.AutoMergeCompleted {
+		summary = "auto-merged PR delivery"
+	} else if delivery.Status != report.StatusCompleted && delivery.Reason != "" {
+		summary = delivery.Reason
+	}
 	rep := report.Report{
 		SchemaVersion: report.SchemaVersion,
 		RunID:         wr.Run.ID,
@@ -1410,18 +1428,42 @@ func (e *Engine) runPRReadyStage(ctx context.Context, wr store.WorkflowRun, stag
 		StageID:       stage.ID,
 		StageType:     stage.StageType,
 		Actor:         report.Actor{Kind: report.ActorKindHarness, ID: "pr_ready"},
-		Status:        report.StatusCompleted,
-		Summary:       "PR-ready handoff reached",
+		Status:        delivery.Status,
+		Summary:       summary,
 		EvidenceRefs:  []string{diffID},
 		Payload: map[string]any{
-			"branch":           branch,
-			"commit_sha":       commitSHA,
-			"diff_artifact_id": diffID,
-			"push_performed":   false,
-			"pr_created":       false,
-			"pr_behavior":      settingString(template.Settings, "pr_behavior"),
+			"branch":                    branch,
+			"branch_policy":             delivery.BranchPolicy,
+			"commit_sha":                commitSHA,
+			"diff_artifact_id":          diffID,
+			"push_performed":            delivery.PushPerformed,
+			"pr_created":                delivery.PRCreated,
+			"pr_behavior":               delivery.PRBehavior,
+			"merge_policy":              delivery.MergePolicy,
+			"target_branch":             delivery.TargetBranch,
+			"merge_wait_timeout":        delivery.MergeWaitTimeout.String(),
+			"required_checks":           delivery.RequiredChecks,
+			"forge_credential":          delivery.CredentialRef,
+			"auto_merge_attempted":      delivery.AutoMergeAttempted,
+			"auto_merge_completed":      delivery.AutoMergeCompleted,
+			"auto_merge_skipped_reason": delivery.Reason,
 		},
 		Errors: []string{},
+	}
+	if delivery.PRURL != "" {
+		rep.Payload["pr_url"] = delivery.PRURL
+	}
+	if delivery.PRNumber != "" {
+		rep.Payload["pr_number"] = delivery.PRNumber
+	}
+	if delivery.MergeCommitSHA != "" {
+		rep.Payload["merge_commit_sha"] = delivery.MergeCommitSHA
+	}
+	if len(delivery.ChecksPassed) > 0 {
+		rep.Payload["checks_passed"] = delivery.ChecksPassed
+	}
+	if delivery.Status != report.StatusCompleted && delivery.Reason != "" {
+		rep.Errors = []string{delivery.Reason}
 	}
 	if err := e.completeStage(context.Background(), wr, stage, rep); err != nil {
 		return report.Report{}, err
@@ -1483,7 +1525,7 @@ func (e *Engine) runStopReport(ctx context.Context, wr store.WorkflowRun, stage 
 		},
 		Errors: errors,
 	}
-	copyPayloadStrings(rep.Payload, previous.Payload, "branch", "commit_sha", "diff_artifact_id")
+	copyPayloadStrings(rep.Payload, previous.Payload, "branch", "commit_sha", "diff_artifact_id", "pr_url", "merge_commit_sha")
 	if err := e.completeStage(context.Background(), wr, stage, rep); err != nil {
 		return report.Report{}, err
 	}
@@ -1641,7 +1683,7 @@ func (e *Engine) completeStage(ctx context.Context, wr store.WorkflowRun, stage 
 	if stage.TaskPlanArtifactID != "" {
 		data["task_plan_artifact_id"] = stage.TaskPlanArtifactID
 	}
-	copyPayloadStrings(data, rep.Payload, "branch", "branch_policy", "commit_sha", "diff_artifact_id", "task_contract_artifact_id", "task_plan_artifact_id")
+	copyPayloadStrings(data, rep.Payload, "branch", "branch_policy", "commit_sha", "diff_artifact_id", "pr_url", "merge_commit_sha", "task_contract_artifact_id", "task_plan_artifact_id")
 	if typ := completionEventType(rep); typ != "" {
 		if _, err := e.emit(ctx, stageEvent(wr, stage, typ, reportActor(rep.Actor, stage), rep.Summary, data)); err != nil {
 			return err
@@ -1680,6 +1722,8 @@ func (e *Engine) finishRunFromStopReport(ctx context.Context, wr store.WorkflowR
 		"branch":           payloadString(rep.Payload, "branch"),
 		"commit_sha":       payloadString(rep.Payload, "commit_sha"),
 		"diff_artifact_id": payloadString(rep.Payload, "diff_artifact_id"),
+		"pr_url":           payloadString(rep.Payload, "pr_url"),
+		"merge_commit_sha": payloadString(rep.Payload, "merge_commit_sha"),
 	}))
 	if err != nil {
 		return err
@@ -2156,7 +2200,7 @@ func withDeliveryPayload(rep report.Report, delivery report.Report) report.Repor
 	if rep.Payload == nil {
 		rep.Payload = map[string]any{}
 	}
-	copyPayloadStrings(rep.Payload, delivery.Payload, "branch", "branch_policy", "commit_sha", "diff_artifact_id")
+	copyPayloadStrings(rep.Payload, delivery.Payload, "branch", "branch_policy", "commit_sha", "diff_artifact_id", "pr_url", "merge_commit_sha")
 	return rep
 }
 

@@ -86,6 +86,7 @@ suggested_stage_types = ["implementation"]
 
 [agents.profiles.pi_headless_worker]
 model = "global-default-model"
+default_instructions = "Prefer repository conventions."
 suggested_stage_types = ["implementation", "pr_creation"]
 `)
 	writeFile(t, projectPath, `[agents]
@@ -107,8 +108,8 @@ model = "project-model"
 	if !ok {
 		t.Fatalf("profile %q missing", agentregistry.ProfilePiHeadlessWorker)
 	}
-	if worker.Name != "Project worker" || worker.Model != "project-model" {
-		t.Fatalf("worker profile = %+v, want project overrides", worker)
+	if worker.Name != "Project worker" || worker.Model != "project-model" || worker.DefaultInstructions != "Prefer repository conventions." {
+		t.Fatalf("worker profile = %+v, want project overrides with inherited default instructions", worker)
 	}
 	if strings.Join(worker.SuggestedStageTypes, ",") != "implementation,pr_creation" {
 		t.Fatalf("worker suggested stages = %#v, want inherited global stages", worker.SuggestedStageTypes)

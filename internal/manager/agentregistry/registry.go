@@ -48,6 +48,7 @@ type Profile struct {
 	Role                string   `json:"role"`
 	Headless            bool     `json:"headless"`
 	Prompt              string   `json:"prompt,omitempty"`
+	DefaultInstructions string   `json:"default_instructions,omitempty"`
 	Model               string   `json:"model,omitempty"`
 	ContextPolicy       string   `json:"context_policy"`
 	OutputStyle         string   `json:"output_style"`
@@ -58,28 +59,29 @@ type Profile struct {
 // "inherit the existing global/built-in value"; project overrides are applied
 // after global overrides.
 type Overrides struct {
-	DefaultProfileID *string                    `toml:"default_profile_id"`
-	Families         map[string]FamilyOverride  `toml:"families"`
-	Profiles         map[string]ProfileOverride `toml:"profiles"`
+	DefaultProfileID *string                    `toml:"default_profile_id" json:"default_profile_id,omitempty"`
+	Families         map[string]FamilyOverride  `toml:"families" json:"families,omitempty"`
+	Profiles         map[string]ProfileOverride `toml:"profiles" json:"profiles,omitempty"`
 }
 
 type FamilyOverride struct {
-	Name        *string `toml:"name"`
-	Description *string `toml:"description"`
-	Status      *string `toml:"status"`
+	Name        *string `toml:"name" json:"name,omitempty"`
+	Description *string `toml:"description" json:"description,omitempty"`
+	Status      *string `toml:"status" json:"status,omitempty"`
 }
 
 type ProfileOverride struct {
-	FamilyID            *string  `toml:"family_id"`
-	Name                *string  `toml:"name"`
-	Description         *string  `toml:"description"`
-	Role                *string  `toml:"role"`
-	Headless            *bool    `toml:"headless"`
-	Prompt              *string  `toml:"prompt"`
-	Model               *string  `toml:"model"`
-	ContextPolicy       *string  `toml:"context_policy"`
-	OutputStyle         *string  `toml:"output_style"`
-	SuggestedStageTypes []string `toml:"suggested_stage_types"`
+	FamilyID            *string  `toml:"family_id" json:"family_id,omitempty"`
+	Name                *string  `toml:"name" json:"name,omitempty"`
+	Description         *string  `toml:"description" json:"description,omitempty"`
+	Role                *string  `toml:"role" json:"role,omitempty"`
+	Headless            *bool    `toml:"headless" json:"headless,omitempty"`
+	Prompt              *string  `toml:"prompt" json:"prompt,omitempty"`
+	DefaultInstructions *string  `toml:"default_instructions" json:"default_instructions,omitempty"`
+	Model               *string  `toml:"model" json:"model,omitempty"`
+	ContextPolicy       *string  `toml:"context_policy" json:"context_policy,omitempty"`
+	OutputStyle         *string  `toml:"output_style" json:"output_style,omitempty"`
+	SuggestedStageTypes []string `toml:"suggested_stage_types" json:"suggested_stage_types,omitempty"`
 }
 
 func Defaults() Registry {
@@ -193,6 +195,7 @@ func ApplyOverrides(registry Registry, source string, overrides Overrides) (Regi
 		applyString(&profile.Role, override.Role)
 		applyBool(&profile.Headless, override.Headless)
 		applyString(&profile.Prompt, override.Prompt)
+		applyString(&profile.DefaultInstructions, override.DefaultInstructions)
 		applyString(&profile.Model, override.Model)
 		applyString(&profile.ContextPolicy, override.ContextPolicy)
 		applyString(&profile.OutputStyle, override.OutputStyle)
@@ -253,6 +256,23 @@ func ProfileByID(registry Registry, id string) (Profile, bool) {
 		}
 	}
 	return Profile{}, false
+}
+
+func ProfileOverrideFromProfile(profile Profile) ProfileOverride {
+	profile = normalizeProfile(profile)
+	return ProfileOverride{
+		FamilyID:            profileStringPtr(profile.FamilyID),
+		Name:                profileStringPtr(profile.Name),
+		Description:         profileStringPtr(profile.Description),
+		Role:                profileStringPtr(profile.Role),
+		Headless:            profileBoolPtr(profile.Headless),
+		Prompt:              profileStringPtr(profile.Prompt),
+		DefaultInstructions: profileStringPtr(profile.DefaultInstructions),
+		Model:               profileStringPtr(profile.Model),
+		ContextPolicy:       profileStringPtr(profile.ContextPolicy),
+		OutputStyle:         profileStringPtr(profile.OutputStyle),
+		SuggestedStageTypes: append([]string(nil), profile.SuggestedStageTypes...),
+	}
 }
 
 func DefaultProfileIDForStageType(registry Registry, stageType string) (string, bool) {
@@ -318,6 +338,7 @@ func normalizeProfile(profile Profile) Profile {
 	profile.Description = strings.TrimSpace(profile.Description)
 	profile.Role = normalizeID(profile.Role)
 	profile.Prompt = strings.TrimSpace(profile.Prompt)
+	profile.DefaultInstructions = strings.TrimSpace(profile.DefaultInstructions)
 	profile.Model = strings.TrimSpace(profile.Model)
 	profile.ContextPolicy = strings.TrimSpace(profile.ContextPolicy)
 	profile.OutputStyle = strings.TrimSpace(profile.OutputStyle)
@@ -351,6 +372,10 @@ func applyBool(dst *bool, src *bool) {
 		*dst = *src
 	}
 }
+
+func profileStringPtr(value string) *string { return &value }
+
+func profileBoolPtr(value bool) *bool { return &value }
 
 type familyOverrideEntry struct {
 	id       string

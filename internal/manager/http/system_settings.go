@@ -13,7 +13,10 @@ import (
 	"github.com/agent-parley/parley/internal/shared/ids"
 )
 
-const externalSinkSecretUnavailable = "Set PARLEY_SECRETS_KEK or restore the configured secrets key to enable external notification sinks. In-app notifications still work."
+const (
+	externalSinkSecretUnavailable    = "Set PARLEY_SECRETS_KEK or restore the configured secrets key to enable external notification sinks. In-app notifications still work."
+	forgeCredentialSecretUnavailable = "Set PARLEY_SECRETS_KEK or restore the configured secrets key to enable forge credentials. Auto-merge will stay disabled until credentials can be opened."
+)
 
 func (s *Server) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/settings" {
@@ -35,7 +38,23 @@ func (s *Server) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSystemSettingsPath(w http.ResponseWriter, r *http.Request) {
 	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/settings/"), "/")
 	parts := strings.Split(path, "/")
-	if len(parts) == 0 || parts[0] != "notification-sinks" {
+	if len(parts) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	if parts[0] == "forge-credentials" {
+		s.handleForgeCredentialPath(w, r, parts)
+		return
+	}
+	if parts[0] == "agent-profiles" {
+		if len(parts) == 1 {
+			s.handleGlobalAgentProfileSave(w, r)
+			return
+		}
+		http.NotFound(w, r)
+		return
+	}
+	if parts[0] != "notification-sinks" {
 		http.NotFound(w, r)
 		return
 	}
@@ -62,6 +81,58 @@ func (s *Server) handleSystemSettingsPath(w http.ResponseWriter, r *http.Request
 		return
 	}
 	http.NotFound(w, r)
+}
+
+func (s *Server) handleForgeCredentialPath(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) == 1 {
+		s.handleCreateForgeCredential(w, r)
+		return
+	}
+	if len(parts) == 3 && parts[1] != "" && parts[2] == "delete" {
+		s.handleDeleteForgeCredential(w, r, parts[1])
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func (s *Server) handleCreateForgeCredential(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.secretsAvailable() {
+		s.writeForgeCredentialsFragment(w, r, http.StatusBadRequest, forgeCredentialSecretUnavailable, "")
+		return
+	}
+	token := strings.TrimSpace(r.Form.Get("token"))
+	if token == "" {
+		s.writeForgeCredentialsFragment(w, r, http.StatusBadRequest, "Forge token is required.", "")
+		return
+	}
+	credentialID := ids.New("fcr")
+	ciphertext, err := s.sealForgeCredentialSecret(r, credentialID, []byte(token))
+	if err != nil {
+		s.writeForgeCredentialsFragment(w, r, http.StatusInternalServerError, "Could not seal forge token.", "")
+		return
+	}
+	credential, err := s.store.InsertForgeCredential(r.Context(), store.ForgeCredentialInput{ID: credentialID, Host: r.Form.Get("host"), SecretCiphertext: ciphertext})
+	if err != nil {
+		s.writeForgeCredentialsFragment(w, r, http.StatusBadRequest, err.Error(), "")
+		return
+	}
+	s.writeForgeCredentialsFragment(w, r, http.StatusAccepted, "Forge credential stored. Use `"+credential.ID+"` in workflow template merge settings.", "")
+}
+
+func (s *Server) handleDeleteForgeCredential(w http.ResponseWriter, r *http.Request, credentialID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.store.DeleteForgeCredential(r.Context(), credentialID); err != nil {
+		s.writeForgeCredentialsFragment(w, r, http.StatusBadRequest, err.Error(), "")
+		return
+	}
+	s.writeForgeCredentialsFragment(w, r, http.StatusAccepted, "Forge credential deleted.", "")
 }
 
 func (s *Server) handleCreateGotifyNotificationSink(w http.ResponseWriter, r *http.Request) {
@@ -292,11 +363,19 @@ func (s *Server) systemSettingsData(r *http.Request, notice, status, oneTimeSecr
 	if err != nil {
 		return web.SystemSettingsData{}, err
 	}
+	forgeCredentials, err := s.forgeCredentialsData(r, "", "")
+	if err != nil {
+		return web.SystemSettingsData{}, err
+	}
+	agentProfiles, err := s.globalAgentProfileEditorData(r, "", "")
+	if err != nil {
+		return web.SystemSettingsData{}, err
+	}
 	center, err := s.notificationCenterData(r.Context(), csrf)
 	if err != nil {
 		return web.SystemSettingsData{}, err
 	}
-	return web.SystemSettingsData{Sinks: sinks, Center: center, CSRF: csrf, Title: "Parley · System Settings"}, nil
+	return web.SystemSettingsData{Sinks: sinks, ForgeCredentials: forgeCredentials, AgentProfiles: agentProfiles, Center: center, CSRF: csrf, Title: "Parley · System Settings"}, nil
 }
 
 func (s *Server) externalNotificationSinksData(r *http.Request, notice, status, oneTimeSecret string) (web.ExternalNotificationSinksData, error) {
@@ -323,6 +402,37 @@ func (s *Server) externalNotificationSinksData(r *http.Request, notice, status, 
 		CreateGotifyPath:     "/settings/notification-sinks/gotify",
 		CreateWebhookPath:    "/settings/notification-sinks/webhook",
 		CSRF:                 csrfFromContext(r.Context()),
+	}, nil
+}
+
+func (s *Server) forgeCredentialsData(r *http.Request, notice, status string) (web.ForgeCredentialsData, error) {
+	credentials, err := s.store.ListForgeCredentials(r.Context())
+	if err != nil {
+		return web.ForgeCredentialsData{}, err
+	}
+	views := make([]web.ForgeCredentialData, 0, len(credentials))
+	for _, credential := range credentials {
+		views = append(views, web.ForgeCredentialData{
+			ID:               credential.ID,
+			Host:             credential.Host,
+			SecretConfigured: len(credential.SecretCiphertext) > 0,
+			DeletePath:       "/settings/forge-credentials/" + credential.ID + "/delete",
+			UpdatedAt:        credential.UpdatedAt,
+		})
+	}
+	secretsAvailable := s.secretsAvailable()
+	message := ""
+	if !secretsAvailable {
+		message = forgeCredentialSecretUnavailable
+	}
+	return web.ForgeCredentialsData{
+		Credentials:      views,
+		SecretsAvailable: secretsAvailable,
+		SecretsMessage:   message,
+		Notice:           notice,
+		Status:           status,
+		CreatePath:       "/settings/forge-credentials",
+		CSRF:             csrfFromContext(r.Context()),
 	}, nil
 }
 
@@ -356,6 +466,11 @@ func (s *Server) sealNotificationSinkSecret(r *http.Request, sinkID string, plai
 	return s.secrets.Seal(r.Context(), plaintext, secrets.AssociatedData{Table: table, Column: column, RowID: rowID})
 }
 
+func (s *Server) sealForgeCredentialSecret(r *http.Request, credentialID string, plaintext []byte) ([]byte, error) {
+	table, column, rowID := store.ForgeCredentialSecretAD(credentialID)
+	return s.secrets.Seal(r.Context(), plaintext, secrets.AssociatedData{Table: table, Column: column, RowID: rowID})
+}
+
 func (s *Server) secretsAvailable() bool {
 	return s.secrets != nil && s.secrets.Available()
 }
@@ -367,6 +482,23 @@ func (s *Server) writeExternalSinksFragment(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	fragment, err := s.renderer.ExecutePage("external_notification_sinks.html", data)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(fragment)))
+	w.WriteHeader(statusCode)
+	_, _ = w.Write([]byte(fragment))
+}
+
+func (s *Server) writeForgeCredentialsFragment(w http.ResponseWriter, r *http.Request, statusCode int, notice, status string) {
+	data, err := s.forgeCredentialsData(r, notice, status)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	fragment, err := s.renderer.ExecutePage("forge_credentials.html", data)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

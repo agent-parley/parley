@@ -84,6 +84,20 @@ func TestPredefinedTemplatesHumanGateFloorClassification(t *testing.T) {
 	}
 }
 
+func TestAutoMergePolicyDoesNotMeetHumanGateFloor(t *testing.T) {
+	template := balancedPRDelivery()
+	template.Settings["merge_policy"] = "auto_merge"
+	if MeetsHumanGateFloor(template) {
+		t.Fatal("auto_merge policy should not satisfy the human-gate floor, even on a template with human review")
+	}
+	if !MergePolicyAllowsAutoMerge("merge_when_green") || !MergePolicyAllowsAutoMerge("auto") {
+		t.Fatal("expected supported auto-merge aliases to be recognized")
+	}
+	if MergePolicyRequiresHumanGate("auto_merge") {
+		t.Fatal("auto_merge policy must not be classified as human-gated")
+	}
+}
+
 func TestQuickFixDeliveryIsSlimPRGatedAndOptIn(t *testing.T) {
 	template := quickFixDelivery()
 	if err := ValidateTemplate(template); err != nil {

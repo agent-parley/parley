@@ -356,6 +356,82 @@ func TestWorkflowTemplateAuthoringCopyEditSaveReloadAndRejectsMalformed(t *testi
 	assertContains(t, badRec.Body.String(), "exactly one idea_refinement")
 }
 
+func TestAgentProfileEditorPersistsOverridesAndFeedsTemplateDropdown(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	cookie, csrf := getCSRFToken(t, srv)
+
+	body := getSettingsBody(t, srv, "/settings")
+	assertContains(t, body, "Global agent profiles")
+	assertContains(t, body, "Pi headless worker")
+
+	globalRec := postForm(t, srv, "/settings/agent-profiles", cookie, agentProfileForm(csrf, "global_builder", "Global builder", "implementation", "global-model", "global persona", "global instructions", "implementation"))
+	if globalRec.Code != http.StatusAccepted {
+		t.Fatalf("POST global agent profile status = %d want %d body=%s", globalRec.Code, http.StatusAccepted, globalRec.Body.String())
+	}
+	assertContains(t, globalRec.Body.String(), "Global builder")
+	globalRegistry, err := st.ResolveGlobalAgentRegistry(ctx)
+	if err != nil {
+		t.Fatalf("resolve global registry: %v", err)
+	}
+	globalProfile, ok := agentregistry.ProfileByID(globalRegistry, "global_builder")
+	if !ok || globalProfile.Model != "global-model" || globalProfile.Prompt != "global persona" || globalProfile.DefaultInstructions != "global instructions" {
+		t.Fatalf("global profile = %+v/%v, want persisted fields", globalProfile, ok)
+	}
+
+	copied, err := st.CopyWorkflowTemplate(ctx, workflow.BalancedPRDeliveryID, "profile_dropdown_template", "Profile Dropdown Template")
+	if err != nil {
+		t.Fatalf("copy workflow template: %v", err)
+	}
+	editBody := getSettingsBody(t, srv, "/templates/"+copied.ID+"/edit")
+	assertContains(t, editBody, "Global builder")
+
+	projectRec := postForm(t, srv, "/projects/default/settings/agent-profiles", cookie, agentProfileForm(csrf, "global_builder", "Project builder", "implementation", "project-model", "project persona", "project instructions", "implementation"))
+	if projectRec.Code != http.StatusAccepted {
+		t.Fatalf("POST project agent profile status = %d want %d body=%s", projectRec.Code, http.StatusAccepted, projectRec.Body.String())
+	}
+	assertContains(t, projectRec.Body.String(), "Project builder")
+	projectRegistry, err := st.ResolveAgentRegistry(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("resolve project registry: %v", err)
+	}
+	projectProfile, ok := agentregistry.ProfileByID(projectRegistry, "global_builder")
+	if !ok || projectProfile.Model != "project-model" || projectProfile.Prompt != "project persona" || projectProfile.DefaultInstructions != "project instructions" {
+		t.Fatalf("project profile = %+v/%v, want project override fields", projectProfile, ok)
+	}
+
+	projectOnlyRec := postForm(t, srv, "/projects/default/settings/agent-profiles", cookie, agentProfileForm(csrf, "project_validator", "Project validator", "validation-support", "validator-model", "validator persona", "validator instructions", "implementation, validation"))
+	if projectOnlyRec.Code != http.StatusAccepted {
+		t.Fatalf("POST project-only agent profile status = %d want %d body=%s", projectOnlyRec.Code, http.StatusAccepted, projectOnlyRec.Body.String())
+	}
+	projectRegistry, err = st.ResolveAgentRegistry(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("resolve project registry after create: %v", err)
+	}
+	if _, ok := agentregistry.ProfileByID(projectRegistry, "project_validator"); !ok {
+		t.Fatalf("project_validator missing from resolved project registry: %+v", projectRegistry.Profiles)
+	}
+	editBody = getSettingsBody(t, srv, "/templates/"+copied.ID+"/edit")
+	assertContains(t, editBody, "Project builder")
+	assertContains(t, editBody, "Project validator")
+
+	saveForm := workflowTemplateSaveForm(copied, csrf)
+	saveForm.Set("profile_id_implementation", "project_validator")
+	saveRec := postForm(t, srv, "/templates/"+copied.ID+"/save", cookie, saveForm)
+	if saveRec.Code != http.StatusSeeOther {
+		t.Fatalf("POST template save with project profile status = %d want %d body=%s", saveRec.Code, http.StatusSeeOther, saveRec.Body.String())
+	}
+	saved, err := st.GetWorkflowTemplate(ctx, copied.ID)
+	if err != nil {
+		t.Fatalf("get saved template: %v", err)
+	}
+	implementation := saved.Stages[workflowTemplateStageIndex(saved, "implementation")]
+	if implementation.ProfileID != "project_validator" {
+		t.Fatalf("implementation profile_id = %q, want project_validator", implementation.ProfileID)
+	}
+}
+
 func TestSystemSettingsExternalSinkCreationSealsSecretAndShowsWebhookSecretOnce(t *testing.T) {
 	ctx := context.Background()
 	st := openRouteTestStore(t)
@@ -399,6 +475,46 @@ func TestSystemSettingsExternalSinkCreationSealsSecretAndShowsWebhookSecretOnce(
 	body = getSettingsBody(t, srv, "/settings")
 	assertContains(t, body, "Secret: configured")
 	assertNotContains(t, body, secret[1])
+}
+
+func TestSystemSettingsForgeCredentialCreationSealsToken(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	svc, err := secrets.New(ctx, st, secrets.Config{})
+	if err != nil {
+		t.Fatalf("new secrets: %v", err)
+	}
+	srv := newRouteTestServerWithSecrets(t, st, &fakeRunController{state: defaultRouteQueueState()}, svc)
+	body := getSettingsBody(t, srv, "/settings")
+	assertContains(t, body, "Forge credentials")
+	cookie, csrf := getCSRFToken(t, srv)
+
+	rec := postForm(t, srv, "/settings/forge-credentials", cookie, url.Values{
+		"host":  {"github.com"},
+		"token": {"gh-secret-token"},
+		"_csrf": {csrf},
+	})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST forge credential status = %d want %d body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	body = rec.Body.String()
+	assertContains(t, body, "Forge credential stored")
+	assertNotContains(t, body, "gh-secret-token")
+	credentials, err := st.ListForgeCredentials(ctx)
+	if err != nil {
+		t.Fatalf("list forge credentials: %v", err)
+	}
+	if len(credentials) != 1 || credentials[0].Host != "github.com" {
+		t.Fatalf("credentials = %+v, want one github.com credential", credentials)
+	}
+	if strings.Contains(string(credentials[0].SecretCiphertext), "gh-secret-token") {
+		t.Fatal("stored forge credential contains plaintext")
+	}
+	table, column, rowID := store.ForgeCredentialSecretAD(credentials[0].ID)
+	plaintext, err := svc.Open(ctx, credentials[0].SecretCiphertext, secrets.AssociatedData{Table: table, Column: column, RowID: rowID})
+	if err != nil || string(plaintext) != "gh-secret-token" {
+		t.Fatalf("opened forge credential = %q, err=%v", plaintext, err)
+	}
 }
 
 func TestSystemSettingsExternalSinkCreationRefusedWhenSecretsUnavailable(t *testing.T) {
@@ -1629,6 +1745,23 @@ func assertBefore(t *testing.T, body, first, second string) {
 	}
 }
 
+func agentProfileForm(csrf, id, name, role, model, prompt, defaultInstructions, suggestedStages string) url.Values {
+	return url.Values{
+		"_csrf":                 {csrf},
+		"profile_id":            {id},
+		"family_id":             {agentregistry.FamilyPi},
+		"name":                  {name},
+		"role":                  {role},
+		"headless":              {"1"},
+		"model":                 {model},
+		"context_policy":        {"task_contract_only"},
+		"output_style":          {"structured_report"},
+		"prompt":                {prompt},
+		"default_instructions":  {defaultInstructions},
+		"suggested_stage_types": {suggestedStages},
+	}
+}
+
 func workflowTemplateSaveForm(template workflow.Template, csrf string) url.Values {
 	settings := workflowTemplateSettingsData(template.Settings)
 	form := url.Values{}
@@ -1638,6 +1771,9 @@ func workflowTemplateSaveForm(template workflow.Template, csrf string) url.Value
 	form.Set("branch_policy", settings.BranchPolicy)
 	form.Set("pr_behavior", settings.PRBehavior)
 	form.Set("merge_policy", settings.MergePolicy)
+	form.Set("required_checks", settings.RequiredChecks)
+	form.Set("forge_credential", settings.ForgeCredential)
+	form.Set("merge_wait_timeout", settings.MergeWaitTimeout)
 	if settings.FixLoop {
 		form.Set("fix_loop", "1")
 	}
