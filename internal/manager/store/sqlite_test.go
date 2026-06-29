@@ -778,6 +778,106 @@ func TestProjectMemoryIsSQLiteOnlyAndCuratorGated(t *testing.T) {
 	}
 }
 
+func TestRollbackProjectMemoryUpdateRestoresPreviousEntriesAndDecisions(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "learn from a run", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sourceReport := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		StageID:       wr.ImplementationStage.ID,
+		StageType:     wr.ImplementationStage.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: "noop"},
+		Status:        report.StatusCompleted,
+		Summary:       "implementation found reusable memory",
+		Payload:       map[string]any{},
+		Errors:        []string{},
+	}
+	sourceArtifact, err := st.SaveReportArtifact(ctx, sourceReport)
+	if err != nil {
+		t.Fatalf("save source report: %v", err)
+	}
+	oldBody := "Validation containers need git before worktree snapshots can be inspected."
+	initial, err := st.ApplyProjectMemoryUpdate(ctx, ProjectMemoryUpdate{
+		ProjectID:      wr.Run.ProjectID,
+		RunID:          wr.Run.ID,
+		TaskID:         wr.Task.ID,
+		CuratorStageID: wr.MemoryUpdateStage.ID,
+		Entries: []ProjectMemoryInput{{
+			CandidateID:      "candidate-1",
+			Kind:             ProjectMemoryKindGotcha,
+			Title:            "Validation image needs git",
+			Body:             oldBody,
+			SourceStageID:    wr.ImplementationStage.ID,
+			SourceArtifactID: sourceArtifact.ID,
+			SourceSummary:    "old source",
+		}},
+		Decisions: []ProjectMemoryDecisionInput{{
+			CandidateID:      "candidate-1",
+			Action:           ProjectMemoryDecisionApprove,
+			Kind:             ProjectMemoryKindGotcha,
+			Title:            "Validation image needs git",
+			Body:             oldBody,
+			SourceStageID:    wr.ImplementationStage.ID,
+			SourceArtifactID: sourceArtifact.ID,
+			SourceSummary:    "old source",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("seed memory update: %v", err)
+	}
+	if len(initial.Entries) != 1 || len(initial.Decisions) != 1 {
+		t.Fatalf("initial memory result = %#v", initial)
+	}
+	newBody := "Validation containers need git and ssh before snapshots can be inspected."
+	update, err := st.ApplyProjectMemoryUpdate(ctx, ProjectMemoryUpdate{
+		ProjectID:      wr.Run.ProjectID,
+		RunID:          wr.Run.ID,
+		TaskID:         wr.Task.ID,
+		CuratorStageID: wr.MemoryUpdateStage.ID,
+		Entries: []ProjectMemoryInput{
+			{CandidateID: "candidate-1", Kind: ProjectMemoryKindGotcha, Title: "Validation image needs git", Body: newBody, SourceStageID: wr.ImplementationStage.ID, SourceArtifactID: sourceArtifact.ID, SourceSummary: "new source"},
+			{CandidateID: "candidate-2", Kind: ProjectMemoryKindLesson, Title: "New temporary lesson", Body: "This write should be undone if resume fails.", SourceStageID: wr.ImplementationStage.ID, SourceArtifactID: sourceArtifact.ID, SourceSummary: "new source"},
+		},
+		Decisions: []ProjectMemoryDecisionInput{
+			{CandidateID: "candidate-1", Action: ProjectMemoryDecisionEdit, Kind: ProjectMemoryKindGotcha, Title: "Validation image needs git", Body: newBody, SourceStageID: wr.ImplementationStage.ID, SourceArtifactID: sourceArtifact.ID, SourceSummary: "new source"},
+			{CandidateID: "candidate-2", Action: ProjectMemoryDecisionApprove, Kind: ProjectMemoryKindLesson, Title: "New temporary lesson", Body: "This write should be undone if resume fails.", SourceStageID: wr.ImplementationStage.ID, SourceArtifactID: sourceArtifact.ID, SourceSummary: "new source"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("apply replacement memory update: %v", err)
+	}
+	if len(update.Revert.Entries) != 2 || len(update.Revert.Decisions) != 2 {
+		t.Fatalf("rollback token entries=%d decisions=%d: %#v", len(update.Revert.Entries), len(update.Revert.Decisions), update.Revert)
+	}
+	if err := st.RollbackProjectMemoryUpdate(ctx, update.Revert); err != nil {
+		t.Fatalf("rollback memory update: %v", err)
+	}
+	entries, err := st.ListProjectMemoryEntries(ctx, wr.Run.ProjectID)
+	if err != nil {
+		t.Fatalf("list memory entries: %v", err)
+	}
+	if len(entries) != 1 || entries[0].ID != initial.Entries[0].ID || entries[0].Body != oldBody || entries[0].SourceSummary != "old source" {
+		t.Fatalf("entries after rollback = %#v, want original entry", entries)
+	}
+	decisions, err := st.ListProjectMemoryDecisions(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("list memory decisions: %v", err)
+	}
+	if len(decisions) != 1 || decisions[0].ID != initial.Decisions[0].ID || decisions[0].CandidateID != "candidate-1" || decisions[0].Action != ProjectMemoryDecisionApprove || decisions[0].Body != oldBody {
+		t.Fatalf("decisions after rollback = %#v, want original decision", decisions)
+	}
+}
+
 func TestProjectMemoryExportSelectedEntriesWritesSanitizedFiles(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

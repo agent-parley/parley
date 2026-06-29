@@ -57,6 +57,46 @@
 
     {{with .PendingHumanReview}}
     <section class="review-section verdict-panel">
+      {{if .MemoryApproval}}
+      <h2>Memory approval</h2>
+      <p class="muted">This run is awaiting human approval for project-memory candidates. The human decision is authoritative; the curator applies approved edits through memory guardrails.</p>
+      {{if .PacketArtifactID}}<p class="artifact-meta">Memory approval packet <code>{{.PacketArtifactID}}</code></p>{{end}}
+      {{if .MemoryInboxSummary}}<p class="artifact-meta">{{.MemoryInboxSummary}}</p>{{end}}
+      <form method="post" action="/projects/{{$.Project.ID}}/runs/{{$.Run.ID}}/human-stages/{{.StageID}}/verdict" data-on:submit="@post('/projects/{{$.Project.ID}}/runs/{{$.Run.ID}}/human-stages/{{.StageID}}/verdict', {contentType: 'form'})">
+        <input type="hidden" name="_csrf" value="{{$.CSRF}}" data-bind:csrf>
+        <label for="human-memory-summary">Summary</label>
+        <textarea id="human-memory-summary" name="summary" required rows="3" placeholder="Summarize the memory decision."></textarea>
+        {{if .MemoryCandidates}}
+        {{range .MemoryCandidates}}
+        <fieldset class="verdict-options">
+          <legend>{{.Title}}</legend>
+          <input type="hidden" name="memory_candidate_id" value="{{.CandidateID}}">
+          <label>Action
+            <select name="memory_action" required>
+              <option value="" selected disabled>Choose…</option>
+              <option value="approve">Approve</option>
+              <option value="edit">Edit</option>
+              <option value="reject">Reject</option>
+              <option value="defer">Defer</option>
+            </select>
+          </label>
+          <label>Kind <input name="memory_kind" value="{{.Kind}}"></label>
+          <label>Title <input name="memory_title" value="{{.Title}}"></label>
+          <label>Body</label>
+          <textarea name="memory_body" rows="5">{{.Body}}</textarea>
+          <label>Source summary</label>
+          <textarea name="memory_source_summary" rows="2">{{.SourceSummary}}</textarea>
+          <label>Reject/defer reason</label>
+          <textarea name="memory_reason" rows="2" placeholder="Optional reason for reject/defer."></textarea>
+          {{if .SourceArtifactID}}<p class="artifact-meta">Source artifact <code>{{.SourceArtifactID}}</code></p>{{end}}
+        </fieldset>
+        {{end}}
+        {{else}}
+        <p class="empty-state">No memory candidates are waiting for approval.</p>
+        {{end}}
+        <button type="submit">Submit memory decisions</button>
+      </form>
+      {{else}}
       <h2>Human verdict</h2>
       <p class="muted">This run is awaiting a human review verdict. The human is the arbiter.</p>
       {{if .PacketArtifactID}}<p class="artifact-meta">Review packet <code>{{.PacketArtifactID}}</code></p>{{end}}
@@ -78,6 +118,7 @@
         <textarea id="human-review-finding-3" name="finding" rows="3" placeholder="Optional accepted finding."></textarea>
         <button type="submit">Submit verdict</button>
       </form>
+      {{end}}
     </section>
     {{end}}
   </aside>

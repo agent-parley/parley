@@ -20,17 +20,28 @@ var (
 )
 
 type HumanReviewSubmission struct {
-	ActorID      string         `json:"actor_id"`
-	Verdict      string         `json:"verdict"`
-	Summary      string         `json:"summary"`
-	Findings     []HumanFinding `json:"findings,omitempty"`
-	EvidenceRefs []string       `json:"evidence_refs,omitempty"`
+	ActorID         string                `json:"actor_id"`
+	Verdict         string                `json:"verdict"`
+	Summary         string                `json:"summary"`
+	Findings        []HumanFinding        `json:"findings,omitempty"`
+	EvidenceRefs    []string              `json:"evidence_refs,omitempty"`
+	MemoryDecisions []HumanMemoryDecision `json:"memory_decisions,omitempty"`
 }
 
 type HumanFinding struct {
 	ID        string `json:"id,omitempty"`
 	Summary   string `json:"summary"`
 	Rationale string `json:"rationale,omitempty"`
+}
+
+type HumanMemoryDecision struct {
+	CandidateID   string `json:"candidate_id"`
+	Action        string `json:"action"`
+	Kind          string `json:"kind,omitempty"`
+	Title         string `json:"title,omitempty"`
+	Body          string `json:"body,omitempty"`
+	SourceSummary string `json:"source_summary,omitempty"`
+	Reason        string `json:"reason,omitempty"`
 }
 
 func (e *Engine) SubmitHumanReview(ctx context.Context, runID, stageID string, submission HumanReviewSubmission) (report.Report, error) {
@@ -46,9 +57,20 @@ func (e *Engine) SubmitHumanReview(ctx context.Context, runID, stageID string, s
 		return report.Report{}, err
 	}
 	runtimeStage, ok := runtimeStageByStageID(runtime, stageID)
-	if !ok || runtimeStage.Stage.Status != store.StageStatusRunning || runtimeStage.Template.Actor != workflow.ActorHuman || runtimeStage.Template.Type != workflow.StageTypeReview {
+	if !ok || runtimeStage.Stage.Status != store.StageStatusRunning || runtimeStage.Template.Actor != workflow.ActorHuman {
 		return report.Report{}, ErrHumanReviewNotAwaiting
 	}
+	switch runtimeStage.Template.Type {
+	case workflow.StageTypeReview:
+		return e.submitHumanReviewVerdict(ctx, wr, runtimeStage, submission)
+	case workflow.StageTypeMemoryUpdate:
+		return e.submitHumanMemoryApproval(ctx, wr, runtimeStage, submission)
+	default:
+		return report.Report{}, ErrHumanReviewNotAwaiting
+	}
+}
+
+func (e *Engine) submitHumanReviewVerdict(ctx context.Context, wr store.WorkflowRun, runtimeStage runtimeStage, submission HumanReviewSubmission) (report.Report, error) {
 	rep, err := humanReviewReport(wr, runtimeStage.Stage, runtimeStage.Template, submission)
 	if err != nil {
 		return report.Report{}, err
@@ -90,13 +112,17 @@ func (e *Engine) SubmitHumanReview(ctx context.Context, runID, stageID string, s
 		rollbackResume()
 		return report.Report{}, err
 	}
-	runCtx, cancel := context.WithCancel(e.rootCtx)
-	e.registerActiveRun(wr.Run.ID, cancel)
-	if !e.spawn(func() { e.executeRunAfter(runCtx, wr.Run.ID, runtimeStage.Template.ID) }) {
-		cancel()
-		e.unregisterActiveRun(wr.Run.ID)
-	}
+	e.resumeRunAfterHumanStage(wr.Run.ID, runtimeStage.Template.ID)
 	return rep, nil
+}
+
+func (e *Engine) resumeRunAfterHumanStage(runID, workflowStageID string) {
+	runCtx, cancel := context.WithCancel(e.rootCtx)
+	e.registerActiveRun(runID, cancel)
+	if !e.spawn(func() { e.executeRunAfter(runCtx, runID, workflowStageID) }) {
+		cancel()
+		e.unregisterActiveRun(runID)
+	}
 }
 
 func humanReviewReport(wr store.WorkflowRun, stage store.Stage, templateStage workflow.StageTemplate, submission HumanReviewSubmission) (report.Report, error) {

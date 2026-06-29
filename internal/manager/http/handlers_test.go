@@ -1250,6 +1250,58 @@ func TestHandleHumanReviewVerdictReturnsHTMLFragment(t *testing.T) {
 	assertNotContains(t, body, "\"run_id\"")
 }
 
+func TestHandleHumanReviewVerdictParsesMemoryApprovalDecisions(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "Approve memory", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stage := wr.MemoryUpdateStage
+	controller := &fakeRunController{state: defaultRouteQueueState()}
+	controller.humanReviewFunc = func(_ context.Context, runID, stageID string, submission orchestrator.HumanReviewSubmission) (report.Report, error) {
+		if runID != wr.Run.ID || stageID != stage.ID {
+			t.Fatalf("SubmitHumanReview run=%s stage=%s", runID, stageID)
+		}
+		if submission.Summary != "Approve memory decisions" {
+			t.Fatalf("summary = %q", submission.Summary)
+		}
+		if len(submission.MemoryDecisions) != 2 {
+			t.Fatalf("memory decisions = %#v", submission.MemoryDecisions)
+		}
+		if submission.MemoryDecisions[0].CandidateID != "candidate-1" || submission.MemoryDecisions[0].Action != "edit" || submission.MemoryDecisions[0].Title != "Edited title" || submission.MemoryDecisions[0].Body != "Edited body" {
+			t.Fatalf("first memory decision = %#v", submission.MemoryDecisions[0])
+		}
+		if submission.MemoryDecisions[1].CandidateID != "candidate-2" || submission.MemoryDecisions[1].Action != "defer" || submission.MemoryDecisions[1].Reason != "needs evidence" {
+			t.Fatalf("second memory decision = %#v", submission.MemoryDecisions[1])
+		}
+		if err := st.UpdateRunStatus(ctx, runID, store.RunStatusRunning); err != nil {
+			t.Fatalf("update run: %v", err)
+		}
+		if err := st.UpdateStageStatus(ctx, stageID, report.StatusCompleted); err != nil {
+			t.Fatalf("update stage: %v", err)
+		}
+		return report.Report{Status: report.StatusCompleted}, nil
+	}
+
+	srv := newRouteTestServer(t, st, controller)
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/projects/default/runs/"+wr.Run.ID+"/human-stages/"+stage.ID+"/verdict", cookie, url.Values{
+		"summary":               {"Approve memory decisions"},
+		"memory_candidate_id":   {"candidate-1", "candidate-2"},
+		"memory_action":         {"edit", "defer"},
+		"memory_kind":           {"lesson", "gotcha"},
+		"memory_title":          {"Edited title", "Deferred title"},
+		"memory_body":           {"Edited body", "Deferred body"},
+		"memory_source_summary": {"Edited source", "Deferred source"},
+		"memory_reason":         {"", "needs evidence"},
+		"_csrf":                 {csrf},
+	})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST memory approval status = %d want %d body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+}
+
 func TestHandleHumanReviewVerdictInvalidVerdictIsBadRequest(t *testing.T) {
 	ctx := context.Background()
 	st := openRouteTestStore(t)

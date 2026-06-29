@@ -956,7 +956,30 @@ func parseHumanReviewSubmission(r *http.Request) (orchestrator.HumanReviewSubmis
 			submission.Findings = append(submission.Findings, orchestrator.HumanFinding{Summary: finding})
 		}
 	}
+	candidateIDs := r.Form["memory_candidate_id"]
+	for i, candidateID := range candidateIDs {
+		candidateID = strings.TrimSpace(candidateID)
+		if candidateID == "" {
+			continue
+		}
+		submission.MemoryDecisions = append(submission.MemoryDecisions, orchestrator.HumanMemoryDecision{
+			CandidateID:   candidateID,
+			Action:        formValueAt(r.Form["memory_action"], i),
+			Kind:          formValueAt(r.Form["memory_kind"], i),
+			Title:         formValueAt(r.Form["memory_title"], i),
+			Body:          formValueAt(r.Form["memory_body"], i),
+			SourceSummary: formValueAt(r.Form["memory_source_summary"], i),
+			Reason:        formValueAt(r.Form["memory_reason"], i),
+		})
+	}
 	return submission, nil
+}
+
+func formValueAt(values []string, index int) string {
+	if index < 0 || index >= len(values) {
+		return ""
+	}
+	return strings.TrimSpace(values[index])
 }
 
 func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request, projectID, runID string) {

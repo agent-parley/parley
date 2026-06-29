@@ -868,6 +868,125 @@ func TestMemoryProducerLoopPersistsAgentLearningOpportunities(t *testing.T) {
 	}
 }
 
+func TestHumanMemoryUpdateSuspendsApprovesEditsRejectsDefersAndResumesOnce(t *testing.T) {
+	ctx := context.Background()
+	runner := &humanMemoryApprovalRunner{}
+	env := newTestEnv(t, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
+	templateID := "human_memory_approval"
+	createMemoryProducerTemplateWithActor(t, env.store, templateID, true, workflow.ActorHuman)
+
+	runID, err := env.engine.StartRunInput(ctx, contract.TaskInput{Idea: "approve memory candidates", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: templateID})
+	if err != nil {
+		t.Fatalf("StartRunInput() error = %v", err)
+	}
+	if err := env.engine.StartQueuedRun(ctx, runID); err != nil {
+		t.Fatalf("StartQueuedRun() error = %v", err)
+	}
+	waitForWorkflowStageAwaiting(t, env.store, runID, "memory_update")
+	queue, err := env.engine.QueueState(ctx)
+	if err != nil {
+		t.Fatalf("queue state: %v", err)
+	}
+	if queue.Running != 0 {
+		t.Fatalf("running slots = %d, want 0 after memory approval suspend", queue.Running)
+	}
+
+	awaiting := eventByWorkflowStage(t, env.store, runID, "stage.awaiting_human", "memory_update")
+	packetID := payloadString(awaiting.Data, "memory_approval_packet_id")
+	if packetID == "" {
+		t.Fatalf("awaiting event missing memory_approval_packet_id: %#v", awaiting.Data)
+	}
+	_, packetContent, err := env.store.GetArtifact(ctx, packetID)
+	if err != nil {
+		t.Fatalf("get memory approval packet: %v", err)
+	}
+	var packet memoryApprovalPacket
+	if err := json.Unmarshal(packetContent, &packet); err != nil {
+		t.Fatalf("decode memory approval packet: %v", err)
+	}
+	if len(packet.Candidates) != 4 || packet.InboxSummary["candidate_count"] == nil {
+		t.Fatalf("memory approval packet = %#v", packet)
+	}
+
+	memoryStage := stageByWorkflowID(t, env.store, runID, "memory_update")
+	rep, err := env.engine.SubmitHumanReview(ctx, runID, memoryStage.ID, HumanReviewSubmission{
+		ActorID: "alice",
+		Summary: "memory decisions approved",
+		MemoryDecisions: []HumanMemoryDecision{
+			{CandidateID: "candidate-1", Action: store.ProjectMemoryDecisionApprove},
+			{CandidateID: "candidate-2", Action: store.ProjectMemoryDecisionEdit, Kind: store.ProjectMemoryKindLesson, Title: "Edited memory lesson", Body: "Edited memory body stays source-linked and useful.", SourceSummary: "edited by human"},
+			{CandidateID: "candidate-3", Action: store.ProjectMemoryDecisionReject, Reason: "not durable"},
+			{CandidateID: "candidate-4", Action: store.ProjectMemoryDecisionDefer, Reason: "needs more evidence"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SubmitHumanReview(memory) error = %v", err)
+	}
+	if rep.Status != report.StatusCompleted || rep.Actor.Kind != report.ActorKindHuman || rep.Actor.ID != "alice" {
+		t.Fatalf("human memory report = %#v", rep)
+	}
+	if rep.Summary != "memory decisions approved" {
+		t.Fatalf("human memory report summary = %q, want submitted summary", rep.Summary)
+	}
+	if got := reportPayloadInt(rep.Payload, "applied_count"); got != 2 {
+		t.Fatalf("applied_count = %d; payload=%#v", got, rep.Payload)
+	}
+	if got := reportPayloadInt(rep.Payload, "human_rejected_count"); got != 1 {
+		t.Fatalf("human_rejected_count = %d; payload=%#v", got, rep.Payload)
+	}
+	if got := reportPayloadInt(rep.Payload, "deferred_count"); got != 1 {
+		t.Fatalf("deferred_count = %d; payload=%#v", got, rep.Payload)
+	}
+	if _, err := env.engine.SubmitHumanReview(ctx, runID, memoryStage.ID, HumanReviewSubmission{Summary: "late", MemoryDecisions: []HumanMemoryDecision{{CandidateID: "candidate-1", Action: store.ProjectMemoryDecisionApprove}}}); err == nil {
+		t.Fatal("double memory approval submit succeeded")
+	}
+
+	entries, err := env.store.ListProjectMemoryEntries(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("list project memory: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("project memory entries = %#v, want 2", entries)
+	}
+	titles := map[string]bool{}
+	for _, entry := range entries {
+		titles[entry.Title] = true
+		if entry.CuratorStageID != memoryStage.ID {
+			t.Fatalf("entry curator stage = %s, want %s", entry.CuratorStageID, memoryStage.ID)
+		}
+	}
+	for _, want := range []string{"Approve this memory", "Edited memory lesson"} {
+		if !titles[want] {
+			t.Fatalf("project memory titles = %#v, missing %q", titles, want)
+		}
+	}
+	for _, unwanted := range []string{"Reject this memory", "Defer this memory"} {
+		if titles[unwanted] {
+			t.Fatalf("project memory titles include rejected/deferred %q: %#v", unwanted, titles)
+		}
+	}
+	decisions, err := env.store.ListProjectMemoryDecisions(ctx, runID)
+	if err != nil {
+		t.Fatalf("list memory decisions: %v", err)
+	}
+	if len(decisions) != 4 {
+		t.Fatalf("memory decisions = %#v, want 4", decisions)
+	}
+	outcomes := map[string]string{}
+	actions := map[string]string{}
+	for _, decision := range decisions {
+		outcomes[decision.CandidateID] = decision.Outcome
+		actions[decision.CandidateID] = decision.Action
+		if (decision.CandidateID == "candidate-1" || decision.CandidateID == "candidate-2") && decision.EntryID == "" {
+			t.Fatalf("applied decision missing entry_id: %+v", decision)
+		}
+	}
+	if outcomes["candidate-1"] != store.ProjectMemoryDecisionOutcomeApplied || outcomes["candidate-2"] != store.ProjectMemoryDecisionOutcomeApplied || outcomes["candidate-3"] != store.ProjectMemoryDecisionOutcomeRejected || outcomes["candidate-4"] != store.ProjectMemoryDecisionOutcomeDeferred {
+		t.Fatalf("memory decision outcomes = %#v actions=%#v", outcomes, actions)
+	}
+	waitForRunStatus(t, env.store, runID, store.RunStatusCompleted)
+}
+
 func TestMemoryCaptureDisabledWithoutMemoryUpdateStage(t *testing.T) {
 	ctx := context.Background()
 	runner := &memoryLearningRunner{emitEvenWhenDisabled: true}
@@ -1108,6 +1227,11 @@ func TestStartRunFreezesSelectedWorkflowTemplateSnapshot(t *testing.T) {
 
 func createMemoryProducerTemplate(t *testing.T, st *store.Store, templateID string, includeMemoryUpdate bool) {
 	t.Helper()
+	createMemoryProducerTemplateWithActor(t, st, templateID, includeMemoryUpdate, workflow.ActorAgent)
+}
+
+func createMemoryProducerTemplateWithActor(t *testing.T, st *store.Store, templateID string, includeMemoryUpdate bool, memoryActor string) {
+	t.Helper()
 	stages := []workflow.StageTemplate{
 		{ID: "idea_refinement", Type: workflow.StageTypeIdeaRefinement, Label: "Idea refinement", Actor: workflow.ActorHarness},
 		{ID: "implementation", Type: workflow.StageTypeImplementation, Label: "Implementation", Actor: workflow.ActorAgent},
@@ -1119,7 +1243,7 @@ func createMemoryProducerTemplate(t *testing.T, st *store.Store, templateID stri
 	}
 	reviewNext := "stop_report"
 	if includeMemoryUpdate {
-		stages = append(stages, workflow.StageTemplate{ID: "memory_update", Type: workflow.StageTypeMemoryUpdate, Label: "Memory update", Actor: workflow.ActorAgent})
+		stages = append(stages, workflow.StageTemplate{ID: "memory_update", Type: workflow.StageTypeMemoryUpdate, Label: "Memory update", Actor: memoryActor})
 		reviewNext = "memory_update"
 		edges = append(edges, workflow.Edge{From: "memory_update", To: "stop_report", On: workflow.OnCompleted})
 	}
@@ -1476,6 +1600,48 @@ func (r *memoryLearningRunner) addLearning(rep *report.Report, disp contract.Dis
 }
 
 func (r *memoryLearningRunner) CancelAttempt(context.Context, string, string, string) error {
+	return nil
+}
+
+type humanMemoryApprovalRunner struct {
+	disps []contract.Dispatch
+}
+
+func (r *humanMemoryApprovalRunner) Dispatch(_ context.Context, disp contract.Dispatch) (report.Report, error) {
+	r.disps = append(r.disps, disp)
+	rep := validAdapterReport(disp, "human memory approval dispatch")
+	if !memoryCaptureInputEnabled(disp.Input) {
+		return rep, nil
+	}
+	switch disp.StageType {
+	case contract.StageTypeImplementation:
+		rep.Payload[memoryCapturePayloadKey] = []any{
+			map[string]any{"kind": store.ProjectMemoryKindGotcha, "title": "Approve this memory", "body": "Approved memory should be written after human approval.", "source_summary": "implementation approval candidate"},
+			map[string]any{"kind": store.ProjectMemoryKindLesson, "title": "Edit this memory", "body": "Original body that the human should edit before writing.", "source_summary": "implementation edit candidate"},
+		}
+	case contract.StageTypeReview:
+		switch disp.Input["review_role"] {
+		case contract.ReviewRoleCritic:
+			rep.Payload = map[string]any{"raw_findings": []any{}}
+		case contract.ReviewRoleArbiter:
+			verdict := report.ReviewVerdictPass
+			rep.Verdict = &verdict
+			rep.Payload = map[string]any{
+				"raw_findings":          disp.Input["raw_findings"],
+				"arbitration_decisions": []any{},
+				"residual_risk":         "low",
+				"confidence":            "high",
+				memoryCapturePayloadKey: []any{
+					map[string]any{"kind": store.ProjectMemoryKindRepoFact, "title": "Reject this memory", "body": "Rejected memory should be recorded but not written.", "source_summary": "review rejection candidate"},
+					map[string]any{"kind": store.ProjectMemoryKindPriorResult, "title": "Defer this memory", "body": "Deferred memory should be recorded without writing.", "source_summary": "review deferred candidate"},
+				},
+			}
+		}
+	}
+	return rep, nil
+}
+
+func (r *humanMemoryApprovalRunner) CancelAttempt(context.Context, string, string, string) error {
 	return nil
 }
 

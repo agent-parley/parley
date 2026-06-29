@@ -290,6 +290,11 @@ func (c *Client) SetLifecycleHandlers(onHeartbeatMissed HeartbeatMissedHandler, 
 }
 
 func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.Report, error) {
+	cancelAttempt := func() {
+		cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = c.CancelAttempt(cancelCtx, disp.RunID, disp.TaskID, disp.AttemptID)
+	}
 	waiter := &dispatchWaiter{reportCh: make(chan report.Report, 1), resultCh: make(chan protocol.ResultPayload, 1)}
 	reportKey := disp.StageID
 	resultKey := resultWaiterKey(disp.RunID, disp.TaskID, disp.AttemptID)
@@ -305,6 +310,9 @@ func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.R
 	}()
 
 	if err := c.send(ctx, protocol.TypeDispatch, disp); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			cancelAttempt()
+		}
 		return report.Report{}, err
 	}
 
@@ -312,7 +320,7 @@ func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.R
 	select {
 	case rep = <-waiter.reportCh:
 	case <-ctx.Done():
-		_ = c.CancelAttempt(context.Background(), disp.RunID, disp.TaskID, disp.AttemptID)
+		cancelAttempt()
 		return report.Report{}, ctx.Err()
 	case <-c.session.Done():
 		return report.Report{}, protocol.ErrSessionClosed
@@ -326,6 +334,7 @@ func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.R
 	case <-time.After(2 * time.Second):
 		return rep, nil
 	case <-ctx.Done():
+		cancelAttempt()
 		return rep, ctx.Err()
 	case <-c.session.Done():
 		return rep, protocol.ErrSessionClosed
