@@ -1,6 +1,7 @@
 package agentregistry
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -90,6 +91,87 @@ func TestResolveLayersProjectOverridesOverGlobalDefaults(t *testing.T) {
 	}
 	if globalWorker.Name != globalName || globalWorker.FamilyID != FamilyPi {
 		t.Fatalf("global profile = %+v, want Pi metadata", globalWorker)
+	}
+}
+
+func TestProfileOverrideFromProfileDiffPinsOnlyChangedNormalizedFields(t *testing.T) {
+	baseline := Profile{
+		ID:                  ProfilePiHeadlessWorker,
+		FamilyID:            FamilyPi,
+		Name:                "Worker",
+		Description:         "Inherited description",
+		Role:                "implementation",
+		Headless:            true,
+		Prompt:              "Inherited prompt",
+		DefaultInstructions: "Prefer repository conventions.",
+		Model:               "model-a",
+		ContextPolicy:       "task_contract_only",
+		OutputStyle:         "structured_report",
+		SuggestedStageTypes: []string{contract.StageTypeImplementation},
+	}
+	edited := baseline
+	edited.Name = " Worker edited "
+	edited.Description = ""
+	edited.Model = " model-b "
+	edited.SuggestedStageTypes = []string{contract.StageTypeImplementation, contract.StageTypeValidation}
+
+	override := ProfileOverrideFromProfileDiff(edited, baseline)
+	if override.Name == nil || *override.Name != "Worker edited" {
+		t.Fatalf("Name override = %v, want Worker edited", override.Name)
+	}
+	if override.Description == nil || *override.Description != "" {
+		t.Fatalf("Description override = %v, want deliberate empty string", override.Description)
+	}
+	if override.Model == nil || *override.Model != "model-b" {
+		t.Fatalf("Model override = %v, want model-b", override.Model)
+	}
+	if strings.Join(override.SuggestedStageTypes, ",") != strings.Join([]string{contract.StageTypeImplementation, contract.StageTypeValidation}, ",") {
+		t.Fatalf("SuggestedStageTypes override = %#v, want implementation+validation", override.SuggestedStageTypes)
+	}
+	if override.FamilyID != nil || override.Role != nil || override.Headless != nil || override.Prompt != nil || override.DefaultInstructions != nil || override.ContextPolicy != nil || override.OutputStyle != nil {
+		t.Fatalf("unchanged fields were pinned: %+v", override)
+	}
+}
+
+func TestProfileOverrideFromProfileDiffPreservesEmptySuggestedStagePin(t *testing.T) {
+	baseline := Profile{
+		ID:                  ProfilePiHeadlessWorker,
+		FamilyID:            FamilyPi,
+		Name:                "Worker",
+		Role:                "implementation",
+		Headless:            true,
+		ContextPolicy:       "task_contract_only",
+		OutputStyle:         "structured_report",
+		SuggestedStageTypes: []string{contract.StageTypeImplementation},
+	}
+	edited := baseline
+	edited.SuggestedStageTypes = nil
+
+	override := ProfileOverrideFromProfileDiff(edited, baseline)
+	if override.SuggestedStageTypes == nil {
+		t.Fatal("SuggestedStageTypes override = nil, want non-nil empty slice to pin a deliberate clear")
+	}
+	if len(override.SuggestedStageTypes) != 0 {
+		t.Fatalf("SuggestedStageTypes override = %#v, want empty slice", override.SuggestedStageTypes)
+	}
+}
+
+func TestProfileOverrideJSONPreservesEmptySuggestedStagePin(t *testing.T) {
+	raw, err := json.Marshal(Overrides{Profiles: map[string]ProfileOverride{
+		ProfilePiHeadlessWorker: {SuggestedStageTypes: []string{}},
+	}})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(raw), `"suggested_stage_types":[]`) {
+		t.Fatalf("marshaled overrides = %s, want explicit empty suggested_stage_types", raw)
+	}
+	var decoded Overrides
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if decoded.Profiles[ProfilePiHeadlessWorker].SuggestedStageTypes == nil {
+		t.Fatal("decoded suggested_stage_types = nil, want non-nil empty slice")
 	}
 }
 
