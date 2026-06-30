@@ -1,6 +1,7 @@
 package managerhttp
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"sort"
@@ -10,6 +11,7 @@ import (
 	"github.com/agent-parley/parley/internal/manager/agentregistry"
 	"github.com/agent-parley/parley/internal/manager/store"
 	"github.com/agent-parley/parley/internal/manager/web"
+	"github.com/agent-parley/parley/internal/manager/workflow"
 	"github.com/agent-parley/parley/internal/shared/contract"
 )
 
@@ -69,6 +71,144 @@ func (s *Server) handleProjectAgentProfileSave(w http.ResponseWriter, r *http.Re
 	s.writeProjectAgentProfilesFragment(w, r, http.StatusAccepted, project, "", "saved project profile "+profile.ID)
 }
 
+func (s *Server) handleGlobalAgentProfileDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		s.writeGlobalAgentProfilesFragment(w, r, http.StatusBadRequest, err.Error(), "")
+		return
+	}
+	profileID := agentProfileIDFromForm(r)
+	if profileID == "" {
+		s.writeGlobalAgentProfilesFragment(w, r, http.StatusBadRequest, "profile_id is required", "")
+		return
+	}
+	overrides, err := s.store.GetGlobalAgentRegistryOverrides(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	deletedOverride, clearedDefault := deleteAgentProfileOverride(&overrides, profileID)
+	if _, err := agentregistry.Resolve(overrides, agentregistry.Overrides{}); err != nil {
+		s.writeGlobalAgentProfilesFragment(w, r, http.StatusBadRequest, err.Error(), "")
+		return
+	}
+	if err := s.ensureGlobalAgentProfileDeleteDoesNotBreakTemplates(r.Context(), profileID, overrides); err != nil {
+		s.writeGlobalAgentProfilesFragment(w, r, http.StatusBadRequest, err.Error(), "")
+		return
+	}
+	if err := s.ensureProjectAgentRegistriesResolveAfterGlobalUpdate(r.Context(), profileID, overrides); err != nil {
+		s.writeGlobalAgentProfilesFragment(w, r, http.StatusBadRequest, err.Error(), "")
+		return
+	}
+	if _, err := s.store.UpdateGlobalAgentRegistryOverrides(r.Context(), overrides); err != nil {
+		s.writeGlobalAgentProfilesFragment(w, r, http.StatusBadRequest, err.Error(), "")
+		return
+	}
+	s.writeGlobalAgentProfilesFragment(w, r, http.StatusAccepted, "", agentProfileDeleteStatus("global", profileID, deletedOverride, clearedDefault))
+}
+
+func (s *Server) handleProjectAgentProfileDelete(w http.ResponseWriter, r *http.Request, projectID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	project, err := s.store.GetProject(r.Context(), projectID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		s.writeProjectAgentProfilesFragment(w, r, http.StatusBadRequest, project, err.Error(), "")
+		return
+	}
+	profileID := agentProfileIDFromForm(r)
+	if profileID == "" {
+		s.writeProjectAgentProfilesFragment(w, r, http.StatusBadRequest, project, "profile_id is required", "")
+		return
+	}
+	overrides, err := s.store.GetProjectAgentRegistryOverrides(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	deletedOverride, clearedDefault := deleteAgentProfileOverride(&overrides, profileID)
+	globalOverrides, err := s.store.GetGlobalAgentRegistryOverrides(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	registryAfter, err := agentregistry.Resolve(globalOverrides, overrides)
+	if err != nil {
+		s.writeProjectAgentProfilesFragment(w, r, http.StatusBadRequest, project, err.Error(), "")
+		return
+	}
+	if err := s.ensureAgentProfileDeleteDoesNotBreakTemplates(r.Context(), profileID, registryAfter); err != nil {
+		s.writeProjectAgentProfilesFragment(w, r, http.StatusBadRequest, project, err.Error(), "")
+		return
+	}
+	if _, err := s.store.UpdateProjectAgentRegistryOverrides(r.Context(), project.ID, overrides); err != nil {
+		s.writeProjectAgentProfilesFragment(w, r, http.StatusBadRequest, project, err.Error(), "")
+		return
+	}
+	project, err = s.store.GetProject(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.writeProjectAgentProfilesFragment(w, r, http.StatusAccepted, project, "", agentProfileDeleteStatus("project", profileID, deletedOverride, clearedDefault))
+}
+
+func (s *Server) handleGlobalAgentProfileClearDefault(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	overrides, err := s.store.GetGlobalAgentRegistryOverrides(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	alreadyInherited := overrides.DefaultProfileID == nil
+	overrides.DefaultProfileID = nil
+	if _, err := s.store.UpdateGlobalAgentRegistryOverrides(r.Context(), overrides); err != nil {
+		s.writeGlobalAgentProfilesFragment(w, r, http.StatusBadRequest, err.Error(), "")
+		return
+	}
+	s.writeGlobalAgentProfilesFragment(w, r, http.StatusAccepted, "", agentProfileClearDefaultStatus("global", alreadyInherited))
+}
+
+func (s *Server) handleProjectAgentProfileClearDefault(w http.ResponseWriter, r *http.Request, projectID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	project, err := s.store.GetProject(r.Context(), projectID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	overrides, err := s.store.GetProjectAgentRegistryOverrides(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	alreadyInherited := overrides.DefaultProfileID == nil
+	overrides.DefaultProfileID = nil
+	if _, err := s.store.UpdateProjectAgentRegistryOverrides(r.Context(), project.ID, overrides); err != nil {
+		s.writeProjectAgentProfilesFragment(w, r, http.StatusBadRequest, project, err.Error(), "")
+		return
+	}
+	project, err = s.store.GetProject(r.Context(), project.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.writeProjectAgentProfilesFragment(w, r, http.StatusAccepted, project, "", agentProfileClearDefaultStatus("project", alreadyInherited))
+}
+
 func (s *Server) globalAgentProfileEditorData(r *http.Request, notice, status string) (web.AgentProfileEditorData, error) {
 	overrides, err := s.store.GetGlobalAgentRegistryOverrides(r.Context())
 	if err != nil {
@@ -78,19 +218,23 @@ func (s *Server) globalAgentProfileEditorData(r *http.Request, notice, status st
 	if err != nil {
 		return web.AgentProfileEditorData{}, err
 	}
+	savePath := "/settings/agent-profiles"
 	return agentProfileEditorData(agentProfileEditorInput{
-		Scope:            "global",
-		Title:            "Global agent profiles",
-		Help:             "View, create, and edit global default profile definitions. TOML agent settings are still readable; this in-app editor is the supported path for ongoing changes.",
-		SavePath:         "/settings/agent-profiles",
-		Registry:         registry,
-		Overrides:        overrides,
-		OverrideLabel:    "global override",
-		InheritedLabel:   "built-in default",
-		Notice:           notice,
-		Status:           status,
-		CSRF:             csrfFromContext(r.Context()),
-		DefaultProfileID: registry.DefaultProfileID,
+		Scope:             "global",
+		Title:             "Global agent profiles",
+		Help:              "View, create, and edit global default profile definitions. TOML agent settings are still readable; this in-app editor is the supported path for ongoing changes.",
+		SavePath:          savePath,
+		DeletePath:        savePath + "/delete",
+		ClearDefaultPath:  savePath + "/clear-default",
+		Registry:          registry,
+		InheritedRegistry: agentregistry.Defaults(),
+		Overrides:         overrides,
+		OverrideLabel:     "global override",
+		InheritedLabel:    "built-in default",
+		Notice:            notice,
+		Status:            status,
+		CSRF:              csrfFromContext(r.Context()),
+		DefaultProfileID:  registry.DefaultProfileID,
 	}), nil
 }
 
@@ -99,39 +243,50 @@ func (s *Server) projectAgentProfileEditorData(r *http.Request, project store.Pr
 	if err != nil {
 		return web.AgentProfileEditorData{}, err
 	}
+	inherited, err := s.store.ResolveGlobalAgentRegistry(r.Context())
+	if err != nil {
+		return web.AgentProfileEditorData{}, err
+	}
 	registry, err := s.store.ResolveAgentRegistry(r.Context(), project.ID)
 	if err != nil {
 		return web.AgentProfileEditorData{}, err
 	}
+	savePath := "/projects/" + project.ID + "/settings/agent-profiles"
 	return agentProfileEditorData(agentProfileEditorInput{
-		Scope:            "project-" + project.ID,
-		Title:            "Project agent profile overrides",
-		Help:             "View the resolved profile set and create or edit project-layer overrides without mutating global defaults.",
-		SavePath:         "/projects/" + project.ID + "/settings/agent-profiles",
-		Registry:         registry,
-		Overrides:        overrides,
-		OverrideLabel:    "project override",
-		InheritedLabel:   "inherited global",
-		Notice:           notice,
-		Status:           status,
-		CSRF:             csrfFromContext(r.Context()),
-		DefaultProfileID: registry.DefaultProfileID,
+		Scope:             "project-" + project.ID,
+		Title:             "Project agent profile overrides",
+		Help:              "View the resolved profile set and create or edit project-layer overrides without mutating global defaults.",
+		SavePath:          savePath,
+		DeletePath:        savePath + "/delete",
+		ClearDefaultPath:  savePath + "/clear-default",
+		Registry:          registry,
+		InheritedRegistry: inherited,
+		Overrides:         overrides,
+		OverrideLabel:     "project override",
+		InheritedLabel:    "inherited global",
+		Notice:            notice,
+		Status:            status,
+		CSRF:              csrfFromContext(r.Context()),
+		DefaultProfileID:  registry.DefaultProfileID,
 	}), nil
 }
 
 type agentProfileEditorInput struct {
-	Scope            string
-	Title            string
-	Help             string
-	SavePath         string
-	Registry         agentregistry.Registry
-	Overrides        agentregistry.Overrides
-	OverrideLabel    string
-	InheritedLabel   string
-	Notice           string
-	Status           string
-	CSRF             string
-	DefaultProfileID string
+	Scope             string
+	Title             string
+	Help              string
+	SavePath          string
+	DeletePath        string
+	ClearDefaultPath  string
+	Registry          agentregistry.Registry
+	InheritedRegistry agentregistry.Registry
+	Overrides         agentregistry.Overrides
+	OverrideLabel     string
+	InheritedLabel    string
+	Notice            string
+	Status            string
+	CSRF              string
+	DefaultProfileID  string
 }
 
 func agentProfileEditorData(input agentProfileEditorInput) web.AgentProfileEditorData {
@@ -145,12 +300,16 @@ func agentProfileEditorData(input agentProfileEditorInput) web.AgentProfileEdito
 	views := make([]web.AgentProfileFormData, 0, len(profiles))
 	for _, profile := range profiles {
 		layer := input.InheritedLabel
-		if input.Overrides.Profiles != nil {
-			if _, ok := input.Overrides.Profiles[profile.ID]; ok {
-				layer = input.OverrideLabel
+		canDelete := profileOverrideExists(input.Overrides, profile.ID)
+		deleteLabel := ""
+		if canDelete {
+			layer = input.OverrideLabel
+			deleteLabel = "Delete profile"
+			if _, ok := agentregistry.ProfileByID(input.InheritedRegistry, profile.ID); ok {
+				deleteLabel = "Revert override"
 			}
 		}
-		views = append(views, agentProfileFormData(profile, input.DefaultProfileID, layer))
+		views = append(views, agentProfileFormData(profile, input.DefaultProfileID, layer, canDelete, deleteLabel))
 	}
 	return web.AgentProfileEditorData{
 		Scope:            input.Scope,
@@ -159,14 +318,17 @@ func agentProfileEditorData(input agentProfileEditorInput) web.AgentProfileEdito
 		Profiles:         views,
 		Create:           defaultNewAgentProfileForm(),
 		SavePath:         input.SavePath,
+		DeletePath:       input.DeletePath,
+		ClearDefaultPath: input.ClearDefaultPath,
 		DefaultProfileID: input.DefaultProfileID,
+		CanClearDefault:  input.Overrides.DefaultProfileID != nil,
 		Notice:           input.Notice,
 		Status:           input.Status,
 		CSRF:             input.CSRF,
 	}
 }
 
-func agentProfileFormData(profile agentregistry.Profile, defaultProfileID, layer string) web.AgentProfileFormData {
+func agentProfileFormData(profile agentregistry.Profile, defaultProfileID, layer string, canDelete bool, deleteLabel string) web.AgentProfileFormData {
 	return web.AgentProfileFormData{
 		ID:                  profile.ID,
 		FamilyID:            profile.FamilyID,
@@ -182,6 +344,8 @@ func agentProfileFormData(profile agentregistry.Profile, defaultProfileID, layer
 		SuggestedStageTypes: strings.Join(profile.SuggestedStageTypes, ", "),
 		Layer:               layer,
 		IsDefault:           profile.ID == defaultProfileID,
+		CanDelete:           canDelete,
+		DeleteLabel:         deleteLabel,
 	}
 }
 
@@ -252,7 +416,170 @@ func upsertAgentProfileOverride(overrides *agentregistry.Overrides, profile agen
 	if makeDefault {
 		profileID := profile.ID
 		overrides.DefaultProfileID = &profileID
+		return
 	}
+	if profileIDPtrEqual(overrides.DefaultProfileID, profile.ID) {
+		overrides.DefaultProfileID = nil
+	}
+}
+
+func deleteAgentProfileOverride(overrides *agentregistry.Overrides, profileID string) (bool, bool) {
+	profileID = normalizeAgentProfileID(profileID)
+	deletedOverride := false
+	for id := range overrides.Profiles {
+		if agentProfileIDEqual(id, profileID) {
+			delete(overrides.Profiles, id)
+			deletedOverride = true
+		}
+	}
+	clearedDefault := false
+	if profileIDPtrEqual(overrides.DefaultProfileID, profileID) {
+		overrides.DefaultProfileID = nil
+		clearedDefault = true
+	}
+	return deletedOverride, clearedDefault
+}
+
+func profileOverrideExists(overrides agentregistry.Overrides, profileID string) bool {
+	for id := range overrides.Profiles {
+		if agentProfileIDEqual(id, profileID) {
+			return true
+		}
+	}
+	return false
+}
+
+func agentProfileIDFromForm(r *http.Request) string {
+	return normalizeAgentProfileID(r.Form.Get("profile_id"))
+}
+
+func normalizeAgentProfileID(profileID string) string {
+	return strings.ToLower(strings.TrimSpace(profileID))
+}
+
+func agentProfileIDEqual(a, b string) bool {
+	return normalizeAgentProfileID(a) == normalizeAgentProfileID(b)
+}
+
+func profileIDPtrEqual(ptr *string, profileID string) bool {
+	return ptr != nil && agentProfileIDEqual(*ptr, profileID)
+}
+
+func agentProfileDeleteStatus(scope, profileID string, deletedOverride, clearedDefault bool) string {
+	if deletedOverride && clearedDefault {
+		return "deleted " + scope + " profile override " + profileID + " and cleared the " + scope + " default profile override"
+	}
+	if deletedOverride {
+		return "deleted " + scope + " profile override " + profileID
+	}
+	if clearedDefault {
+		return "cleared the " + scope + " default profile override for " + profileID
+	}
+	return "no " + scope + " profile override existed for " + profileID
+}
+
+func agentProfileClearDefaultStatus(scope string, alreadyInherited bool) string {
+	if alreadyInherited {
+		return scope + " default profile already inherits from the lower layer"
+	}
+	return "cleared " + scope + " default profile override"
+}
+
+func (s *Server) ensureAgentProfileDeleteDoesNotBreakTemplates(ctx context.Context, profileID string, registryAfter agentregistry.Registry) error {
+	if _, ok := agentregistry.ProfileByID(registryAfter, profileID); ok {
+		return nil
+	}
+	referencing, err := s.workflowTemplatesReferencingProfile(ctx, profileID)
+	if err != nil {
+		return err
+	}
+	if len(referencing) > 0 {
+		return fmt.Errorf("cannot delete profile %s; workflow template(s) %s reference it", profileID, strings.Join(referencing, ", "))
+	}
+	return nil
+}
+
+func (s *Server) ensureGlobalAgentProfileDeleteDoesNotBreakTemplates(ctx context.Context, profileID string, globalOverrides agentregistry.Overrides) error {
+	referencing, err := s.workflowTemplatesReferencingProfile(ctx, profileID)
+	if err != nil {
+		return err
+	}
+	if len(referencing) == 0 {
+		return nil
+	}
+	projects, err := s.store.ListProjects(ctx)
+	if err != nil {
+		return err
+	}
+	var unresolvedProjects []string
+	for _, project := range projects {
+		registry, err := s.resolveAgentRegistryAfterGlobalUpdate(ctx, project.ID, globalOverrides)
+		if err != nil {
+			return err
+		}
+		if _, ok := agentregistry.ProfileByID(registry, profileID); ok {
+			continue
+		}
+		label := project.ID
+		if strings.TrimSpace(project.Name) != "" {
+			label = project.Name + " (" + project.ID + ")"
+		}
+		unresolvedProjects = append(unresolvedProjects, label)
+	}
+	if len(unresolvedProjects) > 0 {
+		sort.Strings(unresolvedProjects)
+		return fmt.Errorf("cannot delete profile %s; workflow template(s) %s reference it and project(s) %s would no longer resolve it", profileID, strings.Join(referencing, ", "), strings.Join(unresolvedProjects, ", "))
+	}
+	return nil
+}
+
+func (s *Server) workflowTemplatesReferencingProfile(ctx context.Context, profileID string) ([]string, error) {
+	templates, err := s.store.ListWorkflowTemplates(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var referencing []string
+	for _, template := range templates {
+		if workflowTemplateReferencesProfile(template, profileID) {
+			label := template.ID
+			if strings.TrimSpace(template.Name) != "" {
+				label = template.Name + " (" + template.ID + ")"
+			}
+			referencing = append(referencing, label)
+		}
+	}
+	sort.Strings(referencing)
+	return referencing, nil
+}
+
+func workflowTemplateReferencesProfile(template workflow.Template, profileID string) bool {
+	for _, stage := range template.Stages {
+		if agentProfileIDEqual(stage.ProfileID, profileID) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) ensureProjectAgentRegistriesResolveAfterGlobalUpdate(ctx context.Context, profileID string, globalOverrides agentregistry.Overrides) error {
+	projects, err := s.store.ListProjects(ctx)
+	if err != nil {
+		return err
+	}
+	for _, project := range projects {
+		if _, err := s.resolveAgentRegistryAfterGlobalUpdate(ctx, project.ID, globalOverrides); err != nil {
+			return fmt.Errorf("cannot delete profile %s; project %s has agent registry overrides that would no longer resolve: %w", profileID, project.ID, err)
+		}
+	}
+	return nil
+}
+
+func (s *Server) resolveAgentRegistryAfterGlobalUpdate(ctx context.Context, projectID string, globalOverrides agentregistry.Overrides) (agentregistry.Registry, error) {
+	projectOverrides, err := s.store.GetProjectAgentRegistryOverrides(ctx, projectID)
+	if err != nil {
+		return agentregistry.Registry{}, err
+	}
+	return agentregistry.Resolve(globalOverrides, projectOverrides)
 }
 
 func (s *Server) writeGlobalAgentProfilesFragment(w http.ResponseWriter, r *http.Request, statusCode int, notice, status string) {

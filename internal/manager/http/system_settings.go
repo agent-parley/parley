@@ -51,6 +51,17 @@ func (s *Server) handleSystemSettingsPath(w http.ResponseWriter, r *http.Request
 			s.handleGlobalAgentProfileSave(w, r)
 			return
 		}
+		if len(parts) == 2 {
+			switch parts[1] {
+			case "delete":
+				s.handleGlobalAgentProfileDelete(w, r)
+			case "clear-default":
+				s.handleGlobalAgentProfileClearDefault(w, r)
+			default:
+				http.NotFound(w, r)
+			}
+			return
+		}
 		http.NotFound(w, r)
 		return
 	}

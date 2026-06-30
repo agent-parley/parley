@@ -533,6 +533,279 @@ func TestAgentProfileEditorPersistsOverridesAndFeedsTemplateDropdown(t *testing.
 	}
 }
 
+func TestAgentProfileEditorDeletesOverridesAndClearsDefaults(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	cookie, csrf := getCSRFToken(t, srv)
+
+	globalDefaultForm := agentProfileForm(csrf, "global_builder", "Global builder", "implementation", "global-model", "global persona", "global instructions", "implementation")
+	globalDefaultForm.Set("default_profile", "1")
+	globalRec := postForm(t, srv, "/settings/agent-profiles", cookie, globalDefaultForm)
+	if globalRec.Code != http.StatusAccepted {
+		t.Fatalf("POST global default profile status = %d want %d body=%s", globalRec.Code, http.StatusAccepted, globalRec.Body.String())
+	}
+	assertContains(t, globalRec.Body.String(), "Clear default override")
+	assertContains(t, globalRec.Body.String(), "Delete profile")
+	globalOverrides, err := st.GetGlobalAgentRegistryOverrides(ctx)
+	if err != nil {
+		t.Fatalf("get global overrides: %v", err)
+	}
+	if globalOverrides.DefaultProfileID == nil || *globalOverrides.DefaultProfileID != "global_builder" {
+		t.Fatalf("global default override = %v, want global_builder", globalOverrides.DefaultProfileID)
+	}
+
+	clearRec := postForm(t, srv, "/settings/agent-profiles/clear-default", cookie, csrfOnlyForm(csrf))
+	if clearRec.Code != http.StatusAccepted {
+		t.Fatalf("POST global clear default status = %d want %d body=%s", clearRec.Code, http.StatusAccepted, clearRec.Body.String())
+	}
+	globalOverrides, err = st.GetGlobalAgentRegistryOverrides(ctx)
+	if err != nil {
+		t.Fatalf("get global overrides after clear: %v", err)
+	}
+	if globalOverrides.DefaultProfileID != nil {
+		t.Fatalf("global default override after clear = %v, want nil", *globalOverrides.DefaultProfileID)
+	}
+	globalRegistry, err := st.ResolveGlobalAgentRegistry(ctx)
+	if err != nil {
+		t.Fatalf("resolve global registry after clear: %v", err)
+	}
+	if globalRegistry.DefaultProfileID != agentregistry.ProfilePiHeadlessWorker {
+		t.Fatalf("global resolved default = %q, want %q", globalRegistry.DefaultProfileID, agentregistry.ProfilePiHeadlessWorker)
+	}
+
+	globalDefaultForm.Set("default_profile", "1")
+	if rec := postForm(t, srv, "/settings/agent-profiles", cookie, globalDefaultForm); rec.Code != http.StatusAccepted {
+		t.Fatalf("POST global default reset status = %d want %d body=%s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	uncheckedForm := agentProfileForm(csrf, "global_builder", "Global builder", "implementation", "global-model-updated", "global persona", "global instructions", "implementation")
+	uncheckedRec := postForm(t, srv, "/settings/agent-profiles", cookie, uncheckedForm)
+	if uncheckedRec.Code != http.StatusAccepted {
+		t.Fatalf("POST unchecked global default profile status = %d want %d body=%s", uncheckedRec.Code, http.StatusAccepted, uncheckedRec.Body.String())
+	}
+	globalOverrides, err = st.GetGlobalAgentRegistryOverrides(ctx)
+	if err != nil {
+		t.Fatalf("get global overrides after unchecked save: %v", err)
+	}
+	if globalOverrides.DefaultProfileID != nil {
+		t.Fatalf("global default override after unchecked save = %v, want nil", *globalOverrides.DefaultProfileID)
+	}
+
+	projectDefaultForm := agentProfileForm(csrf, "global_builder", "Project builder", "implementation", "project-model", "project persona", "project instructions", "implementation")
+	projectDefaultForm.Set("default_profile", "1")
+	projectRec := postForm(t, srv, "/projects/default/settings/agent-profiles", cookie, projectDefaultForm)
+	if projectRec.Code != http.StatusAccepted {
+		t.Fatalf("POST project profile default status = %d want %d body=%s", projectRec.Code, http.StatusAccepted, projectRec.Body.String())
+	}
+	assertContains(t, projectRec.Body.String(), "Clear default override")
+	assertContains(t, projectRec.Body.String(), "Revert override")
+
+	deleteProjectRec := postForm(t, srv, "/projects/default/settings/agent-profiles/delete", cookie, agentProfileDeleteForm(csrf, "global_builder"))
+	if deleteProjectRec.Code != http.StatusAccepted {
+		t.Fatalf("POST project profile delete status = %d want %d body=%s", deleteProjectRec.Code, http.StatusAccepted, deleteProjectRec.Body.String())
+	}
+	assertContains(t, deleteProjectRec.Body.String(), "cleared the project default profile override")
+	projectOverrides, err := st.GetProjectAgentRegistryOverrides(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("get project overrides: %v", err)
+	}
+	if projectOverrides.DefaultProfileID != nil {
+		t.Fatalf("project default override after delete = %v, want nil", *projectOverrides.DefaultProfileID)
+	}
+	if profileOverrideExists(projectOverrides, "global_builder") {
+		t.Fatalf("project global_builder override still present: %+v", projectOverrides.Profiles)
+	}
+	projectRegistry, err := st.ResolveAgentRegistry(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("resolve project registry after project delete: %v", err)
+	}
+	projectProfile, ok := agentregistry.ProfileByID(projectRegistry, "global_builder")
+	if !ok || projectProfile.Model != "global-model-updated" {
+		t.Fatalf("project profile after delete = %+v/%v, want inherited global model", projectProfile, ok)
+	}
+
+	builtinOverride := agentProfileForm(csrf, agentregistry.ProfilePiHeadlessWorker, "Project worker", "implementation", "project-worker-model", "project worker persona", "project worker instructions", "implementation")
+	builtinRec := postForm(t, srv, "/projects/default/settings/agent-profiles", cookie, builtinOverride)
+	if builtinRec.Code != http.StatusAccepted {
+		t.Fatalf("POST project built-in profile override status = %d want %d body=%s", builtinRec.Code, http.StatusAccepted, builtinRec.Body.String())
+	}
+	deleteBuiltinRec := postForm(t, srv, "/projects/default/settings/agent-profiles/delete", cookie, agentProfileDeleteForm(csrf, agentregistry.ProfilePiHeadlessWorker))
+	if deleteBuiltinRec.Code != http.StatusAccepted {
+		t.Fatalf("POST project built-in profile delete status = %d want %d body=%s", deleteBuiltinRec.Code, http.StatusAccepted, deleteBuiltinRec.Body.String())
+	}
+	projectRegistry, err = st.ResolveAgentRegistry(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("resolve project registry after built-in delete: %v", err)
+	}
+	worker, ok := agentregistry.ProfileByID(projectRegistry, agentregistry.ProfilePiHeadlessWorker)
+	if !ok {
+		t.Fatalf("built-in profile %q missing after deleting override", agentregistry.ProfilePiHeadlessWorker)
+	}
+	if worker.Name == "Project worker" || worker.Model == "project-worker-model" {
+		t.Fatalf("built-in profile still has project override after delete: %+v", worker)
+	}
+
+	deleteGlobalRec := postForm(t, srv, "/settings/agent-profiles/delete", cookie, agentProfileDeleteForm(csrf, "global_builder"))
+	if deleteGlobalRec.Code != http.StatusAccepted {
+		t.Fatalf("POST global profile delete status = %d want %d body=%s", deleteGlobalRec.Code, http.StatusAccepted, deleteGlobalRec.Body.String())
+	}
+	globalRegistry, err = st.ResolveGlobalAgentRegistry(ctx)
+	if err != nil {
+		t.Fatalf("resolve global registry after global delete: %v", err)
+	}
+	if _, ok := agentregistry.ProfileByID(globalRegistry, "global_builder"); ok {
+		t.Fatalf("global_builder still resolves after deleting global override")
+	}
+	projectRegistry, err = st.ResolveAgentRegistry(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("resolve project registry after global delete: %v", err)
+	}
+	if _, ok := agentregistry.ProfileByID(projectRegistry, "global_builder"); ok {
+		t.Fatalf("global_builder still resolves in project after deleting global override")
+	}
+}
+
+func TestAgentProfileEditorRejectsDeletingProfileReferencedByTemplate(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	cookie, csrf := getCSRFToken(t, srv)
+
+	profileRec := postForm(t, srv, "/projects/default/settings/agent-profiles", cookie, agentProfileForm(csrf, "project_validator", "Project validator", "validation-support", "validator-model", "validator persona", "validator instructions", "implementation, validation"))
+	if profileRec.Code != http.StatusAccepted {
+		t.Fatalf("POST project profile status = %d want %d body=%s", profileRec.Code, http.StatusAccepted, profileRec.Body.String())
+	}
+	copied, err := st.CopyWorkflowTemplate(ctx, workflow.BalancedPRDeliveryID, "profile_delete_guard_template", "Profile Delete Guard Template")
+	if err != nil {
+		t.Fatalf("copy workflow template: %v", err)
+	}
+	saveForm := workflowTemplateSaveForm(copied, csrf)
+	saveForm.Set("profile_id_implementation", "project_validator")
+	saveRec := postForm(t, srv, "/templates/"+copied.ID+"/save", cookie, saveForm)
+	if saveRec.Code != http.StatusSeeOther {
+		t.Fatalf("POST template save with project profile status = %d want %d body=%s", saveRec.Code, http.StatusSeeOther, saveRec.Body.String())
+	}
+
+	deleteRec := postForm(t, srv, "/projects/default/settings/agent-profiles/delete", cookie, agentProfileDeleteForm(csrf, "project_validator"))
+	if deleteRec.Code != http.StatusBadRequest {
+		t.Fatalf("POST referenced project profile delete status = %d want %d body=%s", deleteRec.Code, http.StatusBadRequest, deleteRec.Body.String())
+	}
+	assertContains(t, deleteRec.Body.String(), "cannot delete profile project_validator")
+	assertContains(t, deleteRec.Body.String(), "Profile Delete Guard Template")
+	projectRegistry, err := st.ResolveAgentRegistry(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("resolve project registry after rejected delete: %v", err)
+	}
+	if _, ok := agentregistry.ProfileByID(projectRegistry, "project_validator"); !ok {
+		t.Fatalf("project_validator missing after rejected delete")
+	}
+}
+
+func TestAgentProfileEditorAllowsGlobalDeleteWhenProjectOverrideKeepsTemplateResolvable(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	cookie, csrf := getCSRFToken(t, srv)
+	if _, err := st.EnsureProject(ctx, store.ProjectSpec{ID: "other", Name: "Other project", WorkspacePath: t.TempDir(), QueueAutoWhenReady: true, QueueMaxConcurrent: 1, QueueBacklogCap: 10}); err != nil {
+		t.Fatalf("ensure other project: %v", err)
+	}
+
+	globalRec := postForm(t, srv, "/settings/agent-profiles", cookie, agentProfileForm(csrf, "layered_builder", "Global layered builder", "implementation", "global-layered-model", "global persona", "global instructions", "implementation"))
+	if globalRec.Code != http.StatusAccepted {
+		t.Fatalf("POST global profile status = %d want %d body=%s", globalRec.Code, http.StatusAccepted, globalRec.Body.String())
+	}
+	projectRec := postForm(t, srv, "/projects/default/settings/agent-profiles", cookie, agentProfileForm(csrf, "layered_builder", "Project layered builder", "implementation", "project-layered-model", "project persona", "project instructions", "implementation"))
+	if projectRec.Code != http.StatusAccepted {
+		t.Fatalf("POST project profile status = %d want %d body=%s", projectRec.Code, http.StatusAccepted, projectRec.Body.String())
+	}
+	otherRec := postForm(t, srv, "/projects/other/settings/agent-profiles", cookie, agentProfileForm(csrf, "layered_builder", "Other project layered builder", "implementation", "other-project-model", "other persona", "other instructions", "implementation"))
+	if otherRec.Code != http.StatusAccepted {
+		t.Fatalf("POST other project profile status = %d want %d body=%s", otherRec.Code, http.StatusAccepted, otherRec.Body.String())
+	}
+	copied, err := st.CopyWorkflowTemplate(ctx, workflow.BalancedPRDeliveryID, "layered_profile_template", "Layered Profile Template")
+	if err != nil {
+		t.Fatalf("copy workflow template: %v", err)
+	}
+	saveForm := workflowTemplateSaveForm(copied, csrf)
+	saveForm.Set("profile_id_implementation", "layered_builder")
+	saveRec := postForm(t, srv, "/templates/"+copied.ID+"/save", cookie, saveForm)
+	if saveRec.Code != http.StatusSeeOther {
+		t.Fatalf("POST template save with layered profile status = %d want %d body=%s", saveRec.Code, http.StatusSeeOther, saveRec.Body.String())
+	}
+
+	deleteGlobalRec := postForm(t, srv, "/settings/agent-profiles/delete", cookie, agentProfileDeleteForm(csrf, "layered_builder"))
+	if deleteGlobalRec.Code != http.StatusAccepted {
+		t.Fatalf("POST global layered profile delete status = %d want %d body=%s", deleteGlobalRec.Code, http.StatusAccepted, deleteGlobalRec.Body.String())
+	}
+	globalRegistry, err := st.ResolveGlobalAgentRegistry(ctx)
+	if err != nil {
+		t.Fatalf("resolve global registry after global delete: %v", err)
+	}
+	if _, ok := agentregistry.ProfileByID(globalRegistry, "layered_builder"); ok {
+		t.Fatalf("layered_builder still resolves globally after deleting global override")
+	}
+	projectRegistry, err := st.ResolveAgentRegistry(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("resolve project registry after global delete: %v", err)
+	}
+	projectProfile, ok := agentregistry.ProfileByID(projectRegistry, "layered_builder")
+	if !ok || projectProfile.Model != "project-layered-model" {
+		t.Fatalf("project profile after global delete = %+v/%v, want project override", projectProfile, ok)
+	}
+	saved, err := st.GetWorkflowTemplate(ctx, copied.ID)
+	if err != nil {
+		t.Fatalf("get saved template after global delete: %v", err)
+	}
+	implementation := saved.Stages[workflowTemplateStageIndex(saved, "implementation")]
+	if implementation.ProfileID != "layered_builder" {
+		t.Fatalf("implementation profile_id after global delete = %q, want layered_builder", implementation.ProfileID)
+	}
+}
+
+func TestAgentProfileEditorRejectsGlobalDeleteWhenAnyProjectWouldLoseReferencedProfile(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
+	cookie, csrf := getCSRFToken(t, srv)
+	if _, err := st.EnsureProject(ctx, store.ProjectSpec{ID: "other", Name: "Other project", WorkspacePath: t.TempDir(), QueueAutoWhenReady: true, QueueMaxConcurrent: 1, QueueBacklogCap: 10}); err != nil {
+		t.Fatalf("ensure other project: %v", err)
+	}
+
+	globalRec := postForm(t, srv, "/settings/agent-profiles", cookie, agentProfileForm(csrf, "global_only_builder", "Global-only builder", "implementation", "global-only-model", "global persona", "global instructions", "implementation"))
+	if globalRec.Code != http.StatusAccepted {
+		t.Fatalf("POST global-only profile status = %d want %d body=%s", globalRec.Code, http.StatusAccepted, globalRec.Body.String())
+	}
+	projectRec := postForm(t, srv, "/projects/default/settings/agent-profiles", cookie, agentProfileForm(csrf, "global_only_builder", "Default project builder", "implementation", "default-project-model", "default persona", "default instructions", "implementation"))
+	if projectRec.Code != http.StatusAccepted {
+		t.Fatalf("POST default project profile status = %d want %d body=%s", projectRec.Code, http.StatusAccepted, projectRec.Body.String())
+	}
+	copied, err := st.CopyWorkflowTemplate(ctx, workflow.BalancedPRDeliveryID, "global_delete_other_project_guard", "Global Delete Other Project Guard")
+	if err != nil {
+		t.Fatalf("copy workflow template: %v", err)
+	}
+	saveForm := workflowTemplateSaveForm(copied, csrf)
+	saveForm.Set("profile_id_implementation", "global_only_builder")
+	saveRec := postForm(t, srv, "/templates/"+copied.ID+"/save", cookie, saveForm)
+	if saveRec.Code != http.StatusSeeOther {
+		t.Fatalf("POST template save with global-only profile status = %d want %d body=%s", saveRec.Code, http.StatusSeeOther, saveRec.Body.String())
+	}
+
+	deleteGlobalRec := postForm(t, srv, "/settings/agent-profiles/delete", cookie, agentProfileDeleteForm(csrf, "global_only_builder"))
+	if deleteGlobalRec.Code != http.StatusBadRequest {
+		t.Fatalf("POST global-only profile delete status = %d want %d body=%s", deleteGlobalRec.Code, http.StatusBadRequest, deleteGlobalRec.Body.String())
+	}
+	assertContains(t, deleteGlobalRec.Body.String(), "cannot delete profile global_only_builder")
+	assertContains(t, deleteGlobalRec.Body.String(), "Global Delete Other Project Guard")
+	assertContains(t, deleteGlobalRec.Body.String(), "Other project (other)")
+	globalRegistry, err := st.ResolveGlobalAgentRegistry(ctx)
+	if err != nil {
+		t.Fatalf("resolve global registry after rejected global delete: %v", err)
+	}
+	if _, ok := agentregistry.ProfileByID(globalRegistry, "global_only_builder"); !ok {
+		t.Fatalf("global_only_builder missing after rejected global delete")
+	}
+}
+
 func TestSystemSettingsExternalSinkCreationSealsSecretAndShowsWebhookSecretOnce(t *testing.T) {
 	ctx := context.Background()
 	st := openRouteTestStore(t)
@@ -1910,6 +2183,14 @@ func agentProfileForm(csrf, id, name, role, model, prompt, defaultInstructions, 
 		"default_instructions":  {defaultInstructions},
 		"suggested_stage_types": {suggestedStages},
 	}
+}
+
+func agentProfileDeleteForm(csrf, id string) url.Values {
+	return url.Values{"_csrf": {csrf}, "profile_id": {id}}
+}
+
+func csrfOnlyForm(csrf string) url.Values {
+	return url.Values{"_csrf": {csrf}}
 }
 
 func workflowTemplateSaveForm(template workflow.Template, csrf string) url.Values {

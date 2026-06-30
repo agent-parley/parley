@@ -236,9 +236,22 @@ func (s *Server) handleProjectSettingsPath(w http.ResponseWriter, r *http.Reques
 		s.handleProjectNotificationSettingsSave(w, r, projectID)
 		return
 	}
-	if len(parts) == 1 && parts[0] == "agent-profiles" {
-		s.handleProjectAgentProfileSave(w, r, projectID)
-		return
+	if parts[0] == "agent-profiles" {
+		if len(parts) == 1 {
+			s.handleProjectAgentProfileSave(w, r, projectID)
+			return
+		}
+		if len(parts) == 2 {
+			switch parts[1] {
+			case "delete":
+				s.handleProjectAgentProfileDelete(w, r, projectID)
+			case "clear-default":
+				s.handleProjectAgentProfileClearDefault(w, r, projectID)
+			default:
+				http.NotFound(w, r)
+			}
+			return
+		}
 	}
 	if len(parts) == 2 && parts[0] == "memory" && parts[1] == "export" {
 		s.handleProjectMemoryExport(w, r, projectID)

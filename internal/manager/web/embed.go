@@ -111,7 +111,10 @@ type AgentProfileEditorData struct {
 	Profiles         []AgentProfileFormData
 	Create           AgentProfileFormData
 	SavePath         string
+	DeletePath       string
+	ClearDefaultPath string
 	DefaultProfileID string
+	CanClearDefault  bool
 	Notice           string
 	Status           string
 	CSRF             string
@@ -132,6 +135,8 @@ type AgentProfileFormData struct {
 	SuggestedStageTypes string
 	Layer               string
 	IsDefault           bool
+	CanDelete           bool
+	DeleteLabel         string
 }
 
 type NotificationSinkData struct {
