@@ -13,57 +13,72 @@
   {{end}}
   <div class="agent-profile-list">
     {{range .Profiles}}
-    <form class="agent-profile-card" method="post" action="{{$.SavePath}}" data-on:submit="@post('{{$.SavePath}}', {contentType: 'form'})">
-      <input type="hidden" name="_csrf" value="{{$.CSRF}}" data-bind:csrf>
-      <div class="template-card-head">
-        <div>
-          <h3>{{.Name}} <span class="safety-tag small">{{.Layer}}</span></h3>
-          <p class="muted"><code>{{.ID}}</code>{{if .IsDefault}} · default profile{{end}}</p>
+    <article class="agent-profile-card">
+      <form method="post" action="{{$.SavePath}}" data-on:submit="@post('{{$.SavePath}}', {contentType: 'form'})">
+        <input type="hidden" name="_csrf" value="{{$.CSRF}}" data-bind:csrf>
+        <div class="template-card-head">
+          <div>
+            <h3>{{.Name}} <span class="safety-tag small">{{.Layer}}</span></h3>
+            <p class="muted"><code>{{.ID}}</code>{{if .IsDefault}} · default profile{{end}}</p>
+          </div>
+          <button type="submit">Save profile</button>
         </div>
-        <button type="submit">Save profile</button>
-      </div>
-      <div class="agent-profile-grid">
-        <label>Profile ID
-          <input name="profile_id" value="{{.ID}}" readonly>
+        <div class="agent-profile-grid">
+          <label>Profile ID
+            <input name="profile_id" value="{{.ID}}" readonly>
+          </label>
+          <label>Family
+            <select name="family_id">
+              <option value="pi" {{if eq .FamilyID "pi"}}selected{{end}}>Pi</option>
+            </select>
+          </label>
+          <label>Name
+            <input name="name" required value="{{.Name}}">
+          </label>
+          <label>Role
+            <input name="role" required value="{{.Role}}" placeholder="implementation, review, validation-support">
+          </label>
+          <label>Model
+            <input name="model" value="{{.Model}}" placeholder="Optional model hint">
+          </label>
+          <label>Context policy
+            <input name="context_policy" required value="{{.ContextPolicy}}">
+          </label>
+          <label>Output style
+            <input name="output_style" required value="{{.OutputStyle}}">
+          </label>
+        </div>
+        <label>Description
+          <textarea name="description" rows="2">{{.Description}}</textarea>
         </label>
-        <label>Family
-          <select name="family_id">
-            <option value="pi" {{if eq .FamilyID "pi"}}selected{{end}}>Pi</option>
-          </select>
+        <label>Role / persona prompt
+          <textarea name="prompt" rows="3">{{.Prompt}}</textarea>
         </label>
-        <label>Name
-          <input name="name" required value="{{.Name}}">
+        <label>Default instructions
+          <textarea name="default_instructions" rows="3">{{.DefaultInstructions}}</textarea>
         </label>
-        <label>Role
-          <input name="role" required value="{{.Role}}" placeholder="implementation, review, validation-support">
+        <label>Suggested stage tags
+          <input name="suggested_stage_types" value="{{.SuggestedStageTypes}}" placeholder="implementation, review">
         </label>
-        <label>Model
-          <input name="model" value="{{.Model}}" placeholder="Optional model hint">
-        </label>
-        <label>Context policy
-          <input name="context_policy" required value="{{.ContextPolicy}}">
-        </label>
-        <label>Output style
-          <input name="output_style" required value="{{.OutputStyle}}">
-        </label>
-      </div>
-      <label>Description
-        <textarea name="description" rows="2">{{.Description}}</textarea>
-      </label>
-      <label>Role / persona prompt
-        <textarea name="prompt" rows="3">{{.Prompt}}</textarea>
-      </label>
-      <label>Default instructions
-        <textarea name="default_instructions" rows="3">{{.DefaultInstructions}}</textarea>
-      </label>
-      <label>Suggested stage tags
-        <input name="suggested_stage_types" value="{{.SuggestedStageTypes}}" placeholder="implementation, review">
-      </label>
-      <div class="settings-actions single-action">
-        <label class="checkbox-line"><input type="checkbox" name="headless" value="1" {{if .Headless}}checked{{end}}> Headless profile</label>
-        <label class="checkbox-line"><input type="checkbox" name="default_profile" value="1" {{if .IsDefault}}checked{{end}}> Use as default profile</label>
-      </div>
-    </form>
+        <div class="settings-actions single-action">
+          <label class="checkbox-line"><input type="checkbox" name="headless" value="1" {{if .Headless}}checked{{end}}> Headless profile</label>
+          <label class="checkbox-line"><input type="checkbox" name="default_profile" value="1" {{if .IsDefault}}checked{{end}}> Use as default profile</label>
+        </div>
+      </form>
+      {{if and .IsDefault $.CanClearDefault}}
+      <form class="settings-actions single-action" method="post" action="{{$.ClearDefaultPath}}" data-on:submit="@post('{{$.ClearDefaultPath}}', {contentType: 'form'})">
+        <input type="hidden" name="_csrf" value="{{$.CSRF}}" data-bind:csrf>
+        <button type="submit">Clear default override</button>
+      </form>
+      {{end}}
+      {{if .CanDelete}}
+      <form class="settings-actions single-action" method="post" action="{{$.DeletePath}}" data-on:submit="@post('{{$.DeletePath}}', {contentType: 'form'})">
+        <input type="hidden" name="_csrf" value="{{$.CSRF}}" data-bind:csrf>
+        <input type="hidden" name="profile_id" value="{{.ID}}">
+        <button type="submit">{{.DeleteLabel}}</button>
+      </form>
+      {{end}}
+    </article>
     {{end}}
   </div>
   <form class="agent-profile-card create-profile-card" method="post" action="{{.SavePath}}" data-on:submit="@post('{{.SavePath}}', {contentType: 'form'})">
