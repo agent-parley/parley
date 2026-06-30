@@ -21,10 +21,7 @@ type projectMemoryEntryUniqueKey struct {
 }
 
 func (s *Store) ApplyProjectMemoryUpdate(ctx context.Context, update ProjectMemoryUpdate) (ProjectMemoryUpdateResult, error) {
-	update.ProjectID = strings.TrimSpace(update.ProjectID)
-	update.RunID = strings.TrimSpace(update.RunID)
-	update.TaskID = strings.TrimSpace(update.TaskID)
-	update.CuratorStageID = strings.TrimSpace(update.CuratorStageID)
+	update = normalizeProjectMemoryUpdate(update)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -34,6 +31,54 @@ func (s *Store) ApplyProjectMemoryUpdate(ctx context.Context, update ProjectMemo
 	}
 	defer rollback(tx)
 
+	result, err := applyProjectMemoryUpdateTx(ctx, tx, update)
+	if err != nil {
+		return ProjectMemoryUpdateResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return ProjectMemoryUpdateResult{}, fmt.Errorf("commit project memory update: %w", err)
+	}
+	return result, nil
+}
+
+// ApplyProjectMemoryUpdateGuarded applies a project-memory update and runs a
+// store-free validation callback before committing it. The callback must not
+// call Store methods, because the store mutex is held for the transaction.
+func (s *Store) ApplyProjectMemoryUpdateGuarded(ctx context.Context, update ProjectMemoryUpdate, validate func(ProjectMemoryUpdateResult) error) (ProjectMemoryUpdateResult, error) {
+	update = normalizeProjectMemoryUpdate(update)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ProjectMemoryUpdateResult{}, fmt.Errorf("begin guarded project memory update: %w", err)
+	}
+	defer rollback(tx)
+
+	result, err := applyProjectMemoryUpdateTx(ctx, tx, update)
+	if err != nil {
+		return ProjectMemoryUpdateResult{}, err
+	}
+	if validate != nil {
+		if err := validate(result); err != nil {
+			return result, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ProjectMemoryUpdateResult{}, fmt.Errorf("commit guarded project memory update: %w", err)
+	}
+	return result, nil
+}
+
+func normalizeProjectMemoryUpdate(update ProjectMemoryUpdate) ProjectMemoryUpdate {
+	update.ProjectID = strings.TrimSpace(update.ProjectID)
+	update.RunID = strings.TrimSpace(update.RunID)
+	update.TaskID = strings.TrimSpace(update.TaskID)
+	update.CuratorStageID = strings.TrimSpace(update.CuratorStageID)
+	return update
+}
+
+func applyProjectMemoryUpdateTx(ctx context.Context, tx *sql.Tx, update ProjectMemoryUpdate) (ProjectMemoryUpdateResult, error) {
 	if err := validateProjectMemoryCuratorStageTx(ctx, tx, update); err != nil {
 		return ProjectMemoryUpdateResult{}, err
 	}
@@ -97,7 +142,9 @@ ON CONFLICT(project_id, kind, title) DO UPDATE SET body = excluded.body, source_
 		if err != nil {
 			return ProjectMemoryUpdateResult{}, err
 		}
+		applied := persisted
 		result.Revert.Entries[revertIndex].AppliedID = persisted.ID
+		result.Revert.Entries[revertIndex].Applied = &applied
 		result.Entries = append(result.Entries, persisted)
 		result.Outcomes = append(result.Outcomes, ProjectMemoryWriteOutcome{Entry: &persisted})
 		if entry.CandidateID != "" {
@@ -111,52 +158,56 @@ ON CONFLICT(project_id, kind, title) DO UPDATE SET body = excluded.body, source_
 		}
 		result.Decisions = decisions
 	}
-	if err := tx.Commit(); err != nil {
-		return ProjectMemoryUpdateResult{}, fmt.Errorf("commit project memory update: %w", err)
-	}
 	return result, nil
 }
 
-func (s *Store) RollbackProjectMemoryUpdate(ctx context.Context, revert ProjectMemoryUpdateRevert) error {
+func (s *Store) RollbackProjectMemoryUpdate(ctx context.Context, revert ProjectMemoryUpdateRevert) (ProjectMemoryRollbackOutcome, error) {
+	outcome := ProjectMemoryRollbackOutcome{}
 	if len(revert.Entries) == 0 && len(revert.Decisions) == 0 {
-		return nil
+		return outcome, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin project memory update rollback: %w", err)
+		return outcome, fmt.Errorf("begin project memory update rollback: %w", err)
 	}
 	defer rollback(tx)
 
 	for i := len(revert.Decisions) - 1; i >= 0; i-- {
 		decision := revert.Decisions[i]
+		var skipped *ProjectMemorySkippedRevert
 		if decision.Previous == nil {
-			if err := deleteProjectMemoryDecisionRevertTx(ctx, tx, decision); err != nil {
-				return err
-			}
-			continue
+			skipped, err = deleteProjectMemoryDecisionRevertTx(ctx, tx, decision)
+		} else {
+			skipped, err = restoreProjectMemoryDecisionRevertTx(ctx, tx, decision)
 		}
-		if err := restoreProjectMemoryDecisionTx(ctx, tx, *decision.Previous); err != nil {
-			return err
+		if err != nil {
+			return outcome, err
+		}
+		if skipped != nil {
+			outcome.Skipped = append(outcome.Skipped, *skipped)
 		}
 	}
 	for i := len(revert.Entries) - 1; i >= 0; i-- {
 		entry := revert.Entries[i]
+		var skipped *ProjectMemorySkippedRevert
 		if entry.Previous == nil {
-			if err := deleteProjectMemoryEntryRevertTx(ctx, tx, entry); err != nil {
-				return err
-			}
-			continue
+			skipped, err = deleteProjectMemoryEntryRevertTx(ctx, tx, entry)
+		} else {
+			skipped, err = restoreProjectMemoryEntryRevertTx(ctx, tx, entry)
 		}
-		if err := restoreProjectMemoryEntryTx(ctx, tx, *entry.Previous); err != nil {
-			return err
+		if err != nil {
+			return outcome, err
+		}
+		if skipped != nil {
+			outcome.Skipped = append(outcome.Skipped, *skipped)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit project memory update rollback: %w", err)
+		return outcome, fmt.Errorf("commit project memory update rollback: %w", err)
 	}
-	return nil
+	return outcome, nil
 }
 
 func (s *Store) ListProjectMemoryEntries(ctx context.Context, projectID string) ([]ProjectMemoryEntry, error) {
@@ -516,7 +567,9 @@ ON CONFLICT(curator_stage_id, candidate_id) DO UPDATE SET action = excluded.acti
 			return nil, err
 		}
 		if revert != nil && revertIndex >= 0 {
+			applied := record
 			revert.Decisions[revertIndex].AppliedID = record.ID
+			revert.Decisions[revertIndex].Applied = &applied
 		}
 		records = append(records, record)
 	}
@@ -702,19 +755,66 @@ func rejectionTitle(input ProjectMemoryInput) string {
 	return title
 }
 
-func deleteProjectMemoryEntryRevertTx(ctx context.Context, tx *sql.Tx, revert ProjectMemoryEntryRevert) error {
+const projectMemoryRollbackSkippedReason = "concurrently modified, rollback skipped"
+
+func deleteProjectMemoryEntryRevertTx(ctx context.Context, tx *sql.Tx, revert ProjectMemoryEntryRevert) (*ProjectMemorySkippedRevert, error) {
+	if skipped, err := skippedProjectMemoryEntryRevertTx(ctx, tx, revert); skipped != nil || err != nil {
+		return skipped, err
+	}
 	if revert.AppliedID != "" {
 		_, err := tx.ExecContext(ctx, `DELETE FROM project_memory_entries WHERE id = ?`, revert.AppliedID)
 		if err != nil {
-			return fmt.Errorf("delete rolled-back project memory entry: %w", err)
+			return nil, fmt.Errorf("delete rolled-back project memory entry: %w", err)
 		}
-		return nil
+		return nil, nil
 	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM project_memory_entries WHERE project_id = ? AND kind = ? AND title = ?`, revert.ProjectID, revert.Kind, revert.Title)
 	if err != nil {
-		return fmt.Errorf("delete rolled-back project memory entry: %w", err)
+		return nil, fmt.Errorf("delete rolled-back project memory entry: %w", err)
 	}
-	return nil
+	return nil, nil
+}
+
+func restoreProjectMemoryEntryRevertTx(ctx context.Context, tx *sql.Tx, revert ProjectMemoryEntryRevert) (*ProjectMemorySkippedRevert, error) {
+	if skipped, err := skippedProjectMemoryEntryRevertTx(ctx, tx, revert); skipped != nil || err != nil {
+		return skipped, err
+	}
+	if revert.Previous == nil {
+		return nil, fmt.Errorf("restore project memory entry revert missing previous entry")
+	}
+	return nil, restoreProjectMemoryEntryTx(ctx, tx, *revert.Previous)
+}
+
+func skippedProjectMemoryEntryRevertTx(ctx context.Context, tx *sql.Tx, revert ProjectMemoryEntryRevert) (*ProjectMemorySkippedRevert, error) {
+	if revert.Applied == nil {
+		return nil, nil
+	}
+	appliedID := strings.TrimSpace(revert.AppliedID)
+	if appliedID == "" {
+		appliedID = strings.TrimSpace(revert.Applied.ID)
+	}
+	if appliedID == "" {
+		return nil, nil
+	}
+	current, found, err := lookupProjectMemoryEntryByIDTx(ctx, tx, appliedID)
+	if err != nil {
+		return nil, err
+	}
+	if !found || !projectMemoryEntrySnapshotsMatch(current, *revert.Applied) {
+		skipped := projectMemoryEntrySkippedRevert(revert)
+		return &skipped, nil
+	}
+	return nil, nil
+}
+
+func projectMemoryEntrySkippedRevert(revert ProjectMemoryEntryRevert) ProjectMemorySkippedRevert {
+	return ProjectMemorySkippedRevert{
+		Kind:       "entry",
+		ProjectID:  revert.ProjectID,
+		MemoryKind: revert.Kind,
+		Title:      revert.Title,
+		Reason:     projectMemoryRollbackSkippedReason,
+	}
 }
 
 func restoreProjectMemoryEntryTx(ctx context.Context, tx *sql.Tx, entry ProjectMemoryEntry) error {
@@ -737,6 +837,34 @@ func lookupProjectMemoryEntryTx(ctx context.Context, tx *sql.Tx, projectID, kind
 		return ProjectMemoryEntry{}, false, fmt.Errorf("lookup project memory entry: %w", err)
 	}
 	return entry, true, nil
+}
+
+func lookupProjectMemoryEntryByIDTx(ctx context.Context, tx *sql.Tx, id string) (ProjectMemoryEntry, bool, error) {
+	row := tx.QueryRowContext(ctx, `SELECT id, project_id, kind, title, body, source_run_id, source_task_id, source_stage_id, source_artifact_id, curator_stage_id, source_summary, created_at, updated_at FROM project_memory_entries WHERE id = ?`, id)
+	entry, err := scanProjectMemoryEntry(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ProjectMemoryEntry{}, false, nil
+		}
+		return ProjectMemoryEntry{}, false, fmt.Errorf("lookup project memory entry by id: %w", err)
+	}
+	return entry, true, nil
+}
+
+func projectMemoryEntrySnapshotsMatch(a, b ProjectMemoryEntry) bool {
+	return a.ID == b.ID &&
+		a.ProjectID == b.ProjectID &&
+		a.Kind == b.Kind &&
+		a.Title == b.Title &&
+		a.Body == b.Body &&
+		a.SourceRunID == b.SourceRunID &&
+		a.SourceTaskID == b.SourceTaskID &&
+		a.SourceStageID == b.SourceStageID &&
+		a.SourceArtifactID == b.SourceArtifactID &&
+		a.CuratorStageID == b.CuratorStageID &&
+		a.SourceSummary == b.SourceSummary &&
+		a.CreatedAt == b.CreatedAt &&
+		a.UpdatedAt == b.UpdatedAt
 }
 
 func getProjectMemoryEntryTx(ctx context.Context, tx *sql.Tx, projectID, kind, title string) (ProjectMemoryEntry, error) {
@@ -762,19 +890,63 @@ func scanProjectMemoryEntry(scanner memoryEntryScanner) (ProjectMemoryEntry, err
 	return entry, nil
 }
 
-func deleteProjectMemoryDecisionRevertTx(ctx context.Context, tx *sql.Tx, revert ProjectMemoryDecisionRevert) error {
+func deleteProjectMemoryDecisionRevertTx(ctx context.Context, tx *sql.Tx, revert ProjectMemoryDecisionRevert) (*ProjectMemorySkippedRevert, error) {
+	if skipped, err := skippedProjectMemoryDecisionRevertTx(ctx, tx, revert); skipped != nil || err != nil {
+		return skipped, err
+	}
 	if revert.AppliedID != "" {
 		_, err := tx.ExecContext(ctx, `DELETE FROM project_memory_candidate_decisions WHERE id = ?`, revert.AppliedID)
 		if err != nil {
-			return fmt.Errorf("delete rolled-back project memory decision: %w", err)
+			return nil, fmt.Errorf("delete rolled-back project memory decision: %w", err)
 		}
-		return nil
+		return nil, nil
 	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM project_memory_candidate_decisions WHERE curator_stage_id = ? AND candidate_id = ?`, revert.CuratorStageID, revert.CandidateID)
 	if err != nil {
-		return fmt.Errorf("delete rolled-back project memory decision: %w", err)
+		return nil, fmt.Errorf("delete rolled-back project memory decision: %w", err)
 	}
-	return nil
+	return nil, nil
+}
+
+func restoreProjectMemoryDecisionRevertTx(ctx context.Context, tx *sql.Tx, revert ProjectMemoryDecisionRevert) (*ProjectMemorySkippedRevert, error) {
+	if skipped, err := skippedProjectMemoryDecisionRevertTx(ctx, tx, revert); skipped != nil || err != nil {
+		return skipped, err
+	}
+	if revert.Previous == nil {
+		return nil, fmt.Errorf("restore project memory decision revert missing previous decision")
+	}
+	return nil, restoreProjectMemoryDecisionTx(ctx, tx, *revert.Previous)
+}
+
+func skippedProjectMemoryDecisionRevertTx(ctx context.Context, tx *sql.Tx, revert ProjectMemoryDecisionRevert) (*ProjectMemorySkippedRevert, error) {
+	if revert.Applied == nil {
+		return nil, nil
+	}
+	appliedID := strings.TrimSpace(revert.AppliedID)
+	if appliedID == "" {
+		appliedID = strings.TrimSpace(revert.Applied.ID)
+	}
+	if appliedID == "" {
+		return nil, nil
+	}
+	current, found, err := lookupProjectMemoryDecisionByIDTx(ctx, tx, appliedID)
+	if err != nil {
+		return nil, err
+	}
+	if !found || !projectMemoryDecisionSnapshotsMatch(current, *revert.Applied) {
+		skipped := projectMemoryDecisionSkippedRevert(revert)
+		return &skipped, nil
+	}
+	return nil, nil
+}
+
+func projectMemoryDecisionSkippedRevert(revert ProjectMemoryDecisionRevert) ProjectMemorySkippedRevert {
+	return ProjectMemorySkippedRevert{
+		Kind:           "decision",
+		CuratorStageID: revert.CuratorStageID,
+		CandidateID:    revert.CandidateID,
+		Reason:         projectMemoryRollbackSkippedReason,
+	}
 }
 
 func restoreProjectMemoryDecisionTx(ctx context.Context, tx *sql.Tx, decision ProjectMemoryDecisionRecord) error {
@@ -797,6 +969,38 @@ func lookupProjectMemoryDecisionTx(ctx context.Context, tx *sql.Tx, curatorStage
 		return ProjectMemoryDecisionRecord{}, false, fmt.Errorf("lookup project memory decision: %w", err)
 	}
 	return decision, true, nil
+}
+
+func lookupProjectMemoryDecisionByIDTx(ctx context.Context, tx *sql.Tx, id string) (ProjectMemoryDecisionRecord, bool, error) {
+	row := tx.QueryRowContext(ctx, `SELECT id, project_id, run_id, task_id, curator_stage_id, candidate_id, action, outcome, kind, title, body, reason, source_stage_id, source_artifact_id, source_summary, COALESCE(entry_id, ''), created_at FROM project_memory_candidate_decisions WHERE id = ?`, id)
+	decision, err := scanProjectMemoryDecision(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ProjectMemoryDecisionRecord{}, false, nil
+		}
+		return ProjectMemoryDecisionRecord{}, false, fmt.Errorf("lookup project memory decision by id: %w", err)
+	}
+	return decision, true, nil
+}
+
+func projectMemoryDecisionSnapshotsMatch(a, b ProjectMemoryDecisionRecord) bool {
+	return a.ID == b.ID &&
+		a.ProjectID == b.ProjectID &&
+		a.RunID == b.RunID &&
+		a.TaskID == b.TaskID &&
+		a.CuratorStageID == b.CuratorStageID &&
+		a.CandidateID == b.CandidateID &&
+		a.Action == b.Action &&
+		a.Outcome == b.Outcome &&
+		a.Kind == b.Kind &&
+		a.Title == b.Title &&
+		a.Body == b.Body &&
+		a.Reason == b.Reason &&
+		a.SourceStageID == b.SourceStageID &&
+		a.SourceArtifactID == b.SourceArtifactID &&
+		a.SourceSummary == b.SourceSummary &&
+		a.EntryID == b.EntryID &&
+		a.CreatedAt == b.CreatedAt
 }
 
 func getProjectMemoryDecisionTx(ctx context.Context, tx *sql.Tx, curatorStageID, candidateID string) (ProjectMemoryDecisionRecord, error) {

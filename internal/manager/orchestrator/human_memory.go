@@ -49,30 +49,33 @@ func (e *Engine) submitHumanMemoryApproval(ctx context.Context, wr store.Workflo
 		wr.Run.Status = store.RunStatusAwaitingHuman
 		_ = e.store.UpdateStageStatus(context.Background(), runtimeStage.Stage.ID, store.StageStatusRunning)
 	}
-	result, err := e.store.ApplyProjectMemoryUpdate(ctx, store.ProjectMemoryUpdate{
+	var rep report.Report
+	result, err := e.store.ApplyProjectMemoryUpdateGuarded(ctx, store.ProjectMemoryUpdate{
 		ProjectID:      wr.Run.ProjectID,
 		RunID:          wr.Run.ID,
 		TaskID:         wr.Task.ID,
 		CuratorStageID: runtimeStage.Stage.ID,
 		Entries:        plan.approvedEntries,
 		Decisions:      plan.decisions,
+	}, func(result store.ProjectMemoryUpdateResult) error {
+		var err error
+		rep, err = humanMemoryApprovalReport(wr, runtimeStage.Stage, runtimeStage.Template, submission, plan, result)
+		if err != nil {
+			return err
+		}
+		if err := rep.Validate(); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidHumanReview, err)
+		}
+		return nil
 	})
 	if err != nil {
 		rollbackResume()
 		return report.Report{}, err
 	}
 	rollbackAppliedUpdate := func() {
-		_ = e.store.RollbackProjectMemoryUpdate(context.Background(), result.Revert)
+		outcome, _ := e.store.RollbackProjectMemoryUpdate(context.Background(), result.Revert)
+		e.emitProjectMemoryRollbackSkipped(context.Background(), wr, outcome)
 		rollbackResume()
-	}
-	rep, err := humanMemoryApprovalReport(wr, runtimeStage.Stage, runtimeStage.Template, submission, plan, result)
-	if err != nil {
-		rollbackAppliedUpdate()
-		return report.Report{}, err
-	}
-	if err := rep.Validate(); err != nil {
-		rollbackAppliedUpdate()
-		return report.Report{}, fmt.Errorf("%w: %v", ErrInvalidHumanReview, err)
 	}
 	if err := e.completeStage(ctx, wr, runtimeStage.Stage, rep); err != nil {
 		rollbackAppliedUpdate()
@@ -92,6 +95,16 @@ func (e *Engine) submitHumanMemoryApproval(ctx context.Context, wr store.Workflo
 	}
 	e.resumeRunAfterHumanStage(wr.Run.ID, runtimeStage.Template.ID)
 	return rep, nil
+}
+
+func (e *Engine) emitProjectMemoryRollbackSkipped(ctx context.Context, wr store.WorkflowRun, outcome store.ProjectMemoryRollbackOutcome) {
+	if len(outcome.Skipped) == 0 {
+		return
+	}
+	_, _ = e.emit(ctx, runEvent(wr, "memory.rollback_skipped", event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "project memory rollback skipped concurrently modified rows", map[string]any{
+		"skipped_count":   len(outcome.Skipped),
+		"skipped_reverts": outcome.Skipped,
+	}))
 }
 
 func (e *Engine) humanMemoryApprovalPlan(ctx context.Context, runID, stageID string, submission HumanReviewSubmission) (humanMemoryApprovalPlan, error) {

@@ -778,6 +778,170 @@ func TestProjectMemoryIsSQLiteOnlyAndCuratorGated(t *testing.T) {
 	}
 }
 
+func TestApplyProjectMemoryUpdateGuardedRollsBackOnValidationFailure(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "learn from a run", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sourceReport := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		StageID:       wr.ImplementationStage.ID,
+		StageType:     wr.ImplementationStage.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: "noop"},
+		Status:        report.StatusCompleted,
+		Summary:       "implementation found reusable memory",
+		Payload:       map[string]any{},
+		Errors:        []string{},
+	}
+	sourceArtifact, err := st.SaveReportArtifact(ctx, sourceReport)
+	if err != nil {
+		t.Fatalf("save source report: %v", err)
+	}
+	validationErr := errors.New("forced report validation failure")
+	called := false
+	result, err := st.ApplyProjectMemoryUpdateGuarded(ctx, ProjectMemoryUpdate{
+		ProjectID:      wr.Run.ProjectID,
+		RunID:          wr.Run.ID,
+		TaskID:         wr.Task.ID,
+		CuratorStageID: wr.MemoryUpdateStage.ID,
+		Entries: []ProjectMemoryInput{{
+			CandidateID:      "candidate-1",
+			Kind:             ProjectMemoryKindLesson,
+			Title:            "Atomic validation rollback",
+			Body:             "This entry must roll back with the guarded transaction.",
+			SourceStageID:    wr.ImplementationStage.ID,
+			SourceArtifactID: sourceArtifact.ID,
+			SourceSummary:    "implementation report",
+		}},
+		Decisions: []ProjectMemoryDecisionInput{{
+			CandidateID:      "candidate-1",
+			Action:           ProjectMemoryDecisionApprove,
+			Kind:             ProjectMemoryKindLesson,
+			Title:            "Atomic validation rollback",
+			Body:             "This entry must roll back with the guarded transaction.",
+			SourceStageID:    wr.ImplementationStage.ID,
+			SourceArtifactID: sourceArtifact.ID,
+			SourceSummary:    "implementation report",
+		}},
+	}, func(result ProjectMemoryUpdateResult) error {
+		called = true
+		if len(result.Entries) != 1 || len(result.Decisions) != 1 {
+			t.Fatalf("guarded validation result = %#v, want one entry and one decision", result)
+		}
+		return validationErr
+	})
+	if !errors.Is(err, validationErr) {
+		t.Fatalf("guarded apply error = %v, want %v", err, validationErr)
+	}
+	if !called {
+		t.Fatal("guarded validation callback was not called")
+	}
+	if len(result.Revert.Entries) != 1 || len(result.Revert.Decisions) != 1 {
+		t.Fatalf("guarded result revert = %#v, want captured revert token", result.Revert)
+	}
+	entries, err := st.ListProjectMemoryEntries(ctx, wr.Run.ProjectID)
+	if err != nil {
+		t.Fatalf("list memory entries: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("guarded validation failure persisted entries = %#v, want none", entries)
+	}
+	decisions, err := st.ListProjectMemoryDecisions(ctx, wr.Run.ID)
+	if err != nil {
+		t.Fatalf("list memory decisions: %v", err)
+	}
+	if len(decisions) != 0 {
+		t.Fatalf("guarded validation failure persisted decisions = %#v, want none", decisions)
+	}
+}
+
+func TestRollbackProjectMemoryUpdateSkipsConcurrentSameKeyEntryWrite(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	wr, err := st.CreateWorkflowRunInput(ctx, contract.TaskInput{Idea: "learn from a run", WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sourceReport := report.Report{
+		SchemaVersion: report.SchemaVersion,
+		RunID:         wr.Run.ID,
+		TaskID:        wr.Task.ID,
+		AttemptID:     wr.Attempt.ID,
+		StageID:       wr.ImplementationStage.ID,
+		StageType:     wr.ImplementationStage.StageType,
+		Actor:         report.Actor{Kind: report.ActorKindAgent, ID: "noop"},
+		Status:        report.StatusCompleted,
+		Summary:       "implementation found reusable memory",
+		Payload:       map[string]any{},
+		Errors:        []string{},
+	}
+	sourceArtifact, err := st.SaveReportArtifact(ctx, sourceReport)
+	if err != nil {
+		t.Fatalf("save source report: %v", err)
+	}
+	applied, err := st.ApplyProjectMemoryUpdate(ctx, ProjectMemoryUpdate{
+		ProjectID:      wr.Run.ProjectID,
+		RunID:          wr.Run.ID,
+		TaskID:         wr.Task.ID,
+		CuratorStageID: wr.MemoryUpdateStage.ID,
+		Entries: []ProjectMemoryInput{{
+			Kind:             ProjectMemoryKindGotcha,
+			Title:            "Validation image needs git",
+			Body:             "Rollback should not delete this once another writer updates it.",
+			SourceStageID:    wr.ImplementationStage.ID,
+			SourceArtifactID: sourceArtifact.ID,
+			SourceSummary:    "first apply",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("apply memory update: %v", err)
+	}
+	concurrentBody := "Concurrent same-key write must survive the compensating rollback."
+	if _, err := st.ApplyProjectMemoryUpdate(ctx, ProjectMemoryUpdate{
+		ProjectID:      wr.Run.ProjectID,
+		RunID:          wr.Run.ID,
+		TaskID:         wr.Task.ID,
+		CuratorStageID: wr.MemoryUpdateStage.ID,
+		Entries: []ProjectMemoryInput{{
+			Kind:             ProjectMemoryKindGotcha,
+			Title:            "Validation image needs git",
+			Body:             concurrentBody,
+			SourceStageID:    wr.ImplementationStage.ID,
+			SourceArtifactID: sourceArtifact.ID,
+			SourceSummary:    "concurrent apply",
+		}},
+	}); err != nil {
+		t.Fatalf("concurrent memory update: %v", err)
+	}
+	rollback, err := st.RollbackProjectMemoryUpdate(ctx, applied.Revert)
+	if err != nil {
+		t.Fatalf("rollback memory update: %v", err)
+	}
+	if len(rollback.Skipped) != 1 || rollback.Skipped[0].Kind != "entry" || rollback.Skipped[0].Title != "Validation image needs git" {
+		t.Fatalf("rollback skipped = %#v, want one skipped entry", rollback.Skipped)
+	}
+	entries, err := st.ListProjectMemoryEntries(ctx, wr.Run.ProjectID)
+	if err != nil {
+		t.Fatalf("list memory entries: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Body != concurrentBody || entries[0].SourceSummary != "concurrent apply" {
+		t.Fatalf("entries after skipped rollback = %#v, want concurrent write", entries)
+	}
+}
+
 func TestRollbackProjectMemoryUpdateRestoresPreviousEntriesAndDecisions(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(ctx, t.TempDir())
@@ -859,8 +1023,12 @@ func TestRollbackProjectMemoryUpdateRestoresPreviousEntriesAndDecisions(t *testi
 	if len(update.Revert.Entries) != 2 || len(update.Revert.Decisions) != 2 {
 		t.Fatalf("rollback token entries=%d decisions=%d: %#v", len(update.Revert.Entries), len(update.Revert.Decisions), update.Revert)
 	}
-	if err := st.RollbackProjectMemoryUpdate(ctx, update.Revert); err != nil {
+	rollback, err := st.RollbackProjectMemoryUpdate(ctx, update.Revert)
+	if err != nil {
 		t.Fatalf("rollback memory update: %v", err)
+	}
+	if len(rollback.Skipped) != 0 {
+		t.Fatalf("rollback skipped reverts = %#v, want none", rollback.Skipped)
 	}
 	entries, err := st.ListProjectMemoryEntries(ctx, wr.Run.ProjectID)
 	if err != nil {
