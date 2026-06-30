@@ -173,6 +173,11 @@ type writeRequest struct {
 	binary    []byte
 	hasBinary bool
 	done      chan error
+
+	mu               sync.Mutex
+	acceptedByWriter bool
+	abandoned        bool
+	abandonErr       error
 }
 
 // Session wraps a websocket connection without encoding which side dialed.
@@ -182,7 +187,7 @@ type Session struct {
 	mu       sync.RWMutex
 	handlers map[string]Handler
 
-	writes chan writeRequest
+	writes chan *writeRequest
 	done   chan struct{}
 	once   sync.Once
 }
@@ -192,7 +197,7 @@ func NewSession(conn *websocket.Conn) *Session {
 	return &Session{
 		conn:     conn,
 		handlers: make(map[string]Handler),
-		writes:   make(chan writeRequest, 64),
+		writes:   make(chan *writeRequest, 64),
 		done:     make(chan struct{}),
 	}
 }
@@ -223,7 +228,7 @@ func (s *Session) send(ctx context.Context, msg Message, binary []byte, hasBinar
 	if len(msg.Payload) == 0 {
 		msg.Payload = json.RawMessage(`{}`)
 	}
-	req := writeRequest{ctx: ctx, msg: msg, binary: binary, hasBinary: hasBinary, done: make(chan error, 1)}
+	req := &writeRequest{ctx: ctx, msg: msg, binary: binary, hasBinary: hasBinary, done: make(chan error, 1)}
 	select {
 	case s.writes <- req:
 	case <-s.done:
@@ -235,18 +240,13 @@ func (s *Session) send(ctx context.Context, msg Message, binary []byte, hasBinar
 	case err := <-req.done:
 		return err
 	case <-ctx.Done():
-		return ctx.Err()
+		return req.resultOrAbandon(ctx.Err())
 	case <-s.done:
-		// A peer close can race a write that already completed (e.g. a
-		// receiver that closes the connection immediately after reading the
-		// frame). The writer always reports the outcome on req.done, so honor a
-		// finished write instead of returning a spurious ErrSessionClosed.
-		select {
-		case err := <-req.done:
-			return err
-		default:
-			return ErrSessionClosed
-		}
+		// A peer close can race a write that the writer already accepted. Once
+		// accepted, the writer owns the request and will report whether the frame
+		// was written or failed. Wait for that outcome so callers do not see a
+		// spurious ErrSessionClosed for a delivered message.
+		return req.resultOrAbandon(ErrSessionClosed)
 	}
 }
 
@@ -263,24 +263,101 @@ func (s *Session) Done() <-chan struct{} {
 func (s *Session) writer(ctx context.Context) {
 	for {
 		select {
+		case <-s.done:
+			s.failPendingWrites()
+			return
+		default:
+		}
+		select {
 		case req := <-s.writes:
+			select {
+			case <-s.done:
+				req.abandon(ErrSessionClosed)
+				req.done <- ErrSessionClosed
+				s.failPendingWrites()
+				return
+			case <-req.ctx.Done():
+				req.abandon(req.ctx.Err())
+				req.done <- req.ctx.Err()
+				continue
+			default:
+			}
+			// accepted transfers ownership to the writer: from this point send must
+			// wait for req.done so it cannot report ctx cancellation or
+			// ErrSessionClosed for a frame that may still be written.
+			if err := req.accept(); err != nil {
+				req.done <- err
+				continue
+			}
 			err := s.write(req)
 			req.done <- err
 			if err != nil {
 				debugf("writer write error (type=%s, payload_bytes=%d, binary_bytes=%d): %v", req.msg.Type, len(req.msg.Payload), len(req.binary), err)
 				s.close()
+				s.failPendingWrites()
 				return
 			}
 		case <-s.done:
+			s.failPendingWrites()
 			return
 		case <-ctx.Done():
 			s.close()
+			s.failPendingWrites()
 			return
 		}
 	}
 }
 
-func (s *Session) write(req writeRequest) error {
+func (req *writeRequest) accept() error {
+	req.mu.Lock()
+	defer req.mu.Unlock()
+	if req.abandoned {
+		return req.abandonErr
+	}
+	req.acceptedByWriter = true
+	return nil
+}
+
+func (req *writeRequest) abandon(err error) bool {
+	req.mu.Lock()
+	defer req.mu.Unlock()
+	if req.acceptedByWriter {
+		return false
+	}
+	if !req.abandoned {
+		req.abandoned = true
+		req.abandonErr = err
+		req.msg.Payload = nil
+		req.binary = nil
+	}
+	return true
+}
+
+func (req *writeRequest) resultOrAbandon(err error) error {
+	select {
+	case writeErr := <-req.done:
+		return writeErr
+	default:
+	}
+	if req.abandon(err) {
+		return err
+	}
+	return <-req.done
+}
+
+func (s *Session) failPendingWrites() {
+	for {
+		select {
+		case req := <-s.writes:
+			req.abandon(ErrSessionClosed)
+			req.done <- ErrSessionClosed
+		default:
+			return
+		}
+	}
+}
+
+func (s *Session) write(req *writeRequest) error {
 	b, err := json.Marshal(req.msg)
 	if err != nil {
 		return fmt.Errorf("marshal %s message: %w", req.msg.Type, err)
