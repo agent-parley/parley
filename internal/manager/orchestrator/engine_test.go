@@ -1092,6 +1092,148 @@ func TestHumanMemoryUpdateSuspendsApprovesEditsRejectsDefersAndResumesOnce(t *te
 	waitForRunStatus(t, env.store, runID, store.RunStatusCompleted)
 }
 
+func TestHumanMemoryRollbackSkipsConcurrentSameKeyWriteAndRecordsSafetyNote(t *testing.T) {
+	ctx := context.Background()
+	runner := &humanMemoryApprovalRunner{}
+	env := newTestEnv(t, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 10}})
+	templateID := "human_memory_rollback_skip"
+	createMemoryProducerTemplateWithActor(t, env.store, templateID, true, workflow.ActorHuman)
+
+	runID, err := env.engine.StartRunInput(ctx, contract.TaskInput{Idea: "approve memory candidates", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: templateID})
+	if err != nil {
+		t.Fatalf("StartRunInput() error = %v", err)
+	}
+	if err := env.engine.StartQueuedRun(ctx, runID); err != nil {
+		t.Fatalf("StartQueuedRun() error = %v", err)
+	}
+	waitForWorkflowStageAwaiting(t, env.store, runID, "memory_update")
+
+	renderer := &humanMemoryRollbackInterleavingRenderer{st: env.store}
+	env.engine.renderer = renderer
+	memoryStage := stageByWorkflowID(t, env.store, runID, "memory_update")
+	_, err = env.engine.SubmitHumanReview(ctx, runID, memoryStage.ID, HumanReviewSubmission{
+		ActorID: "alice",
+		Summary: "memory decisions approved",
+		MemoryDecisions: []HumanMemoryDecision{
+			{CandidateID: "candidate-1", Action: store.ProjectMemoryDecisionApprove},
+			{CandidateID: "candidate-2", Action: store.ProjectMemoryDecisionEdit, Kind: store.ProjectMemoryKindLesson, Title: "Edited memory lesson", Body: "Edited memory body stays source-linked and useful.", SourceSummary: "edited by human"},
+			{CandidateID: "candidate-3", Action: store.ProjectMemoryDecisionReject, Reason: "not durable"},
+			{CandidateID: "candidate-4", Action: store.ProjectMemoryDecisionDefer, Reason: "needs more evidence"},
+		},
+	})
+	if !errors.Is(err, errHumanMemoryRendererInterleaved) {
+		t.Fatalf("SubmitHumanReview() error = %v, want renderer interleave failure", err)
+	}
+	if !renderer.interleaved {
+		t.Fatal("renderer did not interleave a concurrent same-key memory write")
+	}
+
+	entries, err := env.store.ListProjectMemoryEntries(ctx, store.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("list project memory: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Title != "Approve this memory" || entries[0].Body != humanMemoryConcurrentBody {
+		t.Fatalf("project memory entries after rollback = %#v, want concurrent write only", entries)
+	}
+	events, err := env.store.ListEvents(ctx, runID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	var rollbackEvent event.Event
+	for _, ev := range events {
+		if ev.Type == "memory.rollback_skipped" {
+			rollbackEvent = ev
+			break
+		}
+	}
+	if rollbackEvent.ID == "" {
+		t.Fatalf("memory.rollback_skipped event not recorded; events=%#v", events)
+	}
+	if got := reportPayloadInt(rollbackEvent.Data, "skipped_count"); got != 1 {
+		t.Fatalf("rollback skipped_count = %d; payload=%#v", got, rollbackEvent.Data)
+	}
+	skipped, ok := rollbackEvent.Data["skipped_reverts"].([]any)
+	if !ok || len(skipped) != 1 {
+		t.Fatalf("skipped_reverts = %#v, want one skipped revert", rollbackEvent.Data["skipped_reverts"])
+	}
+	first, ok := skipped[0].(map[string]any)
+	if !ok || first["kind"] != "entry" || first["title"] != "Approve this memory" || first["reason"] != "concurrently modified, rollback skipped" {
+		t.Fatalf("skipped revert payload = %#v, want skipped Approve this memory entry", skipped[0])
+	}
+	run, err := env.store.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Status != store.RunStatusAwaitingHuman {
+		t.Fatalf("run status = %s, want awaiting_human after rollback", run.Status)
+	}
+	memoryStage = stageByWorkflowID(t, env.store, runID, "memory_update")
+	if memoryStage.Status != store.StageStatusRunning {
+		t.Fatalf("memory stage status = %s, want running after rollback", memoryStage.Status)
+	}
+}
+
+var errHumanMemoryRendererInterleaved = errors.New("human memory renderer interleaved concurrent write")
+
+const humanMemoryConcurrentBody = "Concurrent same-key memory write survives the rollback guard."
+
+type humanMemoryRollbackInterleavingRenderer struct {
+	st          *store.Store
+	interleaved bool
+}
+
+func (r *humanMemoryRollbackInterleavingRenderer) RenderRunFragments(bundle store.RunBundle) (string, error) {
+	if r.interleaved || len(bundle.Events) == 0 {
+		return "", nil
+	}
+	last := bundle.Events[len(bundle.Events)-1]
+	if last.Type != "run.resumed" || !strings.Contains(last.Summary, "human memory approval") {
+		return "", nil
+	}
+	var memoryStage store.Stage
+	for _, stage := range bundle.Stages {
+		if stage.WorkflowStageID == "memory_update" {
+			memoryStage = stage
+			break
+		}
+	}
+	if memoryStage.ID == "" {
+		return "", fmt.Errorf("memory update stage not found for interleaving renderer")
+	}
+	entries, err := r.st.ListProjectMemoryEntries(context.Background(), bundle.Run.ProjectID)
+	if err != nil {
+		return "", err
+	}
+	var applied store.ProjectMemoryEntry
+	for _, entry := range entries {
+		if entry.Title == "Approve this memory" {
+			applied = entry
+			break
+		}
+	}
+	if applied.ID == "" {
+		return "", fmt.Errorf("approved memory entry not found for interleaving renderer")
+	}
+	if _, err := r.st.ApplyProjectMemoryUpdate(context.Background(), store.ProjectMemoryUpdate{
+		ProjectID:      bundle.Run.ProjectID,
+		RunID:          bundle.Run.ID,
+		TaskID:         bundle.Task.ID,
+		CuratorStageID: memoryStage.ID,
+		Entries: []store.ProjectMemoryInput{{
+			Kind:             applied.Kind,
+			Title:            applied.Title,
+			Body:             humanMemoryConcurrentBody,
+			SourceStageID:    applied.SourceStageID,
+			SourceArtifactID: applied.SourceArtifactID,
+			SourceSummary:    "concurrent same-key write",
+		}},
+	}); err != nil {
+		return "", err
+	}
+	r.interleaved = true
+	return "", errHumanMemoryRendererInterleaved
+}
+
 func TestMemoryCaptureDisabledWithoutMemoryUpdateStage(t *testing.T) {
 	ctx := context.Background()
 	runner := &memoryLearningRunner{emitEvenWhenDisabled: true}

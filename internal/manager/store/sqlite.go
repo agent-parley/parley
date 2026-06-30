@@ -307,6 +307,7 @@ type ProjectMemoryEntryRevert struct {
 	Kind      string
 	Title     string
 	AppliedID string
+	Applied   *ProjectMemoryEntry
 	Previous  *ProjectMemoryEntry
 }
 
@@ -314,7 +315,22 @@ type ProjectMemoryDecisionRevert struct {
 	CuratorStageID string
 	CandidateID    string
 	AppliedID      string
+	Applied        *ProjectMemoryDecisionRecord
 	Previous       *ProjectMemoryDecisionRecord
+}
+
+type ProjectMemoryRollbackOutcome struct {
+	Skipped []ProjectMemorySkippedRevert `json:"skipped,omitempty"`
+}
+
+type ProjectMemorySkippedRevert struct {
+	Kind           string `json:"kind"`
+	ProjectID      string `json:"project_id,omitempty"`
+	MemoryKind     string `json:"memory_kind,omitempty"`
+	Title          string `json:"title,omitempty"`
+	CuratorStageID string `json:"curator_stage_id,omitempty"`
+	CandidateID    string `json:"candidate_id,omitempty"`
+	Reason         string `json:"reason"`
 }
 
 type ProjectMemoryWriteOutcome struct {
