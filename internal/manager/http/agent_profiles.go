@@ -28,7 +28,12 @@ func (s *Server) handleGlobalAgentProfileSave(w http.ResponseWriter, r *http.Req
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	upsertAgentProfileOverride(&overrides, profile, r.Form.Get("default_profile") != "")
+	baseline, baselineExists, err := globalAgentProfileSaveBaseline(overrides, profile.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	upsertAgentProfileOverride(&overrides, profile, baseline, baselineExists, r.Form.Get("default_profile") != "")
 	if _, err := s.store.UpdateGlobalAgentRegistryOverrides(r.Context(), overrides); err != nil {
 		s.writeGlobalAgentProfilesFragment(w, r, http.StatusBadRequest, err.Error(), "")
 		return
@@ -51,12 +56,22 @@ func (s *Server) handleProjectAgentProfileSave(w http.ResponseWriter, r *http.Re
 		s.writeProjectAgentProfilesFragment(w, r, http.StatusBadRequest, project, err.Error(), "")
 		return
 	}
+	globalOverrides, err := s.store.GetGlobalAgentRegistryOverrides(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	overrides, err := s.store.GetProjectAgentRegistryOverrides(r.Context(), project.ID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	upsertAgentProfileOverride(&overrides, profile, r.Form.Get("default_profile") != "")
+	baseline, baselineExists, err := projectAgentProfileSaveBaseline(globalOverrides, overrides, profile.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	upsertAgentProfileOverride(&overrides, profile, baseline, baselineExists, r.Form.Get("default_profile") != "")
 	if _, err := s.store.UpdateProjectAgentRegistryOverrides(r.Context(), project.ID, overrides); err != nil {
 		s.writeProjectAgentProfilesFragment(w, r, http.StatusBadRequest, project, err.Error(), "")
 		return
@@ -244,14 +259,143 @@ func parseSuggestedStageTypes(raw string) []string {
 	return out
 }
 
-func upsertAgentProfileOverride(overrides *agentregistry.Overrides, profile agentregistry.Profile, makeDefault bool) {
-	if overrides.Profiles == nil {
-		overrides.Profiles = map[string]agentregistry.ProfileOverride{}
+func upsertAgentProfileOverride(overrides *agentregistry.Overrides, profile agentregistry.Profile, baseline agentregistry.Profile, baselineExists bool, makeDefault bool) {
+	override := agentregistry.ProfileOverrideFromProfileDiff(profile, baseline)
+	if baselineExists && agentProfileOverrideIsEmpty(override) {
+		deleteAgentProfileOverride(overrides.Profiles, profile.ID)
+	} else {
+		if overrides.Profiles == nil {
+			overrides.Profiles = map[string]agentregistry.ProfileOverride{}
+		}
+		overrides.Profiles[profile.ID] = override
 	}
-	overrides.Profiles[profile.ID] = agentregistry.ProfileOverrideFromProfile(profile)
 	if makeDefault {
 		profileID := profile.ID
 		overrides.DefaultProfileID = &profileID
+	}
+}
+
+func globalAgentProfileSaveBaseline(overrides agentregistry.Overrides, profileID string) (agentregistry.Profile, bool, error) {
+	baselineOverrides := cloneAgentRegistryOverrides(overrides)
+	deleteAgentProfileOverride(baselineOverrides.Profiles, profileID)
+	clearDefaultProfileOverrideIfMatches(&baselineOverrides, profileID)
+	registry, err := agentregistry.Resolve(baselineOverrides, agentregistry.Overrides{})
+	if err != nil {
+		return agentregistry.Profile{}, false, err
+	}
+	profile, ok := agentregistry.ProfileByID(registry, profileID)
+	return profile, ok, nil
+}
+
+func projectAgentProfileSaveBaseline(globalOverrides agentregistry.Overrides, projectOverrides agentregistry.Overrides, profileID string) (agentregistry.Profile, bool, error) {
+	baselineProjectOverrides := cloneAgentRegistryOverrides(projectOverrides)
+	deleteAgentProfileOverride(baselineProjectOverrides.Profiles, profileID)
+	clearDefaultProfileOverrideIfMatches(&baselineProjectOverrides, profileID)
+	registry, err := agentregistry.Resolve(globalOverrides, baselineProjectOverrides)
+	if err != nil {
+		return agentregistry.Profile{}, false, err
+	}
+	profile, ok := agentregistry.ProfileByID(registry, profileID)
+	return profile, ok, nil
+}
+
+func agentProfileOverrideIsEmpty(override agentregistry.ProfileOverride) bool {
+	return override.FamilyID == nil &&
+		override.Name == nil &&
+		override.Description == nil &&
+		override.Role == nil &&
+		override.Headless == nil &&
+		override.Prompt == nil &&
+		override.DefaultInstructions == nil &&
+		override.Model == nil &&
+		override.ContextPolicy == nil &&
+		override.OutputStyle == nil &&
+		override.SuggestedStageTypes == nil
+}
+
+func cloneAgentRegistryOverrides(overrides agentregistry.Overrides) agentregistry.Overrides {
+	clone := agentregistry.Overrides{
+		DefaultProfileID: cloneStringPtr(overrides.DefaultProfileID),
+	}
+	if overrides.Families != nil {
+		clone.Families = make(map[string]agentregistry.FamilyOverride, len(overrides.Families))
+		for id, override := range overrides.Families {
+			clone.Families[id] = cloneAgentFamilyOverride(override)
+		}
+	}
+	if overrides.Profiles != nil {
+		clone.Profiles = make(map[string]agentregistry.ProfileOverride, len(overrides.Profiles))
+		for id, override := range overrides.Profiles {
+			clone.Profiles[id] = cloneAgentProfileOverride(override)
+		}
+	}
+	return clone
+}
+
+func cloneAgentFamilyOverride(override agentregistry.FamilyOverride) agentregistry.FamilyOverride {
+	return agentregistry.FamilyOverride{
+		Name:        cloneStringPtr(override.Name),
+		Description: cloneStringPtr(override.Description),
+		Status:      cloneStringPtr(override.Status),
+	}
+}
+
+func cloneAgentProfileOverride(override agentregistry.ProfileOverride) agentregistry.ProfileOverride {
+	return agentregistry.ProfileOverride{
+		FamilyID:            cloneStringPtr(override.FamilyID),
+		Name:                cloneStringPtr(override.Name),
+		Description:         cloneStringPtr(override.Description),
+		Role:                cloneStringPtr(override.Role),
+		Headless:            cloneBoolPtr(override.Headless),
+		Prompt:              cloneStringPtr(override.Prompt),
+		DefaultInstructions: cloneStringPtr(override.DefaultInstructions),
+		Model:               cloneStringPtr(override.Model),
+		ContextPolicy:       cloneStringPtr(override.ContextPolicy),
+		OutputStyle:         cloneStringPtr(override.OutputStyle),
+		SuggestedStageTypes: cloneStringListPreserveNil(override.SuggestedStageTypes),
+	}
+}
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func cloneBoolPtr(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func cloneStringListPreserveNil(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	clone := make([]string, len(values))
+	copy(clone, values)
+	return clone
+}
+
+func deleteAgentProfileOverride(overrides map[string]agentregistry.ProfileOverride, profileID string) {
+	profileID = strings.ToLower(strings.TrimSpace(profileID))
+	for id := range overrides {
+		if strings.ToLower(strings.TrimSpace(id)) == profileID {
+			delete(overrides, id)
+		}
+	}
+}
+
+func clearDefaultProfileOverrideIfMatches(overrides *agentregistry.Overrides, profileID string) {
+	if overrides.DefaultProfileID == nil {
+		return
+	}
+	if strings.ToLower(strings.TrimSpace(*overrides.DefaultProfileID)) == strings.ToLower(strings.TrimSpace(profileID)) {
+		overrides.DefaultProfileID = nil
 	}
 }
 

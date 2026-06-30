@@ -2,7 +2,9 @@
 package agentregistry
 
 import (
+	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -82,6 +84,46 @@ type ProfileOverride struct {
 	ContextPolicy       *string  `toml:"context_policy" json:"context_policy,omitempty"`
 	OutputStyle         *string  `toml:"output_style" json:"output_style,omitempty"`
 	SuggestedStageTypes []string `toml:"suggested_stage_types" json:"suggested_stage_types,omitempty"`
+}
+
+// MarshalJSON preserves a non-nil empty SuggestedStageTypes slice as an explicit
+// [] pin; struct-tag omitempty would otherwise collapse it to inherit-on-decode.
+func (override ProfileOverride) MarshalJSON() ([]byte, error) {
+	fields := map[string]any{}
+	if override.FamilyID != nil {
+		fields["family_id"] = override.FamilyID
+	}
+	if override.Name != nil {
+		fields["name"] = override.Name
+	}
+	if override.Description != nil {
+		fields["description"] = override.Description
+	}
+	if override.Role != nil {
+		fields["role"] = override.Role
+	}
+	if override.Headless != nil {
+		fields["headless"] = override.Headless
+	}
+	if override.Prompt != nil {
+		fields["prompt"] = override.Prompt
+	}
+	if override.DefaultInstructions != nil {
+		fields["default_instructions"] = override.DefaultInstructions
+	}
+	if override.Model != nil {
+		fields["model"] = override.Model
+	}
+	if override.ContextPolicy != nil {
+		fields["context_policy"] = override.ContextPolicy
+	}
+	if override.OutputStyle != nil {
+		fields["output_style"] = override.OutputStyle
+	}
+	if override.SuggestedStageTypes != nil {
+		fields["suggested_stage_types"] = override.SuggestedStageTypes
+	}
+	return json.Marshal(fields)
 }
 
 func Defaults() Registry {
@@ -271,8 +313,48 @@ func ProfileOverrideFromProfile(profile Profile) ProfileOverride {
 		Model:               profileStringPtr(profile.Model),
 		ContextPolicy:       profileStringPtr(profile.ContextPolicy),
 		OutputStyle:         profileStringPtr(profile.OutputStyle),
-		SuggestedStageTypes: append([]string(nil), profile.SuggestedStageTypes...),
+		SuggestedStageTypes: cloneProfileStringList(profile.SuggestedStageTypes),
 	}
+}
+
+func ProfileOverrideFromProfileDiff(edited Profile, baseline Profile) ProfileOverride {
+	edited = normalizeProfile(edited)
+	baseline = normalizeProfile(baseline)
+	override := ProfileOverride{}
+	if edited.FamilyID != baseline.FamilyID {
+		override.FamilyID = profileStringPtr(edited.FamilyID)
+	}
+	if edited.Name != baseline.Name {
+		override.Name = profileStringPtr(edited.Name)
+	}
+	if edited.Description != baseline.Description {
+		override.Description = profileStringPtr(edited.Description)
+	}
+	if edited.Role != baseline.Role {
+		override.Role = profileStringPtr(edited.Role)
+	}
+	if edited.Headless != baseline.Headless {
+		override.Headless = profileBoolPtr(edited.Headless)
+	}
+	if edited.Prompt != baseline.Prompt {
+		override.Prompt = profileStringPtr(edited.Prompt)
+	}
+	if edited.DefaultInstructions != baseline.DefaultInstructions {
+		override.DefaultInstructions = profileStringPtr(edited.DefaultInstructions)
+	}
+	if edited.Model != baseline.Model {
+		override.Model = profileStringPtr(edited.Model)
+	}
+	if edited.ContextPolicy != baseline.ContextPolicy {
+		override.ContextPolicy = profileStringPtr(edited.ContextPolicy)
+	}
+	if edited.OutputStyle != baseline.OutputStyle {
+		override.OutputStyle = profileStringPtr(edited.OutputStyle)
+	}
+	if !slices.Equal(edited.SuggestedStageTypes, baseline.SuggestedStageTypes) {
+		override.SuggestedStageTypes = cloneProfileStringList(edited.SuggestedStageTypes)
+	}
+	return override
 }
 
 func DefaultProfileIDForStageType(registry Registry, stageType string) (string, bool) {
@@ -376,6 +458,12 @@ func applyBool(dst *bool, src *bool) {
 func profileStringPtr(value string) *string { return &value }
 
 func profileBoolPtr(value bool) *bool { return &value }
+
+func cloneProfileStringList(values []string) []string {
+	out := make([]string, len(values))
+	copy(out, values)
+	return out
+}
 
 type familyOverrideEntry struct {
 	id       string
