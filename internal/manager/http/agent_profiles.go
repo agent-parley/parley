@@ -426,7 +426,7 @@ func parseSuggestedStageTypes(raw string) []string {
 func upsertAgentProfileOverride(overrides *agentregistry.Overrides, profile agentregistry.Profile, baseline agentregistry.Profile, baselineExists bool, makeDefault bool) {
 	override := agentregistry.ProfileOverrideFromProfileDiff(profile, baseline)
 	if baselineExists && agentProfileOverrideIsEmpty(override) {
-		deleteAgentProfileOverride(overrides.Profiles, profile.ID)
+		removeProfileOverrideEntry(overrides.Profiles, profile.ID)
 	} else {
 		if overrides.Profiles == nil {
 			overrides.Profiles = map[string]agentregistry.ProfileOverride{}
@@ -604,7 +604,7 @@ func (s *Server) resolveAgentRegistryAfterGlobalUpdate(ctx context.Context, proj
 
 func globalAgentProfileSaveBaseline(overrides agentregistry.Overrides, profileID string) (agentregistry.Profile, bool, error) {
 	baselineOverrides := cloneAgentRegistryOverrides(overrides)
-	deleteAgentProfileOverride(baselineOverrides.Profiles, profileID)
+	removeProfileOverrideEntry(baselineOverrides.Profiles, profileID)
 	clearDefaultProfileOverrideIfMatches(&baselineOverrides, profileID)
 	registry, err := agentregistry.Resolve(baselineOverrides, agentregistry.Overrides{})
 	if err != nil {
@@ -616,7 +616,7 @@ func globalAgentProfileSaveBaseline(overrides agentregistry.Overrides, profileID
 
 func projectAgentProfileSaveBaseline(globalOverrides agentregistry.Overrides, projectOverrides agentregistry.Overrides, profileID string) (agentregistry.Profile, bool, error) {
 	baselineProjectOverrides := cloneAgentRegistryOverrides(projectOverrides)
-	deleteAgentProfileOverride(baselineProjectOverrides.Profiles, profileID)
+	removeProfileOverrideEntry(baselineProjectOverrides.Profiles, profileID)
 	clearDefaultProfileOverrideIfMatches(&baselineProjectOverrides, profileID)
 	registry, err := agentregistry.Resolve(globalOverrides, baselineProjectOverrides)
 	if err != nil {
@@ -708,7 +708,7 @@ func cloneStringListPreserveNil(values []string) []string {
 	return clone
 }
 
-func deleteAgentProfileOverride(overrides map[string]agentregistry.ProfileOverride, profileID string) {
+func removeProfileOverrideEntry(overrides map[string]agentregistry.ProfileOverride, profileID string) {
 	profileID = strings.ToLower(strings.TrimSpace(profileID))
 	for id := range overrides {
 		if strings.ToLower(strings.TrimSpace(id)) == profileID {
