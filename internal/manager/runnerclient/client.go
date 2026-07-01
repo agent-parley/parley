@@ -328,6 +328,10 @@ func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.R
 	}()
 
 	if err := c.send(ctx, protocol.TypeDispatch, disp); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, protocol.ErrSessionClosed) {
+			cancelAttempt()
+			return report.Report{}, ctxErr
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			cancelAttempt()
 		}
@@ -341,7 +345,7 @@ func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.R
 		cancelAttempt()
 		return report.Report{}, ctx.Err()
 	case <-c.session.Done():
-		return report.Report{}, protocol.ErrSessionClosed
+		return report.Report{}, c.dispatchSessionDoneErr(ctx, cancelAttempt)
 	}
 
 	select {
@@ -355,9 +359,24 @@ func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.R
 		cancelAttempt()
 		return rep, ctx.Err()
 	case <-c.session.Done():
-		return rep, protocol.ErrSessionClosed
+		return rep, c.dispatchSessionDoneErr(ctx, cancelAttempt)
 	}
 	return rep, nil
+}
+
+func (c *Client) dispatchSessionDoneErr(ctx context.Context, cancelAttempt func()) error {
+	// Dispatch cancellation is caller intent, so when the session closes in the
+	// same scheduling window we report the caller's cancellation deterministically
+	// instead of ErrSessionClosed. cancelAttempt is invoked for symmetry with the
+	// live-session cancellation paths, but it no-ops here: this function is only
+	// reached once session.Done() has fired, and cancelAttempt bails on a closed
+	// session. The runner therefore learns of the teardown from its own session
+	// close rather than an explicit cancel frame.
+	if err := ctx.Err(); err != nil {
+		cancelAttempt()
+		return err
+	}
+	return protocol.ErrSessionClosed
 }
 
 func (c *Client) Cancel(ctx context.Context, runID, taskID string) error {

@@ -362,15 +362,30 @@ func (s *Session) write(req *writeRequest) error {
 	if err != nil {
 		return fmt.Errorf("marshal %s message: %w", req.msg.Type, err)
 	}
-	if err := s.conn.Write(req.ctx, websocket.MessageText, b); err != nil {
+	// coder/websocket closes the underlying connection when a Write context is
+	// cancelled. Once the writer accepts a request, caller cancellation must not
+	// tear down the session or report a lost frame; the writer owns the write and
+	// reports the actual transport result through req.done. Preserve any caller
+	// deadline so accepted writes are still bounded.
+	writeCtx, cancel := acceptedWriteContext(req.ctx)
+	defer cancel()
+	if err := s.conn.Write(writeCtx, websocket.MessageText, b); err != nil {
 		return err
 	}
 	if req.hasBinary {
-		if err := s.conn.Write(req.ctx, websocket.MessageBinary, req.binary); err != nil {
+		if err := s.conn.Write(writeCtx, websocket.MessageBinary, req.binary); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func acceptedWriteContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	writeCtx := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(writeCtx, deadline)
+	}
+	return writeCtx, func() {}
 }
 
 func (s *Session) reader(ctx context.Context) {

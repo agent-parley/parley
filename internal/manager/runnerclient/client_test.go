@@ -46,6 +46,9 @@ func newRunnerClientHarness(t *testing.T, configure func(*protocol.Session)) *ru
 				Capabilities: protocol.Capabilities{Adapters: []string{"noop"}},
 			}))
 		})
+		sess.Handle(protocol.TypePing, func(ctx context.Context, _ protocol.Message) error {
+			return sess.Send(ctx, protocol.MustMessage(protocol.TypePong, map[string]any{}))
+		})
 		if configure != nil {
 			configure(sess)
 		}
@@ -183,13 +186,23 @@ func TestDispatchContextCancelSendsCancelAttempt(t *testing.T) {
 	}
 }
 
+func TestDispatchSessionDoneAfterContextCancelReturnsContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	attempts := 0
+	err := (&Client{}).dispatchSessionDoneErr(ctx, func() { attempts++ })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("dispatch session-done error = %v, want context.Canceled", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("cancel attempts = %d, want 1", attempts)
+	}
+}
+
 func TestClientPingCancelEvictAndClose(t *testing.T) {
 	cancelSeen := make(chan protocol.CancelPayload, 1)
 	evictSeen := make(chan protocol.EvictWarmSessionPayload, 1)
 	h := newRunnerClientHarness(t, func(sess *protocol.Session) {
-		sess.Handle(protocol.TypePing, func(ctx context.Context, _ protocol.Message) error {
-			return sess.Send(ctx, protocol.MustMessage(protocol.TypePong, map[string]any{}))
-		})
 		sess.Handle(protocol.TypeCancel, func(ctx context.Context, msg protocol.Message) error {
 			payload, err := protocol.DecodePayload[protocol.CancelPayload](msg)
 			if err != nil {
