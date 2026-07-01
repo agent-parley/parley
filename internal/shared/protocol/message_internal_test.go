@@ -126,24 +126,53 @@ func TestSessionWriteUsesDetachedContextAfterAccept(t *testing.T) {
 }
 
 func TestAcceptedWriteContextDetachesCancelAndPreservesDeadline(t *testing.T) {
-	deadline := time.Now().Add(time.Hour)
-	parent, cancelParent := context.WithDeadline(context.Background(), deadline)
-	writeCtx, cancelWrite := acceptedWriteContext(parent)
-	defer cancelWrite()
-	cancelParent()
+	t.Run("uses caller deadline unchanged", func(t *testing.T) {
+		deadline := time.Now().Add(time.Hour)
+		parent, cancelParent := context.WithDeadline(context.Background(), deadline)
+		writeCtx, cancelWrite := acceptedWriteContext(parent)
+		defer cancelWrite()
+		cancelParent()
 
-	gotDeadline, ok := writeCtx.Deadline()
-	if !ok {
-		t.Fatal("accepted write context lost caller deadline")
-	}
-	if !gotDeadline.Equal(deadline) {
-		t.Fatalf("accepted write deadline = %v, want %v", gotDeadline, deadline)
-	}
-	select {
-	case <-writeCtx.Done():
-		t.Fatal("accepted write context was canceled by parent cancellation")
-	default:
-	}
+		gotDeadline, ok := writeCtx.Deadline()
+		if !ok {
+			t.Fatal("accepted write context lost caller deadline")
+		}
+		if !gotDeadline.Equal(deadline) {
+			t.Fatalf("accepted write deadline = %v, want %v", gotDeadline, deadline)
+		}
+		select {
+		case <-writeCtx.Done():
+			t.Fatal("accepted write context was canceled by parent cancellation")
+		default:
+		}
+	})
+
+	t.Run("adds default deadline when caller has none", func(t *testing.T) {
+		parent, cancelParent := context.WithCancel(context.Background())
+		before := time.Now()
+		writeCtx, cancelWrite := acceptedWriteContext(parent)
+		after := time.Now()
+		defer cancelWrite()
+		cancelParent()
+
+		gotDeadline, ok := writeCtx.Deadline()
+		if !ok {
+			t.Fatal("accepted write context without caller deadline has no default deadline")
+		}
+		if gotDeadline.Before(before.Add(maxAcceptedWriteTimeout)) || gotDeadline.After(after.Add(maxAcceptedWriteTimeout)) {
+			t.Fatalf(
+				"accepted write default deadline = %v, want between %v and %v",
+				gotDeadline,
+				before.Add(maxAcceptedWriteTimeout),
+				after.Add(maxAcceptedWriteTimeout),
+			)
+		}
+		select {
+		case <-writeCtx.Done():
+			t.Fatal("accepted write context was canceled by parent cancellation")
+		default:
+		}
+	})
 }
 
 func TestSessionSendWaitsForAcceptedWriteResultWhenDoneCloses(t *testing.T) {

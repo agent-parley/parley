@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 
@@ -59,6 +60,12 @@ const ArtifactChunkBytes = 1 << 20
 // the read limit to 32 KiB, which is far too small for this channel: artifact
 // binary frames are ArtifactChunkBytes, and other JSON payloads need headroom.
 const MaxMessageBytes = 4 * ArtifactChunkBytes
+
+// maxAcceptedWriteTimeout bounds writer-owned websocket writes when the caller
+// did not supply a deadline. It is generous for normal tiny control frames but
+// keeps a stuck peer from wedging the single session writer until heartbeat
+// recovery tears the session down.
+const maxAcceptedWriteTimeout = 30 * time.Second
 
 // Message is the symmetric Manager<->Runner JSON envelope.
 type Message struct {
@@ -385,7 +392,7 @@ func acceptedWriteContext(ctx context.Context) (context.Context, context.CancelF
 	if deadline, ok := ctx.Deadline(); ok {
 		return context.WithDeadline(writeCtx, deadline)
 	}
-	return writeCtx, func() {}
+	return context.WithTimeout(writeCtx, maxAcceptedWriteTimeout)
 }
 
 func (s *Session) reader(ctx context.Context) {
