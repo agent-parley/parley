@@ -203,9 +203,6 @@ func TestClientPingCancelEvictAndClose(t *testing.T) {
 	cancelSeen := make(chan protocol.CancelPayload, 1)
 	evictSeen := make(chan protocol.EvictWarmSessionPayload, 1)
 	h := newRunnerClientHarness(t, func(sess *protocol.Session) {
-		sess.Handle(protocol.TypePing, func(ctx context.Context, _ protocol.Message) error {
-			return sess.Send(ctx, protocol.MustMessage(protocol.TypePong, map[string]any{}))
-		})
 		sess.Handle(protocol.TypeCancel, func(ctx context.Context, msg protocol.Message) error {
 			payload, err := protocol.DecodePayload[protocol.CancelPayload](msg)
 			if err != nil {

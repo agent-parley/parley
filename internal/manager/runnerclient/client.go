@@ -365,9 +365,13 @@ func (c *Client) Dispatch(ctx context.Context, disp contract.Dispatch) (report.R
 }
 
 func (c *Client) dispatchSessionDoneErr(ctx context.Context, cancelAttempt func()) error {
-	// Dispatch cancellation is caller intent. If the protocol session closes in
-	// the same scheduling window, report the caller's cancellation deterministically
-	// while still making the best-effort cancel attempt before returning.
+	// Dispatch cancellation is caller intent, so when the session closes in the
+	// same scheduling window we report the caller's cancellation deterministically
+	// instead of ErrSessionClosed. cancelAttempt is invoked for symmetry with the
+	// live-session cancellation paths, but it no-ops here: this function is only
+	// reached once session.Done() has fired, and cancelAttempt bails on a closed
+	// session. The runner therefore learns of the teardown from its own session
+	// close rather than an explicit cancel frame.
 	if err := ctx.Err(); err != nil {
 		cancelAttempt()
 		return err
