@@ -17,6 +17,7 @@ const DefaultProjectConfigPath = ".parley/config.toml"
 type Settings struct {
 	Queue         QueueSettings          `toml:"queue"`
 	Conversation  ConversationSettings   `toml:"conversation"`
+	Execution     ExecutionSettings      `toml:"execution"`
 	AgentRegistry agentregistry.Registry `toml:"-"`
 }
 
@@ -30,6 +31,11 @@ type ConversationSettings struct {
 	Budget          int            `toml:"budget"`
 	IdleWarmHoldTTL time.Duration  `toml:"idle_warm_hold_ttl"`
 	TurnDeadline    *time.Duration `toml:"turn_deadline"`
+}
+
+type ExecutionSettings struct {
+	GlobalMaxConcurrent int `toml:"global_max_concurrent"`
+	InteractiveReserve  int `toml:"interactive_reserve"`
 }
 
 type LoadOptions struct {
@@ -46,6 +52,7 @@ type Loaded struct {
 type fileSettings struct {
 	Queue        *fileQueueSettings        `toml:"queue"`
 	Conversation *fileConversationSettings `toml:"conversation"`
+	Execution    *fileExecutionSettings    `toml:"execution"`
 	Agents       *agentregistry.Overrides  `toml:"agents"`
 }
 
@@ -61,6 +68,11 @@ type fileConversationSettings struct {
 	TurnDeadline    *string `toml:"turn_deadline"`
 }
 
+type fileExecutionSettings struct {
+	GlobalMaxConcurrent *int `toml:"global_max_concurrent"`
+	InteractiveReserve  *int `toml:"interactive_reserve"`
+}
+
 func Defaults() Settings {
 	return Settings{
 		Queue: QueueSettings{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 100},
@@ -69,6 +81,7 @@ func Defaults() Settings {
 			IdleWarmHoldTTL: 15 * time.Minute,
 			TurnDeadline:    durationPointer(15 * time.Minute),
 		},
+		Execution:     ExecutionSettings{GlobalMaxConcurrent: 0, InteractiveReserve: 1},
 		AgentRegistry: agentregistry.Defaults(),
 	}
 }
@@ -78,7 +91,7 @@ func durationPointer(value time.Duration) *time.Duration {
 }
 
 func IsZero(s Settings) bool {
-	return s.Queue == (QueueSettings{}) && s.Conversation == (ConversationSettings{}) && agentRegistryIsZero(s.AgentRegistry)
+	return s.Queue == (QueueSettings{}) && s.Conversation == (ConversationSettings{}) && s.Execution == (ExecutionSettings{}) && agentRegistryIsZero(s.AgentRegistry)
 }
 
 func ResolveDefaults(s Settings) Settings {
@@ -108,6 +121,9 @@ func ResolveDefaults(s Settings) Settings {
 		if s.Conversation.TurnDeadline == nil {
 			s.Conversation.TurnDeadline = defaults.Conversation.TurnDeadline
 		}
+	}
+	if s.Execution == (ExecutionSettings{}) {
+		s.Execution = defaults.Execution
 	}
 	if agentRegistryIsZero(s.AgentRegistry) {
 		s.AgentRegistry = defaults.AgentRegistry
@@ -159,6 +175,15 @@ func Validate(s Settings) error {
 	}
 	if *s.Conversation.TurnDeadline < 0 {
 		return fmt.Errorf("conversation.turn_deadline must be non-negative")
+	}
+	if s.Execution.GlobalMaxConcurrent < 0 {
+		return fmt.Errorf("execution.global_max_concurrent must be non-negative")
+	}
+	if s.Execution.InteractiveReserve < 0 {
+		return fmt.Errorf("execution.interactive_reserve must be non-negative")
+	}
+	if s.Execution.GlobalMaxConcurrent > 0 && s.Execution.GlobalMaxConcurrent <= s.Execution.InteractiveReserve {
+		return fmt.Errorf("execution.global_max_concurrent must exceed execution.interactive_reserve when enabled")
 	}
 	if err := agentregistry.Validate(s.AgentRegistry); err != nil {
 		return err
@@ -225,6 +250,14 @@ func validateFileSettings(file fileSettings, sourceName, path string) error {
 			}
 		}
 	}
+	if file.Execution != nil {
+		if file.Execution.GlobalMaxConcurrent != nil && *file.Execution.GlobalMaxConcurrent < 0 {
+			return fmt.Errorf("%s settings %s: execution.global_max_concurrent must be non-negative", sourceName, path)
+		}
+		if file.Execution.InteractiveReserve != nil && *file.Execution.InteractiveReserve < 0 {
+			return fmt.Errorf("%s settings %s: execution.interactive_reserve must be non-negative", sourceName, path)
+		}
+	}
 	return nil
 }
 
@@ -257,6 +290,14 @@ func merge(dst *Settings, sourceName string, file fileSettings) error {
 				return fmt.Errorf("parse %s settings conversation.turn_deadline: %w", sourceName, err)
 			}
 			dst.Conversation.TurnDeadline = durationPointer(deadline)
+		}
+	}
+	if file.Execution != nil {
+		if file.Execution.GlobalMaxConcurrent != nil {
+			dst.Execution.GlobalMaxConcurrent = *file.Execution.GlobalMaxConcurrent
+		}
+		if file.Execution.InteractiveReserve != nil {
+			dst.Execution.InteractiveReserve = *file.Execution.InteractiveReserve
 		}
 	}
 	if file.Agents != nil {

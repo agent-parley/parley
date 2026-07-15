@@ -57,6 +57,7 @@
         <div><dt>Running</dt><dd>{{.Queue.Running}}</dd></div>
         <div><dt>Auto when ready</dt><dd>{{.Queue.AutoWhenReady}}</dd></div>
         <div><dt>Concurrency</dt><dd>effective {{.Queue.EffectiveMaxConcurrent}} · configured {{.Queue.MaxConcurrent}} · ready slots {{.Queue.ReadyRunnerSlots}}/{{.Queue.RunnerSlots}}</dd></div>
+        <div><dt>Global execution</dt><dd>{{.Queue.RunsInflight}} runs + {{.Queue.TurnsInflight}} turns{{if .Queue.GlobalMaxConcurrent}} / cap {{.Queue.GlobalMaxConcurrent}} · interactive reserve {{.Queue.InteractiveReserve}}{{else}} · cap disabled{{end}}</dd></div>
       </dl>
     </section>
     <section class="card">

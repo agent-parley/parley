@@ -60,6 +60,15 @@ func (e *Engine) ReRunStage(ctx context.Context, runID, stageID string, actor ev
 	if err := e.validateStageReRunPrerequisites(ctx, wr, runtime, target, seed); err != nil {
 		return store.Attempt{}, err
 	}
+	if err := e.reserveGlobalRunAdmission(); err != nil {
+		return store.Attempt{}, err
+	}
+	reservationTransferred := false
+	defer func() {
+		if !reservationTransferred {
+			e.releaseGlobalRun()
+		}
+	}()
 	attempt, _, err := e.store.CreateAttemptForRun(ctx, wr.Run.ID, runtime.Template)
 	if err != nil {
 		return store.Attempt{}, err
@@ -107,7 +116,9 @@ func (e *Engine) ReRunStage(ctx context.Context, runID, stageID string, actor ev
 	}) {
 		cancel()
 		e.unregisterActiveRun(wr.Run.ID)
+		return attempt, nil
 	}
+	reservationTransferred = true
 	return attempt, nil
 }
 

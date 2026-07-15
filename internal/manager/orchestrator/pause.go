@@ -76,6 +76,15 @@ func (e *Engine) ResumeRun(ctx context.Context, runID string) error {
 	if err != nil {
 		return err
 	}
+	if err := e.reserveGlobalRunAdmission(); err != nil {
+		return err
+	}
+	reservationTransferred := false
+	defer func() {
+		if !reservationTransferred {
+			e.releaseGlobalRun()
+		}
+	}()
 	changed, err := e.store.UpdateRunStatusFrom(ctx, runID, store.RunStatusPaused, store.RunStatusRunning)
 	if err != nil {
 		return err
@@ -103,7 +112,9 @@ func (e *Engine) ResumeRun(ctx context.Context, runID string) error {
 	if !e.spawn(func() { e.executeRunAfter(runCtx, runID, anchor) }) {
 		cancel()
 		e.unregisterActiveRun(runID)
+		return nil
 	}
+	reservationTransferred = true
 	return nil
 }
 

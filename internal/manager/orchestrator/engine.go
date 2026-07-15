@@ -52,6 +52,10 @@ type QueueState struct {
 	RunnerSlots            int
 	ReadyRunnerSlots       int
 	EffectiveMaxConcurrent int
+	RunsInflight           int
+	TurnsInflight          int
+	GlobalMaxConcurrent    int
+	InteractiveReserve     int
 }
 
 type QueueBacklogFullError struct {
@@ -93,6 +97,11 @@ type Engine struct {
 
 	queuePolicy           QueuePolicy
 	runnerSlots           int
+	globalMu              sync.Mutex
+	runsInflight          int
+	turnsInflight         int
+	globalMaxConcurrent   int
+	interactiveReserve    int
 	conversationBudget    int
 	conversationIdleTTL   time.Duration
 	conversationMu        sync.Mutex
@@ -129,6 +138,8 @@ type EngineOptions struct {
 	ForgeDeliveryClient   ForgeDeliveryClient
 	QueuePolicy           *QueuePolicy
 	RunnerSlots           int
+	GlobalMaxConcurrent   int
+	InteractiveReserve    int
 	ConversationBudget    int
 	ConversationIdleTTL   time.Duration
 	ContextAssembler      *contextpack.Assembler
@@ -197,6 +208,17 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 	if runnerSlots <= 0 {
 		runnerSlots = 1
 	}
+	globalMaxConcurrent := opts.GlobalMaxConcurrent
+	if globalMaxConcurrent < 0 {
+		globalMaxConcurrent = 0
+	}
+	interactiveReserve := opts.InteractiveReserve
+	if interactiveReserve < 0 {
+		interactiveReserve = 0
+	}
+	if globalMaxConcurrent == 0 && interactiveReserve == 0 {
+		interactiveReserve = 1
+	}
 	conversationBudget := opts.ConversationBudget
 	if conversationBudget <= 0 {
 		conversationBudget = 1
@@ -232,6 +254,8 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 		runnerDown:            map[string]string{},
 		queuePolicy:           queuePolicy,
 		runnerSlots:           runnerSlots,
+		globalMaxConcurrent:   globalMaxConcurrent,
+		interactiveReserve:    interactiveReserve,
 		conversationBudget:    conversationBudget,
 		conversationIdleTTL:   conversationIdleTTL,
 		conversationSessions:  map[string]*conversationSession{},
@@ -466,6 +490,7 @@ func (e *Engine) QueueState(ctx context.Context) (QueueState, error) {
 		return QueueState{}, err
 	}
 	readySlots := e.readyRunnerSlots()
+	global := e.globalCapacitySnapshot()
 	return QueueState{
 		Policy:                 e.queuePolicy,
 		Pending:                pending,
@@ -473,6 +498,10 @@ func (e *Engine) QueueState(ctx context.Context) (QueueState, error) {
 		RunnerSlots:            e.runnerSlots,
 		ReadyRunnerSlots:       readySlots,
 		EffectiveMaxConcurrent: minInt(e.queuePolicy.MaxConcurrent, readySlots),
+		RunsInflight:           global.runsInflight,
+		TurnsInflight:          global.turnsInflight,
+		GlobalMaxConcurrent:    global.globalMaxConcurrent,
+		InteractiveReserve:     global.interactiveReserve,
 	}, nil
 }
 
@@ -547,6 +576,12 @@ func (e *Engine) dispatchPendingLocked(ctx context.Context) error {
 			// path; skip it so the rest of the backlog still dispatches.
 			continue
 		case errors.Is(err, ErrNoRunnerSlots):
+			var globalHeld *globalRunCapacityError
+			if errors.As(err, &globalHeld) {
+				if emitErr := e.emitQueueEvent(ctx, p.ProjectID, "queue.held_global_cap", "queued run held by global concurrency cap", globalHeld.snapshot.eventData()); emitErr != nil {
+					return emitErr
+				}
+			}
 			return nil
 		default:
 			return err
@@ -570,13 +605,15 @@ func (e *Engine) dispatchRunLocked(ctx context.Context, runID, trigger string) e
 	if !allowed {
 		return ErrRunHeld
 	}
-	available, err := e.availableDispatchSlots(ctx)
-	if err != nil {
+	if err := e.reserveRunAdmission(ctx); err != nil {
 		return err
 	}
-	if available <= 0 {
-		return ErrNoRunnerSlots
-	}
+	reservationTransferred := false
+	defer func() {
+		if !reservationTransferred {
+			e.releaseGlobalRun()
+		}
+	}()
 	queueEvent := newQueueEvent("queue.dispatched", "queued run dispatched", map[string]any{"project_id": run.ProjectID, "run_id": run.ID, "trigger": trigger, "max_concurrent": e.queuePolicy.MaxConcurrent, "runner_slots": e.runnerSlots})
 	queueEvent.ProjectID = run.ProjectID
 	persisted, changed, err := e.store.UpdateRunStatusFromAndAppendSystemEvent(ctx, run.ID, store.RunStatusPending, store.RunStatusRunning, queueEvent)
@@ -592,7 +629,9 @@ func (e *Engine) dispatchRunLocked(ctx context.Context, runID, trigger string) e
 	if !e.spawn(func() { e.executeRun(runCtx, run.ID) }) {
 		cancel()
 		e.unregisterActiveRun(run.ID)
+		return nil
 	}
+	reservationTransferred = true
 	return nil
 }
 
@@ -662,6 +701,14 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func (e *Engine) kickDispatchPending() {
+	e.spawn(func() {
+		if err := e.DispatchPending(e.rootCtx); err != nil {
+			log.Printf("dispatch pending failed: %v", err)
+		}
+	})
 }
 
 func (e *Engine) registerActiveRun(runID string, cancel context.CancelFunc) {
@@ -874,13 +921,9 @@ func (e *Engine) executeRunWithCleanup(ctx context.Context, runID string, execut
 	defer func() {
 		e.clearPausing(runID)
 		e.unregisterActiveRun(runID)
-		if e.queuePolicy.AutoWhenReady {
-			e.spawn(func() {
-				if err := e.DispatchPending(e.rootCtx); err != nil {
-					log.Printf("dispatch pending failed: %v", err)
-				}
-			})
-		}
+		e.releaseGlobalRun()
+		e.scheduleConversationTurns()
+		e.kickDispatchPending()
 	}()
 	if err := execute(); err != nil {
 		if errors.Is(err, errRunAwaitingHuman) || errors.Is(err, errRunPaused) {

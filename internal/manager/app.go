@@ -127,6 +127,8 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		ProjectID:             project.ID,
 		QueuePolicy:           &queuePolicy,
 		RunnerSlots:           1,
+		GlobalMaxConcurrent:   cfg.Settings.Execution.GlobalMaxConcurrent,
+		InteractiveReserve:    cfg.Settings.Execution.InteractiveReserve,
 		ConversationBudget:    cfg.Settings.Conversation.Budget,
 		ConversationIdleTTL:   cfg.Settings.Conversation.IdleWarmHoldTTL,
 		Secrets:               secretService,
