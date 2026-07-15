@@ -8,6 +8,21 @@
   {{if .Notice}}
   <p class="settings-inline-notice warning" role="alert">{{.Notice}}</p>
   {{end}}
+  {{with .DeleteConfirmation}}
+  <section class="settings-inline-notice warning" role="alert">
+    <h3>Confirm global profile deletion</h3>
+    <p>Deleting <code>{{.ProfileID}}</code> will pin these project overrides to their current effective profile. They will stop inheriting this profile from the global layer:</p>
+    <ul>
+      {{range .Projects}}<li>{{.}}</li>{{end}}
+    </ul>
+    <form method="post" action="{{$.DeletePath}}" data-on:submit="@post('{{$.DeletePath}}', {contentType: 'form'})">
+      <input type="hidden" name="_csrf" value="{{$.CSRF}}" data-bind:csrf>
+      <input type="hidden" name="profile_id" value="{{.ProfileID}}">
+      <input type="hidden" name="confirm_rebase" value="1">
+      <button type="submit">Pin project profiles and delete global profile</button>
+    </form>
+  </section>
+  {{end}}
   {{if .Status}}
   <p class="settings-status muted" role="status" aria-live="polite">{{.Status}}</p>
   {{end}}

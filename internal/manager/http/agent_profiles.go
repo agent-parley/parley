@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -105,20 +106,33 @@ func (s *Server) handleGlobalAgentProfileDelete(w http.ResponseWriter, r *http.R
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	beforeDeleteOverrides := cloneAgentRegistryOverrides(overrides)
 	deletedOverride, clearedDefault := deleteAgentProfileOverride(&overrides, profileID)
 	if _, err := agentregistry.Resolve(overrides, agentregistry.Overrides{}); err != nil {
 		s.writeGlobalAgentProfilesFragment(w, r, http.StatusBadRequest, err.Error(), "")
 		return
 	}
-	if err := s.ensureGlobalAgentProfileDeleteDoesNotBreakTemplates(r.Context(), profileID, overrides); err != nil {
+	var projectUpdates []projectAgentProfileOverrideUpdate
+	if deletedOverride || clearedDefault {
+		projectUpdates, err = s.projectAgentProfileOverrideUpdatesForGlobalDelete(r.Context(), profileID, beforeDeleteOverrides, overrides)
+		if err != nil {
+			s.writeGlobalAgentProfilesFragment(w, r, http.StatusBadRequest, err.Error(), "")
+			return
+		}
+	}
+	if err := s.ensureGlobalAgentProfileDeleteDoesNotBreakTemplates(r.Context(), profileID, overrides, projectUpdates); err != nil {
 		s.writeGlobalAgentProfilesFragment(w, r, http.StatusBadRequest, err.Error(), "")
 		return
 	}
-	if err := s.ensureProjectAgentRegistriesResolveAfterGlobalUpdate(r.Context(), profileID, overrides); err != nil {
+	if err := s.ensureProjectAgentRegistriesResolveAfterGlobalUpdate(r.Context(), profileID, overrides, projectUpdates); err != nil {
 		s.writeGlobalAgentProfilesFragment(w, r, http.StatusBadRequest, err.Error(), "")
 		return
 	}
-	if _, err := s.store.UpdateGlobalAgentRegistryOverrides(r.Context(), overrides); err != nil {
+	if len(projectUpdates) > 0 && r.Form.Get("confirm_rebase") != "1" {
+		s.writeGlobalAgentProfilesDeleteConfirmation(w, r, profileID, projectUpdates)
+		return
+	}
+	if err := s.store.UpdateAgentRegistryOverridesAtomically(r.Context(), overrides, projectAgentProfileOverrideUpdatesByID(projectUpdates)); err != nil {
 		s.writeGlobalAgentProfilesFragment(w, r, http.StatusBadRequest, err.Error(), "")
 		return
 	}
@@ -519,7 +533,12 @@ func (s *Server) ensureAgentProfileDeleteDoesNotBreakTemplates(ctx context.Conte
 	return nil
 }
 
-func (s *Server) ensureGlobalAgentProfileDeleteDoesNotBreakTemplates(ctx context.Context, profileID string, globalOverrides agentregistry.Overrides) error {
+type projectAgentProfileOverrideUpdate struct {
+	project   store.Project
+	overrides agentregistry.Overrides
+}
+
+func (s *Server) ensureGlobalAgentProfileDeleteDoesNotBreakTemplates(ctx context.Context, profileID string, globalOverrides agentregistry.Overrides, projectUpdates []projectAgentProfileOverrideUpdate) error {
 	referencing, err := s.workflowTemplatesReferencingProfile(ctx, profileID)
 	if err != nil {
 		return err
@@ -531,20 +550,17 @@ func (s *Server) ensureGlobalAgentProfileDeleteDoesNotBreakTemplates(ctx context
 	if err != nil {
 		return err
 	}
+	projectUpdatesByID := projectAgentProfileOverrideUpdatesByID(projectUpdates)
 	var unresolvedProjects []string
 	for _, project := range projects {
-		registry, err := s.resolveAgentRegistryAfterGlobalUpdate(ctx, project.ID, globalOverrides)
+		registry, err := s.resolveAgentRegistryAfterGlobalUpdate(ctx, project.ID, globalOverrides, projectUpdatesByID)
 		if err != nil {
 			return err
 		}
 		if _, ok := agentregistry.ProfileByID(registry, profileID); ok {
 			continue
 		}
-		label := project.ID
-		if strings.TrimSpace(project.Name) != "" {
-			label = project.Name + " (" + project.ID + ")"
-		}
-		unresolvedProjects = append(unresolvedProjects, label)
+		unresolvedProjects = append(unresolvedProjects, agentProfileProjectLabel(project))
 	}
 	if len(unresolvedProjects) > 0 {
 		sort.Strings(unresolvedProjects)
@@ -581,25 +597,91 @@ func workflowTemplateReferencesProfile(template workflow.Template, profileID str
 	return false
 }
 
-func (s *Server) ensureProjectAgentRegistriesResolveAfterGlobalUpdate(ctx context.Context, profileID string, globalOverrides agentregistry.Overrides) error {
+func (s *Server) ensureProjectAgentRegistriesResolveAfterGlobalUpdate(ctx context.Context, profileID string, globalOverrides agentregistry.Overrides, projectUpdates []projectAgentProfileOverrideUpdate) error {
 	projects, err := s.store.ListProjects(ctx)
 	if err != nil {
 		return err
 	}
+	projectUpdatesByID := projectAgentProfileOverrideUpdatesByID(projectUpdates)
 	for _, project := range projects {
-		if _, err := s.resolveAgentRegistryAfterGlobalUpdate(ctx, project.ID, globalOverrides); err != nil {
+		if _, err := s.resolveAgentRegistryAfterGlobalUpdate(ctx, project.ID, globalOverrides, projectUpdatesByID); err != nil {
 			return fmt.Errorf("cannot delete profile %s; project %s has agent registry overrides that would no longer resolve: %w", profileID, project.ID, err)
 		}
 	}
 	return nil
 }
 
-func (s *Server) resolveAgentRegistryAfterGlobalUpdate(ctx context.Context, projectID string, globalOverrides agentregistry.Overrides) (agentregistry.Registry, error) {
+func (s *Server) resolveAgentRegistryAfterGlobalUpdate(ctx context.Context, projectID string, globalOverrides agentregistry.Overrides, projectUpdates map[string]agentregistry.Overrides) (agentregistry.Registry, error) {
+	if projectOverrides, ok := projectUpdates[projectID]; ok {
+		return agentregistry.Resolve(globalOverrides, projectOverrides)
+	}
 	projectOverrides, err := s.store.GetProjectAgentRegistryOverrides(ctx, projectID)
 	if err != nil {
 		return agentregistry.Registry{}, err
 	}
 	return agentregistry.Resolve(globalOverrides, projectOverrides)
+}
+
+func (s *Server) projectAgentProfileOverrideUpdatesForGlobalDelete(ctx context.Context, profileID string, beforeGlobalOverrides, afterGlobalOverrides agentregistry.Overrides) ([]projectAgentProfileOverrideUpdate, error) {
+	projects, err := s.store.ListProjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var updates []projectAgentProfileOverrideUpdate
+	for _, project := range projects {
+		projectOverrides, err := s.store.GetProjectAgentRegistryOverrides(ctx, project.ID)
+		if err != nil {
+			return nil, err
+		}
+		if !profileOverrideExists(projectOverrides, profileID) {
+			continue
+		}
+		registryBeforeDelete, err := agentregistry.Resolve(beforeGlobalOverrides, projectOverrides)
+		if err != nil {
+			return nil, fmt.Errorf("cannot delete profile %s; project %s has agent registry overrides that do not currently resolve: %w", profileID, project.ID, err)
+		}
+		profileBeforeDelete, ok := agentregistry.ProfileByID(registryBeforeDelete, profileID)
+		if !ok {
+			continue
+		}
+		rebased := cloneAgentRegistryOverrides(projectOverrides)
+		baseline, baselineExists, err := projectAgentProfileSaveBaseline(afterGlobalOverrides, rebased, profileID)
+		if err != nil {
+			return nil, fmt.Errorf("cannot delete profile %s; project %s profile override cannot be rebased: %w", profileID, project.ID, err)
+		}
+		makeDefault := agentProfileIDEqual(registryBeforeDelete.DefaultProfileID, profileID)
+		upsertAgentProfileOverride(&rebased, profileBeforeDelete, baseline, baselineExists, makeDefault)
+		registryAfterDelete, err := agentregistry.Resolve(afterGlobalOverrides, rebased)
+		if err != nil {
+			return nil, fmt.Errorf("cannot delete profile %s; project %s rebased agent registry does not resolve: %w", profileID, project.ID, err)
+		}
+		if !reflect.DeepEqual(registryBeforeDelete, registryAfterDelete) {
+			return nil, fmt.Errorf("cannot delete profile %s; project %s rebase would change its effective agent registry", profileID, project.ID)
+		}
+		if reflect.DeepEqual(projectOverrides, rebased) {
+			continue
+		}
+		updates = append(updates, projectAgentProfileOverrideUpdate{project: project, overrides: rebased})
+	}
+	sort.Slice(updates, func(i, j int) bool {
+		return agentProfileProjectLabel(updates[i].project) < agentProfileProjectLabel(updates[j].project)
+	})
+	return updates, nil
+}
+
+func projectAgentProfileOverrideUpdatesByID(updates []projectAgentProfileOverrideUpdate) map[string]agentregistry.Overrides {
+	byID := make(map[string]agentregistry.Overrides, len(updates))
+	for _, update := range updates {
+		byID[update.project.ID] = update.overrides
+	}
+	return byID
+}
+
+func agentProfileProjectLabel(project store.Project) string {
+	if strings.TrimSpace(project.Name) != "" {
+		return project.Name + " (" + project.ID + ")"
+	}
+	return project.ID
 }
 
 func globalAgentProfileSaveBaseline(overrides agentregistry.Overrides, profileID string) (agentregistry.Profile, bool, error) {
@@ -733,6 +815,23 @@ func (s *Server) writeGlobalAgentProfilesFragment(w http.ResponseWriter, r *http
 		return
 	}
 	s.writeAgentProfilesFragment(w, statusCode, data)
+}
+
+func (s *Server) writeGlobalAgentProfilesDeleteConfirmation(w http.ResponseWriter, r *http.Request, profileID string, updates []projectAgentProfileOverrideUpdate) {
+	data, err := s.globalAgentProfileEditorData(r, "", "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	projects := make([]string, 0, len(updates))
+	for _, update := range updates {
+		projects = append(projects, agentProfileProjectLabel(update.project))
+	}
+	data.DeleteConfirmation = &web.AgentProfileDeleteConfirmationData{
+		ProfileID: profileID,
+		Projects:  projects,
+	}
+	s.writeAgentProfilesFragment(w, http.StatusOK, data)
 }
 
 func (s *Server) writeProjectAgentProfilesFragment(w http.ResponseWriter, r *http.Request, statusCode int, project store.Project, notice, status string) {
