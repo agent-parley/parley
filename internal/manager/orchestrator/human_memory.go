@@ -28,7 +28,7 @@ func (e *Engine) submitHumanMemoryApproval(ctx context.Context, wr store.Workflo
 	if err != nil {
 		return report.Report{}, err
 	}
-	if err := e.reserveRunAdmission(ctx); err != nil {
+	if err := e.reserveGlobalRunAdmission(); err != nil {
 		return report.Report{}, err
 	}
 	reservationTransferred := false

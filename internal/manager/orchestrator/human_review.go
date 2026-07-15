@@ -45,9 +45,6 @@ type HumanMemoryDecision struct {
 }
 
 func (e *Engine) SubmitHumanReview(ctx context.Context, runID, stageID string, submission HumanReviewSubmission) (report.Report, error) {
-	e.queueMu.Lock()
-	defer e.queueMu.Unlock()
-
 	wr, err := e.store.GetWorkflowRun(ctx, runID)
 	if err != nil {
 		return report.Report{}, err
@@ -81,7 +78,7 @@ func (e *Engine) submitHumanReviewVerdict(ctx context.Context, wr store.Workflow
 	if err := rep.Validate(); err != nil {
 		return report.Report{}, fmt.Errorf("%w: %v", ErrInvalidHumanReview, err)
 	}
-	if err := e.reserveRunAdmission(ctx); err != nil {
+	if err := e.reserveGlobalRunAdmission(); err != nil {
 		return report.Report{}, err
 	}
 	reservationTransferred := false

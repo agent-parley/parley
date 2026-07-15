@@ -65,9 +65,6 @@ func (e *Engine) pauseRunAtBoundary(ctx context.Context, wr store.WorkflowRun, w
 }
 
 func (e *Engine) ResumeRun(ctx context.Context, runID string) error {
-	e.queueMu.Lock()
-	defer e.queueMu.Unlock()
-
 	wr, err := e.store.GetWorkflowRun(ctx, runID)
 	if err != nil {
 		return err
@@ -79,7 +76,7 @@ func (e *Engine) ResumeRun(ctx context.Context, runID string) error {
 	if err != nil {
 		return err
 	}
-	if err := e.reserveRunAdmission(ctx); err != nil {
+	if err := e.reserveGlobalRunAdmission(); err != nil {
 		return err
 	}
 	reservationTransferred := false

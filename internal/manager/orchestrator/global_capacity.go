@@ -27,6 +27,10 @@ func (e *Engine) reserveRunAdmission(ctx context.Context) error {
 	if available <= 0 {
 		return ErrNoRunnerSlots
 	}
+	return e.reserveGlobalRunAdmission()
+}
+
+func (e *Engine) reserveGlobalRunAdmission() error {
 	snapshot, ok := e.tryReserveGlobalRun()
 	if !ok {
 		return &globalRunCapacityError{snapshot: snapshot}

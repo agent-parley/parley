@@ -259,7 +259,7 @@ func TestGlobalCapHeldEventOncePerDispatchPass(t *testing.T) {
 	t.Run("global cap is binding", func(t *testing.T) {
 		ctx := context.Background()
 		runner := newGlobalConcurrencyRunner()
-		policy := QueuePolicy{AutoWhenReady: false, MaxConcurrent: 2, BacklogCap: 10}
+		policy := QueuePolicy{AutoWhenReady: true, MaxConcurrent: 2, BacklogCap: 10}
 		env := newTestEnv(t, runner, EngineOptions{
 			QueuePolicy:         &policy,
 			RunnerSlots:         2,
@@ -273,10 +273,9 @@ func TestGlobalCapHeldEventOncePerDispatchPass(t *testing.T) {
 			t.Fatalf("submit turn: %v", err)
 		}
 		_ = receiveDispatch(t, runner.turnDispatches)
-		_ = startGlobalConcurrencyRun(t, ctx, env.engine, "pending one")
-		_ = startGlobalConcurrencyRun(t, ctx, env.engine, "pending two")
+		_ = createPendingGlobalConcurrencyRun(t, env.store, "pending one")
+		_ = createPendingGlobalConcurrencyRun(t, env.store, "pending two")
 
-		env.engine.queuePolicy.AutoWhenReady = true
 		if err := env.engine.DispatchPending(ctx); err != nil {
 			t.Fatalf("DispatchPending() error = %v", err)
 		}
@@ -304,9 +303,8 @@ func TestGlobalCapHeldEventOncePerDispatchPass(t *testing.T) {
 		ensureGlobalConcurrencyProject(t, env.store, store.DefaultProjectID)
 		firstRunID := startGlobalConcurrencyRun(t, ctx, env.engine, "running")
 		_ = receiveDispatch(t, runner.runDispatches)
-		env.engine.queuePolicy.AutoWhenReady = false
-		_ = startGlobalConcurrencyRun(t, ctx, env.engine, "pending")
-		env.engine.queuePolicy.AutoWhenReady = true
+		_ = createPendingGlobalConcurrencyRun(t, env.store, "pending")
+
 		if err := env.engine.DispatchPending(ctx); err != nil {
 			t.Fatalf("DispatchPending() error = %v", err)
 		}
@@ -381,6 +379,15 @@ func TestGlobalCapacityCountersAreRaceSafe(t *testing.T) {
 	if snapshot.runsInflight != 0 || snapshot.turnsInflight != 0 {
 		t.Fatalf("final global capacity = %+v, want zero", snapshot)
 	}
+}
+
+func createPendingGlobalConcurrencyRun(t *testing.T, st *store.Store, idea string) string {
+	t.Helper()
+	wr, err := st.CreateWorkflowRunInput(context.Background(), contract.TaskInput{Idea: idea, WorkflowTemplateID: workflow.AutonomousPRDeliveryID})
+	if err != nil {
+		t.Fatalf("create pending run %q: %v", idea, err)
+	}
+	return wr.Run.ID
 }
 
 func startGlobalConcurrencyRun(t *testing.T, ctx context.Context, engine *Engine, idea string) string {
