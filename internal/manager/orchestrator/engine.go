@@ -737,14 +737,17 @@ func (e *Engine) isCancelling(runID string) bool {
 	return e.cancelling[runID]
 }
 
-func (e *Engine) markPausing(runID string) bool {
+func (e *Engine) markPausingIfActive(runID string) (marked bool, active bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if _, ok := e.activeRuns[runID]; !ok {
+		return false, false
+	}
 	if e.pausing[runID] {
-		return false
+		return false, true
 	}
 	e.pausing[runID] = true
-	return true
+	return true, true
 }
 
 func (e *Engine) clearPausing(runID string) {
@@ -819,6 +822,9 @@ func (e *Engine) HandleRunnerDown(ctx context.Context, runnerID, reason string) 
 		wr, err := e.store.GetWorkflowRun(ctx, runID)
 		if err != nil {
 			joined = append(joined, err)
+			continue
+		}
+		if wr.Run.Status != store.RunStatusRunning {
 			continue
 		}
 		e.markRunnerDown(runID, "runner_disconnected")

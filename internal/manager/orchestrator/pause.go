@@ -23,7 +23,15 @@ func (e *Engine) RequestPause(ctx context.Context, runID string, actor event.Act
 	if wr.Run.Status != store.RunStatusRunning {
 		return fmt.Errorf("%w: run %s has status %q", ErrRunNotRunning, runID, wr.Run.Status)
 	}
-	if !e.markPausing(runID) {
+	marked, active := e.markPausingIfActive(runID)
+	if !active {
+		latest, latestErr := e.store.GetWorkflowRun(ctx, runID)
+		if latestErr == nil && latest.Run.Status != store.RunStatusRunning {
+			return fmt.Errorf("%w: run %s has status %q", ErrRunNotRunning, runID, latest.Run.Status)
+		}
+		return fmt.Errorf("%w: run %s is not active", ErrRunNotRunning, runID)
+	}
+	if !marked {
 		return nil
 	}
 	if actor.Kind == "" {

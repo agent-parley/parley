@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -113,6 +114,170 @@ func TestOperatorPauseEditRemainingStagesAndResume(t *testing.T) {
 	}
 }
 
+func TestCancelWhilePausedTerminatesAndRejectsResume(t *testing.T) {
+	ctx := context.Background()
+	runner := newPauseBoundaryRunner()
+	env := newTestEnv(t, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 100}})
+	template := pauseWorkflowTemplate("pause_cancel_template")
+	if err := env.store.CreateWorkflowTemplate(ctx, template); err != nil {
+		t.Fatalf("create workflow template: %v", err)
+	}
+	runID := startPausedRunAtImplementationBoundary(t, ctx, env, runner, template.ID, "cancel while paused")
+
+	if err := env.engine.CancelRun(ctx, runID); err != nil {
+		t.Fatalf("CancelRun() error = %v", err)
+	}
+	waitForRunStatus(t, env.store, runID, store.RunStatusCancelled)
+	events, err := env.store.ListEvents(ctx, runID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if !hasEventType(events, "run.cancelled") {
+		t.Fatalf("missing run.cancelled event: %#v", eventTypes(events))
+	}
+	if err := env.engine.ResumeRun(ctx, runID); !errors.Is(err, ErrRunNotPaused) {
+		t.Fatalf("ResumeRun() after cancel error = %v, want ErrRunNotPaused", err)
+	}
+}
+
+func TestResumePausedRunWithoutEditsMatchesUnpausedDispatchSequence(t *testing.T) {
+	ctx := context.Background()
+	template := pauseWorkflowTemplate("pause_plain_resume_template")
+
+	unpausedRunner := newPauseBoundaryRunner()
+	unpausedEnv := newTestEnv(t, unpausedRunner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 100}})
+	if err := unpausedEnv.store.CreateWorkflowTemplate(ctx, template); err != nil {
+		t.Fatalf("create unpaused workflow template: %v", err)
+	}
+	unpausedID, err := unpausedEnv.engine.StartProjectRunInput(ctx, store.DefaultProjectID, contract.TaskInput{Idea: "unpaused baseline", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: template.ID})
+	if err != nil {
+		t.Fatalf("StartProjectRunInput(unpaused) error = %v", err)
+	}
+	unpausedRunner.expectDispatch(t, unpausedID, "implementation")
+	unpausedRunner.releaseOne()
+	waitForRunStatus(t, unpausedEnv.store, unpausedID, store.RunStatusCompleted)
+	unpausedSeq := unpausedRunner.workflowStageIDsForRun(unpausedID)
+
+	pausedRunner := newPauseBoundaryRunner()
+	pausedEnv := newTestEnv(t, pausedRunner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 100}})
+	if err := pausedEnv.store.CreateWorkflowTemplate(ctx, template); err != nil {
+		t.Fatalf("create paused workflow template: %v", err)
+	}
+	pausedID := startPausedRunAtImplementationBoundary(t, ctx, pausedEnv, pausedRunner, template.ID, "plain paused resume")
+	if err := pausedEnv.engine.ResumeRun(ctx, pausedID); err != nil {
+		t.Fatalf("ResumeRun() error = %v", err)
+	}
+	waitForRunStatus(t, pausedEnv.store, pausedID, store.RunStatusCompleted)
+	pausedSeq := pausedRunner.workflowStageIDsForRun(pausedID)
+
+	if strings.Join(pausedSeq, ",") != strings.Join(unpausedSeq, ",") {
+		t.Fatalf("paused dispatch sequence = %#v, want unpaused sequence %#v", pausedSeq, unpausedSeq)
+	}
+}
+
+func TestPausedRunSurvivesRestartRecoveryAndResumes(t *testing.T) {
+	ctx := context.Background()
+	runner := newPauseBoundaryRunner()
+	env := newTestEnv(t, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 100}})
+	template := pauseWorkflowTemplate("pause_restart_template")
+	if err := env.store.CreateWorkflowTemplate(ctx, template); err != nil {
+		t.Fatalf("create workflow template: %v", err)
+	}
+	runID := startPausedRunAtImplementationBoundary(t, ctx, env, runner, template.ID, "restart while paused")
+
+	if err := env.engine.failInterruptedRunning(ctx); err != nil {
+		t.Fatalf("failInterruptedRunning() error = %v", err)
+	}
+	assertRunStatus(t, env.store, runID, store.RunStatusPaused)
+	if err := env.engine.ResumeRun(ctx, runID); err != nil {
+		t.Fatalf("ResumeRun() error = %v", err)
+	}
+	waitForRunStatus(t, env.store, runID, store.RunStatusCompleted)
+}
+
+func TestPausedRunSurvivesRunnerDownAndResumes(t *testing.T) {
+	ctx := context.Background()
+	runner := newPauseBoundaryRunner()
+	env := newTestEnv(t, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 100}})
+	template := pauseWorkflowTemplate("pause_runner_down_template")
+	if err := env.store.CreateWorkflowTemplate(ctx, template); err != nil {
+		t.Fatalf("create workflow template: %v", err)
+	}
+	runID := startPausedRunAtImplementationBoundary(t, ctx, env, runner, template.ID, "runner down while paused")
+
+	if err := env.engine.HandleRunnerDown(ctx, "runner-test", "connection lost"); err != nil {
+		t.Fatalf("HandleRunnerDown() error = %v", err)
+	}
+	assertRunStatus(t, env.store, runID, store.RunStatusPaused)
+	if err := env.engine.ResumeRun(ctx, runID); err != nil {
+		t.Fatalf("ResumeRun() error = %v", err)
+	}
+	waitForRunStatus(t, env.store, runID, store.RunStatusCompleted)
+}
+
+func TestAddedPendingStageExecutesInEditedOrderOnResume(t *testing.T) {
+	ctx := context.Background()
+	runner := newPauseBoundaryRunner()
+	env := newTestEnv(t, runner, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 100}})
+	template := pauseWorkflowTemplate("pause_add_stage_template")
+	if err := env.store.CreateWorkflowTemplate(ctx, template); err != nil {
+		t.Fatalf("create workflow template: %v", err)
+	}
+	runID := startPausedRunAtImplementationBoundary(t, ctx, env, runner, template.ID, "add a stage while paused")
+
+	edited, err := env.store.LatestWorkflowTemplateSnapshot(ctx, runID)
+	if err != nil {
+		t.Fatalf("latest workflow template snapshot: %v", err)
+	}
+	added := workflow.StageTemplate{ID: "extra_validation", Type: workflow.StageTypeValidation, Label: "Extra validation", Actor: workflow.ActorHarness}
+	var reordered []workflow.StageTemplate
+	for _, stage := range edited.Stages {
+		reordered = append(reordered, stage)
+		if stage.ID == "implementation" {
+			reordered = append(reordered, added)
+		}
+	}
+	edited.Stages = reordered
+	edited.Edges = workflow.DeriveTemplateEdges(edited)
+	if err := env.engine.UpdateRunWorkflowSnapshot(ctx, runID, edited, event.Actor{Kind: event.ActorKindOperator, ID: "test"}); err != nil {
+		t.Fatalf("UpdateRunWorkflowSnapshot() error = %v", err)
+	}
+	if err := env.engine.ResumeRun(ctx, runID); err != nil {
+		t.Fatalf("ResumeRun() error = %v", err)
+	}
+	waitForRunStatus(t, env.store, runID, store.RunStatusCompleted)
+	got := runner.workflowStageIDsForRun(runID)
+	want := []string{"implementation", "extra_validation", "validation"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("workflow dispatch sequence = %#v, want %#v", got, want)
+	}
+}
+
+func TestRequestPauseRejectsRunningRunWithoutActiveGoroutine(t *testing.T) {
+	ctx := context.Background()
+	env := newTestEnv(t, &capturingRunner{}, EngineOptions{QueuePolicy: &QueuePolicy{AutoWhenReady: false, MaxConcurrent: 1, BacklogCap: 100}})
+	runID, err := env.engine.StartProjectRunInput(ctx, store.DefaultProjectID, contract.TaskInput{Idea: "stale running", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: workflow.QuickFixDeliveryID})
+	if err != nil {
+		t.Fatalf("StartProjectRunInput() error = %v", err)
+	}
+	if err := env.store.UpdateRunStatus(ctx, runID, store.RunStatusRunning); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	if err := env.engine.RequestPause(ctx, runID, event.Actor{Kind: event.ActorKindOperator, ID: "test"}); !errors.Is(err, ErrRunNotRunning) {
+		t.Fatalf("RequestPause() error = %v, want ErrRunNotRunning", err)
+	}
+	if env.engine.isPausing(runID) {
+		t.Fatal("inactive running run left a stale pausing flag")
+	}
+	events, err := env.store.ListEvents(ctx, runID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if hasEventType(events, "run.pause_requested") {
+		t.Fatalf("inactive running run emitted run.pause_requested: %#v", eventTypes(events))
+	}
+}
+
 func TestOperatorPauseRequestedDuringStopReportExpiresOnCompletion(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
@@ -206,6 +371,21 @@ func workflowTemplateHasStage(template workflow.Template, id string) bool {
 	return false
 }
 
+func startPausedRunAtImplementationBoundary(t *testing.T, ctx context.Context, env *testEnv, runner *pauseBoundaryRunner, templateID, idea string) string {
+	t.Helper()
+	runID, err := env.engine.StartProjectRunInput(ctx, store.DefaultProjectID, contract.TaskInput{Idea: idea, RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: templateID})
+	if err != nil {
+		t.Fatalf("StartProjectRunInput() error = %v", err)
+	}
+	runner.expectDispatch(t, runID, "implementation")
+	if err := env.engine.RequestPause(ctx, runID, event.Actor{Kind: event.ActorKindOperator, ID: "test"}); err != nil {
+		t.Fatalf("RequestPause() error = %v", err)
+	}
+	runner.releaseOne()
+	waitForRunStatus(t, env.store, runID, store.RunStatusPaused)
+	return runID
+}
+
 type stopReportBlockingRenderer struct {
 	mu        sync.Mutex
 	blocked   bool
@@ -291,6 +471,15 @@ func (r *pauseBoundaryRunner) waitForDispatch(t *testing.T) contract.Dispatch {
 	}
 }
 
+func (r *pauseBoundaryRunner) expectDispatch(t *testing.T, runID, workflowStageID string) contract.Dispatch {
+	t.Helper()
+	disp := r.waitForDispatch(t)
+	if disp.RunID != runID || workflowStageIDFromDispatch(disp) != workflowStageID {
+		t.Fatalf("dispatch = run %s workflow_stage %s stage_type %s, want run %s workflow_stage %s", disp.RunID, workflowStageIDFromDispatch(disp), disp.StageType, runID, workflowStageID)
+	}
+	return disp
+}
+
 func (r *pauseBoundaryRunner) releaseOne() {
 	r.releases <- struct{}{}
 }
@@ -305,6 +494,26 @@ func (r *pauseBoundaryRunner) dispatchCountByRunAndType(runID, stageType string)
 		}
 	}
 	return count
+}
+
+func (r *pauseBoundaryRunner) workflowStageIDsForRun(runID string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := []string{}
+	for _, disp := range r.disps {
+		if disp.RunID == runID {
+			out = append(out, workflowStageIDFromDispatch(disp))
+		}
+	}
+	return out
+}
+
+func workflowStageIDFromDispatch(disp contract.Dispatch) string {
+	workflowStageID, _ := disp.Input["workflow_stage_id"].(string)
+	if workflowStageID != "" {
+		return workflowStageID
+	}
+	return disp.StageType
 }
 
 func (r *pauseBoundaryRunner) dispatchTypes() []string {
