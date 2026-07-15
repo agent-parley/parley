@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,9 @@ func TestLoadAbsentFilesUsesDefaults(t *testing.T) {
 	}
 	if loaded.Settings.Conversation.Budget != 1 || loaded.Settings.Conversation.IdleWarmHoldTTL != 15*time.Minute || loaded.Settings.Conversation.TurnDeadline == nil || *loaded.Settings.Conversation.TurnDeadline != 15*time.Minute {
 		t.Fatalf("conversation = %+v, want conversation defaults", loaded.Settings.Conversation)
+	}
+	if loaded.Settings.Execution.GlobalMaxConcurrent != 0 || loaded.Settings.Execution.InteractiveReserve != 1 {
+		t.Fatalf("execution = %+v, want disabled cap with reserve 1", loaded.Settings.Execution)
 	}
 	if len(loaded.Settings.AgentRegistry.Families) != 1 || loaded.Settings.AgentRegistry.Families[0].ID != agentregistry.FamilyPi {
 		t.Fatalf("agent families = %+v, want Pi-only defaults", loaded.Settings.AgentRegistry.Families)
@@ -62,8 +66,8 @@ func TestLoadProjectOverridesGlobal(t *testing.T) {
 	dir := t.TempDir()
 	globalPath := filepath.Join(dir, "global.toml")
 	projectPath := filepath.Join(dir, "project.toml")
-	writeFile(t, globalPath, "[queue]\nauto_when_ready = false\nmax_concurrent = 2\nbacklog_cap = 10\n\n[conversation]\nbudget = 2\nidle_warm_hold_ttl = \"10m\"\nturn_deadline = \"20m\"\n")
-	writeFile(t, projectPath, "[queue]\nauto_when_ready = true\nbacklog_cap = 25\n\n[conversation]\nidle_warm_hold_ttl = \"30m\"\nturn_deadline = \"0s\"\n")
+	writeFile(t, globalPath, "[queue]\nauto_when_ready = false\nmax_concurrent = 2\nbacklog_cap = 10\n\n[conversation]\nbudget = 2\nidle_warm_hold_ttl = \"10m\"\nturn_deadline = \"20m\"\n\n[execution]\nglobal_max_concurrent = 3\n")
+	writeFile(t, projectPath, "[queue]\nauto_when_ready = true\nbacklog_cap = 25\n\n[conversation]\nidle_warm_hold_ttl = \"30m\"\nturn_deadline = \"0s\"\n\n[execution]\ninteractive_reserve = 0\n")
 	loaded, err := Load(LoadOptions{GlobalPath: globalPath, ProjectPath: projectPath})
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -75,6 +79,9 @@ func TestLoadProjectOverridesGlobal(t *testing.T) {
 	conversation := loaded.Settings.Conversation
 	if conversation.Budget != 2 || conversation.IdleWarmHoldTTL != 30*time.Minute || conversation.TurnDeadline == nil || *conversation.TurnDeadline != 0 {
 		t.Fatalf("conversation = %+v, want project overrides layered on global with deadline disabled", conversation)
+	}
+	if loaded.Settings.Execution.GlobalMaxConcurrent != 3 || loaded.Settings.Execution.InteractiveReserve != 0 {
+		t.Fatalf("execution = %+v, want project reserve layered on global cap", loaded.Settings.Execution)
 	}
 }
 
@@ -194,6 +201,32 @@ func TestLoadRejectsInvalidConversationPolicy(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "conversation.turn_deadline") {
 		t.Fatalf("error = %q, want turn deadline validation", err.Error())
+	}
+}
+
+func TestLoadRejectsInvalidGlobalConcurrency(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		cap     int
+		reserve int
+		wantErr bool
+	}{
+		{name: "cap equals reserve", cap: 1, reserve: 1, wantErr: true},
+		{name: "cap below reserve", cap: 1, reserve: 2, wantErr: true},
+		{name: "disabled accepts reserve", cap: 0, reserve: 5},
+		{name: "enabled above reserve", cap: 2, reserve: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			writeFile(t, path, fmt.Sprintf("[execution]\nglobal_max_concurrent = %d\ninteractive_reserve = %d\n", test.cap, test.reserve))
+			_, err := Load(LoadOptions{ProjectPath: path})
+			if test.wantErr && (err == nil || !strings.Contains(err.Error(), "global_max_concurrent")) {
+				t.Fatalf("Load() error = %v, want global cap validation failure", err)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("Load() error = %v, want success", err)
+			}
+		})
 	}
 }
 

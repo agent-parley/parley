@@ -45,6 +45,9 @@ type HumanMemoryDecision struct {
 }
 
 func (e *Engine) SubmitHumanReview(ctx context.Context, runID, stageID string, submission HumanReviewSubmission) (report.Report, error) {
+	e.queueMu.Lock()
+	defer e.queueMu.Unlock()
+
 	wr, err := e.store.GetWorkflowRun(ctx, runID)
 	if err != nil {
 		return report.Report{}, err
@@ -78,6 +81,15 @@ func (e *Engine) submitHumanReviewVerdict(ctx context.Context, wr store.Workflow
 	if err := rep.Validate(); err != nil {
 		return report.Report{}, fmt.Errorf("%w: %v", ErrInvalidHumanReview, err)
 	}
+	if err := e.reserveRunAdmission(ctx); err != nil {
+		return report.Report{}, err
+	}
+	reservationTransferred := false
+	defer func() {
+		if !reservationTransferred {
+			e.releaseGlobalRun()
+		}
+	}()
 	changed, err := e.store.UpdateRunStatusFrom(ctx, wr.Run.ID, store.RunStatusAwaitingHuman, store.RunStatusRunning)
 	if err != nil {
 		return report.Report{}, err
@@ -112,17 +124,19 @@ func (e *Engine) submitHumanReviewVerdict(ctx context.Context, wr store.Workflow
 		rollbackResume()
 		return report.Report{}, err
 	}
-	e.resumeRunAfterHumanStage(wr.Run.ID, runtimeStage.Template.ID)
+	reservationTransferred = e.resumeRunAfterHumanStage(wr.Run.ID, runtimeStage.Template.ID)
 	return rep, nil
 }
 
-func (e *Engine) resumeRunAfterHumanStage(runID, workflowStageID string) {
+func (e *Engine) resumeRunAfterHumanStage(runID, workflowStageID string) bool {
 	runCtx, cancel := context.WithCancel(e.rootCtx)
 	e.registerActiveRun(runID, cancel)
 	if !e.spawn(func() { e.executeRunAfter(runCtx, runID, workflowStageID) }) {
 		cancel()
 		e.unregisterActiveRun(runID)
+		return false
 	}
+	return true
 }
 
 func humanReviewReport(wr store.WorkflowRun, stage store.Stage, templateStage workflow.StageTemplate, submission HumanReviewSubmission) (report.Report, error) {

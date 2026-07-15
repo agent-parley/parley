@@ -202,8 +202,14 @@ func (e *Engine) reserveConversationTurn() ([]*conversationSession, *reservedCon
 		if session.running || len(session.queue) == 0 {
 			continue
 		}
+		if _, ok := e.tryReserveGlobalTurn(); !ok {
+			session.ready = true
+			skipped = append(skipped, conversationID)
+			continue
+		}
 		evictions, ok := e.reserveConversationBudgetLocked(session)
 		if !ok {
+			e.releaseGlobalTurn()
 			session.ready = true
 			skipped = append(skipped, conversationID)
 			continue
@@ -355,6 +361,8 @@ func (e *Engine) finishReservedConversationTurn(work *reservedConversationTurn) 
 		e.scheduleConversationIdleEvictionLocked(session, time.Now().UTC())
 	}
 	e.conversationMu.Unlock()
+	e.releaseGlobalTurn()
+	e.kickDispatchPending()
 
 	if timedOut {
 		background := context.Background()

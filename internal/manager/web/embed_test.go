@@ -46,6 +46,10 @@ func TestNewQueueViewCopiesQueueState(t *testing.T) {
 		RunnerSlots:            4,
 		ReadyRunnerSlots:       1,
 		EffectiveMaxConcurrent: 3,
+		RunsInflight:           2,
+		TurnsInflight:          1,
+		GlobalMaxConcurrent:    4,
+		InteractiveReserve:     1,
 	}
 
 	view := NewQueueView(state)
@@ -61,6 +65,9 @@ func TestNewQueueViewCopiesQueueState(t *testing.T) {
 	}
 	if view.RunnerSlots != 4 || view.ReadyRunnerSlots != 1 || view.EffectiveMaxConcurrent != 3 {
 		t.Fatalf("runner limits = slots %d ready %d effective %d, want 4, 1, 3", view.RunnerSlots, view.ReadyRunnerSlots, view.EffectiveMaxConcurrent)
+	}
+	if view.RunsInflight != 2 || view.TurnsInflight != 1 || view.GlobalMaxConcurrent != 4 || view.InteractiveReserve != 1 {
+		t.Fatalf("global capacity = runs %d turns %d cap %d reserve %d, want 2, 1, 4, 1", view.RunsInflight, view.TurnsInflight, view.GlobalMaxConcurrent, view.InteractiveReserve)
 	}
 }
 

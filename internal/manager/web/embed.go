@@ -319,6 +319,10 @@ type QueueView struct {
 	RunnerSlots            int
 	ReadyRunnerSlots       int
 	EffectiveMaxConcurrent int
+	RunsInflight           int
+	TurnsInflight          int
+	GlobalMaxConcurrent    int
+	InteractiveReserve     int
 }
 
 func NewQueueView(state orchestrator.QueueState) QueueView {
@@ -331,6 +335,10 @@ func NewQueueView(state orchestrator.QueueState) QueueView {
 		RunnerSlots:            state.RunnerSlots,
 		ReadyRunnerSlots:       state.ReadyRunnerSlots,
 		EffectiveMaxConcurrent: state.EffectiveMaxConcurrent,
+		RunsInflight:           state.RunsInflight,
+		TurnsInflight:          state.TurnsInflight,
+		GlobalMaxConcurrent:    state.GlobalMaxConcurrent,
+		InteractiveReserve:     state.InteractiveReserve,
 	}
 }
 

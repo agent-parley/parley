@@ -28,6 +28,15 @@ func (e *Engine) submitHumanMemoryApproval(ctx context.Context, wr store.Workflo
 	if err != nil {
 		return report.Report{}, err
 	}
+	if err := e.reserveRunAdmission(ctx); err != nil {
+		return report.Report{}, err
+	}
+	reservationTransferred := false
+	defer func() {
+		if !reservationTransferred {
+			e.releaseGlobalRun()
+		}
+	}()
 	changed, err := e.store.UpdateRunStatusFrom(ctx, wr.Run.ID, store.RunStatusAwaitingHuman, store.RunStatusRunning)
 	if err != nil {
 		return report.Report{}, err
@@ -93,7 +102,7 @@ func (e *Engine) submitHumanMemoryApproval(ctx context.Context, wr store.Workflo
 		rollbackAppliedUpdate()
 		return report.Report{}, err
 	}
-	e.resumeRunAfterHumanStage(wr.Run.ID, runtimeStage.Template.ID)
+	reservationTransferred = e.resumeRunAfterHumanStage(wr.Run.ID, runtimeStage.Template.ID)
 	return rep, nil
 }
 
