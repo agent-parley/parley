@@ -353,6 +353,14 @@ type RunView struct {
 	Outcome            OutcomeView
 	DiffLines          []DiffLineView
 	DiffIsLong         bool
+	CanPause           bool
+	PauseRequested     bool
+	CanResume          bool
+	CanCancel          bool
+	WorkflowEditPath   string
+	PausePath          string
+	ResumePath         string
+	CancelPath         string
 	CSRF               string
 }
 
@@ -580,11 +588,34 @@ func NewRunView(bundle store.RunBundle) RunView {
 		}
 	}
 	view.StageGroups = stageGroups(bundle.Run.Status, bundle.Stages, bundle.Events)
+	view.CanPause = bundle.Run.Status == store.RunStatusRunning
+	view.PauseRequested = runPauseRequested(bundle)
+	view.CanResume = bundle.Run.Status == store.RunStatusPaused
+	view.CanCancel = !store.RunStatusIsTerminal(bundle.Run.Status)
+	view.WorkflowEditPath = "/projects/" + bundle.Project.ID + "/runs/" + bundle.Run.ID + "/workflow"
+	view.PausePath = "/projects/" + bundle.Project.ID + "/runs/" + bundle.Run.ID + "/pause"
+	view.ResumePath = "/projects/" + bundle.Project.ID + "/runs/" + bundle.Run.ID + "/resume"
+	view.CancelPath = "/projects/" + bundle.Project.ID + "/runs/" + bundle.Run.ID + "/cancel"
 	view.TaskPlan = taskPlanView(bundle, view.ArtifactViews)
 	view.Outcome = outcomeView(bundle)
 	view.DiffLines = diffLines(view.DiffPatch.Preview)
 	view.DiffIsLong = len(view.DiffLines) > 80
 	return view
+}
+
+func runPauseRequested(bundle store.RunBundle) bool {
+	if bundle.Run.Status != store.RunStatusRunning {
+		return false
+	}
+	for i := len(bundle.Events) - 1; i >= 0; i-- {
+		switch bundle.Events[i].Type {
+		case "run.pause_requested":
+			return true
+		case "run.paused", "run.resumed", "run.completed", "run.failed", "run.cancelled", "run.abandoned":
+			return false
+		}
+	}
+	return false
 }
 
 func NewRenderer() (*TemplateRenderer, error) {
@@ -614,7 +645,7 @@ func (r *TemplateRenderer) ExecutePage(name string, data any) (string, error) {
 func (r *TemplateRenderer) RenderRunFragments(bundle store.RunBundle) (string, error) {
 	view := NewRunView(bundle)
 	var buf bytes.Buffer
-	for _, name := range []string{"run_summary.html", "story_panel.html", "review_panel.html"} {
+	for _, name := range []string{"run_summary.html", "run_controls.html", "story_panel.html", "review_panel.html"} {
 		if err := r.templates.ExecuteTemplate(&buf, name, view); err != nil {
 			return "", fmt.Errorf("execute fragment %s: %w", name, err)
 		}
@@ -670,7 +701,7 @@ func stageGroups(runStatus string, stages []store.Stage, events []event.Event) [
 			}
 		}
 		group.Summary = stageSummary(stage, group.Events)
-		group.Expanded = stage.Status == store.StageStatusRunning || stage.Status == "awaiting_human" || len(group.Events) == 0
+		group.Expanded = stage.Status == store.StageStatusRunning || stage.Status == "awaiting_human" || (runStatus == store.RunStatusPaused && stage.Status == store.StageStatusPending) || len(group.Events) == 0
 		groups = append(groups, group)
 	}
 	return groups
@@ -1115,7 +1146,7 @@ func statusClass(status string) string {
 		return "status-completed"
 	case "failed", "invalid", "down", "cancelled":
 		return "status-failed"
-	case "running", "awaiting_human", "suspect":
+	case "running", "awaiting_human", "paused", "suspect":
 		return "status-running"
 	default:
 		return "status-pending"

@@ -11,9 +11,9 @@
   {{template "notifications_center.html" .Notifications}}
   <main class="template-edit-main">
     <header class="settings-header">
-      <p class="breadcrumb"><a href="/templates">Workflow templates</a> · <code>{{.Template.ID}}</code></p>
-      <h1>Edit workflow template</h1>
-      <p class="muted">Use forms for stage settings and order. Start, end, and fix-loop edges are derived by the harness every time this template is saved.</p>
+      <p class="breadcrumb"><a href="{{.BackPath}}">{{.Breadcrumb}}</a> · <code>{{.Template.ID}}</code></p>
+      <h1>{{.Heading}}</h1>
+      <p class="muted">{{.Help}}</p>
     </header>
     {{with .Notice}}
     <section class="notice" role="status" aria-live="polite">
@@ -88,7 +88,7 @@
             <h2>Stage sequence</h2>
             <p class="muted">Enable optional stages, set numeric order for compute stages, and edit stage-specific settings. Edges are not editable here.</p>
           </div>
-          <button type="submit">Save template</button>
+          <button type="submit">{{.SubmitLabel}}</button>
         </div>
         <div class="stage-editor-list">
           {{range .StageRows}}
@@ -182,7 +182,7 @@
           </fieldset>
           {{end}}
         </div>
-        <button type="submit">Save template</button>
+        <button type="submit">{{.SubmitLabel}}</button>
       </section>
     </form>
     {{end}}

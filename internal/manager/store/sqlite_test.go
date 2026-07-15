@@ -1600,12 +1600,19 @@ func TestRunAttemptListsStatusesAndWorkflowSnapshots(t *testing.T) {
 	if changed {
 		t.Fatal("stale pending transition unexpectedly changed run")
 	}
+	changed, err = st.UpdateRunStatusIfOpen(ctx, wr.Run.ID, RunStatusPaused)
+	if err != nil {
+		t.Fatalf("update run status if open to paused: %v", err)
+	}
+	if !changed {
+		t.Fatal("open running run did not transition to paused")
+	}
 	changed, err = st.UpdateRunStatusIfOpen(ctx, wr.Run.ID, RunStatusCompleted)
 	if err != nil {
 		t.Fatalf("update run status if open: %v", err)
 	}
 	if !changed {
-		t.Fatal("open running run did not transition to completed")
+		t.Fatal("open paused run did not transition to completed")
 	}
 	changed, err = st.UpdateRunStatusIfOpen(ctx, wr.Run.ID, RunStatusFailed)
 	if err != nil {
@@ -1614,7 +1621,7 @@ func TestRunAttemptListsStatusesAndWorkflowSnapshots(t *testing.T) {
 	if changed {
 		t.Fatal("terminal run transitioned despite UpdateRunStatusIfOpen")
 	}
-	if !RunStatusIsTerminal(RunStatusCompleted) || RunStatusIsTerminal(RunStatusRunning) {
+	if !RunStatusIsTerminal(RunStatusCompleted) || RunStatusIsTerminal(RunStatusRunning) || RunStatusIsTerminal(RunStatusPaused) {
 		t.Fatal("RunStatusIsTerminal returned unexpected values")
 	}
 
@@ -1648,6 +1655,142 @@ func TestRunAttemptListsStatusesAndWorkflowSnapshots(t *testing.T) {
 	if _, err := st.LatestWorkflowSnapshot(ctx, "missing_run"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("latest missing snapshot error = %v, want sql.ErrNoRows", err)
 	}
+}
+
+func TestPausedRunKeepsWorkflowTemplateActive(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	template := reconcileWorkflowTemplate("paused_active_template", true)
+	if err := st.CreateWorkflowTemplate(ctx, template); err != nil {
+		t.Fatalf("create workflow template: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunForProjectInput(ctx, DefaultProjectID, contract.TaskInput{Idea: "paused active", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: template.ID})
+	if err != nil {
+		t.Fatalf("create workflow run: %v", err)
+	}
+	if err := st.UpdateRunStatus(ctx, wr.Run.ID, RunStatusPaused); err != nil {
+		t.Fatalf("mark paused: %v", err)
+	}
+	template.Description = "edited while paused run exists"
+	if err := st.UpdateWorkflowTemplate(ctx, template); !errors.Is(err, ErrWorkflowTemplateInUse) {
+		t.Fatalf("UpdateWorkflowTemplate error = %v, want ErrWorkflowTemplateInUse", err)
+	}
+}
+
+func TestReconcileWorkflowSnapshotStagesUpdatesPendingAndLocksStartedStages(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	template := reconcileWorkflowTemplate("reconcile_template", true)
+	if err := st.CreateWorkflowTemplate(ctx, template); err != nil {
+		t.Fatalf("create workflow template: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunForProjectInput(ctx, DefaultProjectID, contract.TaskInput{Idea: "reconcile", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: template.ID})
+	if err != nil {
+		t.Fatalf("create workflow run: %v", err)
+	}
+
+	withoutValidation := reconcileWorkflowTemplate("reconcile_template", false)
+	if err := st.ReconcileWorkflowSnapshotStages(ctx, wr.Run.ID, withoutValidation); err != nil {
+		t.Fatalf("reconcile remove pending validation: %v", err)
+	}
+	stages, err := st.ListStagesForAttempt(ctx, wr.Run.ID, wr.Attempt.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	if stageByWorkflowIDForStoreTest(stages, "validation").ID != "" {
+		t.Fatalf("pending validation stage was not removed: %+v", stages)
+	}
+
+	withReview := reconcileWorkflowTemplateWithReview("reconcile_template")
+	if err := st.ReconcileWorkflowSnapshotStages(ctx, wr.Run.ID, withReview); err != nil {
+		t.Fatalf("reconcile add pending review: %v", err)
+	}
+	stages, err = st.ListStagesForAttempt(ctx, wr.Run.ID, wr.Attempt.ID)
+	if err != nil {
+		t.Fatalf("list stages after add: %v", err)
+	}
+	if review := stageByWorkflowIDForStoreTest(stages, "change_review_agent"); review.ID == "" || review.Status != StageStatusPending || review.StageType != workflow.StageTypeReview {
+		t.Fatalf("added review stage = %+v", review)
+	}
+
+	withValidation := reconcileWorkflowTemplate("reconcile_template", true)
+	if err := st.ReconcileWorkflowSnapshotStages(ctx, wr.Run.ID, withValidation); err != nil {
+		t.Fatalf("reconcile restore validation: %v", err)
+	}
+	stages, err = st.ListStagesForAttempt(ctx, wr.Run.ID, wr.Attempt.ID)
+	if err != nil {
+		t.Fatalf("list stages after restore: %v", err)
+	}
+	validation := stageByWorkflowIDForStoreTest(stages, "validation")
+	if validation.ID == "" {
+		t.Fatalf("validation stage missing after restore: %+v", stages)
+	}
+	if err := st.UpdateStageStatus(ctx, validation.ID, StageStatusRunning); err != nil {
+		t.Fatalf("mark validation running: %v", err)
+	}
+	if err := st.ReconcileWorkflowSnapshotStages(ctx, wr.Run.ID, withoutValidation); !errors.Is(err, ErrWorkflowSnapshotStageLocked) {
+		t.Fatalf("remove started validation error = %v, want ErrWorkflowSnapshotStageLocked", err)
+	}
+	retyped := withValidation
+	for i := range retyped.Stages {
+		if retyped.Stages[i].ID == "validation" {
+			retyped.Stages[i].Type = workflow.StageTypeReview
+			retyped.Stages[i].Actor = workflow.ActorAgent
+			retyped.Stages[i].Target = workflow.TargetCodeChanges
+		}
+	}
+	retyped.Edges = workflow.DeriveTemplateEdges(retyped)
+	if err := st.ReconcileWorkflowSnapshotStages(ctx, wr.Run.ID, retyped); !errors.Is(err, ErrWorkflowSnapshotStageLocked) {
+		t.Fatalf("retype started validation error = %v, want ErrWorkflowSnapshotStageLocked", err)
+	}
+}
+
+func reconcileWorkflowTemplateWithReview(id string) workflow.Template {
+	template := workflow.Template{
+		SchemaVersion: workflow.SchemaVersion,
+		ID:            id,
+		Name:          id,
+		Editable:      true,
+		Stages: []workflow.StageTemplate{
+			{ID: "idea_refinement", Type: workflow.StageTypeIdeaRefinement, Label: "Idea refinement", Actor: workflow.ActorHarness},
+			{ID: "implementation", Type: workflow.StageTypeImplementation, Label: "Implementation", Actor: workflow.ActorAgent},
+			{ID: "change_review_agent", Type: workflow.StageTypeReview, Label: "Code review", Actor: workflow.ActorAgent, Target: workflow.TargetCodeChanges},
+			{ID: "stop_report", Type: workflow.StageTypeStopReport, Label: "Stop/report", Actor: workflow.ActorHarness},
+		},
+	}
+	template.Edges = workflow.DeriveTemplateEdges(template)
+	return workflow.NormalizeTemplate(template)
+}
+
+func reconcileWorkflowTemplate(id string, includeValidation bool) workflow.Template {
+	stages := []workflow.StageTemplate{
+		{ID: "idea_refinement", Type: workflow.StageTypeIdeaRefinement, Label: "Idea refinement", Actor: workflow.ActorHarness},
+		{ID: "implementation", Type: workflow.StageTypeImplementation, Label: "Implementation", Actor: workflow.ActorAgent},
+	}
+	if includeValidation {
+		stages = append(stages, workflow.StageTemplate{ID: "validation", Type: workflow.StageTypeValidation, Label: "Validation", Actor: workflow.ActorHarness})
+	}
+	stages = append(stages, workflow.StageTemplate{ID: "stop_report", Type: workflow.StageTypeStopReport, Label: "Stop/report", Actor: workflow.ActorHarness})
+	template := workflow.Template{SchemaVersion: workflow.SchemaVersion, ID: id, Name: id, Editable: true, Stages: stages}
+	template.Edges = workflow.DeriveTemplateEdges(template)
+	return workflow.NormalizeTemplate(template)
+}
+
+func stageByWorkflowIDForStoreTest(stages []Stage, workflowStageID string) Stage {
+	for _, stage := range stages {
+		if stage.WorkflowStageID == workflowStageID {
+			return stage
+		}
+	}
+	return Stage{}
 }
 
 func TestRunnerRegistryCRUD(t *testing.T) {
