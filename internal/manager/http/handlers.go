@@ -86,6 +86,18 @@ func (s *Server) handleProjectPath(w http.ResponseWriter, r *http.Request) {
 		s.handleCancelRun(w, r, projectID, runID)
 		return
 	}
+	if len(parts) == 4 && parts[3] == "pause" {
+		s.handlePauseRun(w, r, projectID, runID)
+		return
+	}
+	if len(parts) == 4 && parts[3] == "resume" {
+		s.handleResumeRun(w, r, projectID, runID)
+		return
+	}
+	if len(parts) == 4 && parts[3] == "workflow" {
+		s.handleRunWorkflowSnapshot(w, r, projectID, runID)
+		return
+	}
 	if len(parts) == 4 && parts[3] == "start" {
 		s.handleStartQueuedRun(w, r, projectID, runID)
 		return
@@ -850,6 +862,18 @@ func (s *Server) handleRunPath(w http.ResponseWriter, r *http.Request) {
 		s.handleCancelRun(w, r, projectID, runID)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "pause" {
+		s.handlePauseRun(w, r, projectID, runID)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "resume" {
+		s.handleResumeRun(w, r, projectID, runID)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "workflow" {
+		s.handleRunWorkflowSnapshot(w, r, projectID, runID)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "start" {
 		s.handleStartQueuedRun(w, r, projectID, runID)
 		return
@@ -904,6 +928,46 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request, project
 		return
 	}
 	if err := s.engine.CancelRun(r.Context(), runID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, projectRunPath(projectID, runID), http.StatusSeeOther)
+}
+
+func (s *Server) handlePauseRun(w http.ResponseWriter, r *http.Request, projectID, runID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.runBelongsToProject(r, projectID, runID) {
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.engine.RequestPause(r.Context(), runID, event.Actor{Kind: event.ActorKindOperator, ID: "operator"}); err != nil {
+		if errors.Is(err, orchestrator.ErrRunNotRunning) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, projectRunPath(projectID, runID), http.StatusSeeOther)
+}
+
+func (s *Server) handleResumeRun(w http.ResponseWriter, r *http.Request, projectID, runID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.runBelongsToProject(r, projectID, runID) {
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.engine.ResumeRun(r.Context(), runID); err != nil {
+		if errors.Is(err, orchestrator.ErrRunNotPaused) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

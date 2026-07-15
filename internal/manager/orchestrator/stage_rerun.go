@@ -38,7 +38,7 @@ func (e *Engine) ReRunStage(ctx context.Context, runID, stageID string, actor ev
 		return store.Attempt{}, err
 	}
 	if !stageReRunStatusAllowed(wr.Run.Status) {
-		return store.Attempt{}, fmt.Errorf("%w: run %s has status %q; completed, failed, invalid, or cancelled runs may be re-run; cancel pending/running runs first and resume awaiting_human/needs_input runs instead", ErrStageReRunRunNotTerminal, runID, wr.Run.Status)
+		return store.Attempt{}, fmt.Errorf("%w: run %s has status %q; completed, failed, invalid, or cancelled runs may be re-run; cancel pending/running runs first and resume paused/awaiting_human/needs_input runs instead", ErrStageReRunRunNotTerminal, runID, wr.Run.Status)
 	}
 
 	runtime, err := e.loadFrozenRuntimeWorkflow(ctx, wr)

@@ -232,6 +232,29 @@ func TestNewRunViewMarksStageReRunControlsForTerminalComputeStagesOnly(t *testin
 	}
 }
 
+func TestNewRunViewExposesPauseResumeControls(t *testing.T) {
+	bundle := store.RunBundle{Project: store.Project{ID: "default"}, Run: store.Run{ID: "run-control", Status: store.RunStatusRunning}}
+	view := NewRunView(bundle)
+	if !view.CanPause || view.PauseRequested || view.CanResume || !view.CanCancel {
+		t.Fatalf("running controls = pause:%v requested:%v resume:%v cancel:%v", view.CanPause, view.PauseRequested, view.CanResume, view.CanCancel)
+	}
+	bundle.Events = []event.Event{{Type: "run.pause_requested"}}
+	view = NewRunView(bundle)
+	if !view.PauseRequested {
+		t.Fatal("PauseRequested = false after run.pause_requested event")
+	}
+	bundle.Run.Status = store.RunStatusPaused
+	view = NewRunView(bundle)
+	if view.CanPause || !view.CanResume || !view.CanCancel || view.WorkflowEditPath != "/projects/default/runs/run-control/workflow" {
+		t.Fatalf("paused controls = pause:%v resume:%v cancel:%v path:%q", view.CanPause, view.CanResume, view.CanCancel, view.WorkflowEditPath)
+	}
+	bundle.Run.Status = store.RunStatusCompleted
+	view = NewRunView(bundle)
+	if view.CanPause || view.CanResume || view.CanCancel {
+		t.Fatalf("completed controls = pause:%v resume:%v cancel:%v", view.CanPause, view.CanResume, view.CanCancel)
+	}
+}
+
 func TestNewRunViewSurfacesPendingHumanReview(t *testing.T) {
 	bundle := store.RunBundle{
 		Run:     store.Run{ID: "run-review", TaskID: "task-review", Status: store.RunStatusAwaitingHuman},

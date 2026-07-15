@@ -1,0 +1,28 @@
+<section id="run-controls" class="card run-controls" aria-label="Run controls">
+  {{if .CanPause}}
+  {{if .PauseRequested}}
+  <p class="settings-inline-notice warning">Pause requested — this run will pause after the current stage completes.</p>
+  {{else}}
+  <form method="post" action="{{.PausePath}}" data-on:submit="@post('{{.PausePath}}', {contentType: 'form'})">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}" data-bind:csrf>
+    <button type="submit" class="secondary">Pause after current stage</button>
+  </form>
+  {{end}}
+  {{end}}
+  {{if .CanResume}}
+  <div class="workflow-adjustment-controls">
+    <p><strong>Run is paused.</strong> You may customize not-yet-started workflow stages, then resume.</p>
+    <a class="button-link" href="{{.WorkflowEditPath}}">Customize remaining workflow</a>
+    <form method="post" action="{{.ResumePath}}" data-on:submit="@post('{{.ResumePath}}', {contentType: 'form'})">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}" data-bind:csrf>
+      <button type="submit">Resume run</button>
+    </form>
+  </div>
+  {{end}}
+  {{if .CanCancel}}
+  <form method="post" action="{{.CancelPath}}" data-on:submit="@post('{{.CancelPath}}', {contentType: 'form'})">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}" data-bind:csrf>
+    <button type="submit" class="danger">Cancel run</button>
+  </form>
+  {{end}}
+</section>

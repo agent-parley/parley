@@ -83,6 +83,7 @@ type Engine struct {
 	activeRuns  map[string]context.CancelFunc
 	activeStage map[string]store.Stage
 	cancelling  map[string]bool
+	pausing     map[string]bool
 	runnerDown  map[string]string
 	closed      bool
 	rootCtx     context.Context
@@ -223,6 +224,7 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 		activeRuns:            map[string]context.CancelFunc{},
 		activeStage:           map[string]store.Stage{},
 		cancelling:            map[string]bool{},
+		pausing:               map[string]bool{},
 		runnerDown:            map[string]string{},
 		queuePolicy:           queuePolicy,
 		runnerSlots:           runnerSlots,
@@ -417,6 +419,10 @@ func (e *Engine) CancelRun(ctx context.Context, runID string) error {
 	if wr.Run.Status == store.RunStatusAwaitingHuman {
 		e.queueMu.Unlock()
 		return e.cancelRunTerminal(ctx, wr, "workflow cancelled while awaiting human input")
+	}
+	if wr.Run.Status == store.RunStatusPaused {
+		e.queueMu.Unlock()
+		return e.cancelRunTerminal(ctx, wr, "workflow cancelled while paused")
 	}
 	e.queueMu.Unlock()
 	e.markCancelling(runID)
@@ -664,6 +670,7 @@ func (e *Engine) unregisterActiveRun(runID string) {
 	delete(e.activeRuns, runID)
 	delete(e.activeStage, runID)
 	delete(e.cancelling, runID)
+	delete(e.pausing, runID)
 	delete(e.runnerDown, runID)
 }
 
@@ -730,6 +737,31 @@ func (e *Engine) isCancelling(runID string) bool {
 	return e.cancelling[runID]
 }
 
+func (e *Engine) markPausingIfActive(runID string) (marked bool, active bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.activeRuns[runID]; !ok {
+		return false, false
+	}
+	if e.pausing[runID] {
+		return false, true
+	}
+	e.pausing[runID] = true
+	return true, true
+}
+
+func (e *Engine) clearPausing(runID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.pausing, runID)
+}
+
+func (e *Engine) isPausing(runID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.pausing[runID]
+}
+
 // markRunnerDown records that runID's in-flight work failed because its runner
 // disconnected. It is set both when a stage dispatch fails with ErrSessionClosed
 // (the stage path itself observed the runner vanish) and from HandleRunnerDown,
@@ -792,6 +824,9 @@ func (e *Engine) HandleRunnerDown(ctx context.Context, runnerID, reason string) 
 			joined = append(joined, err)
 			continue
 		}
+		if wr.Run.Status != store.RunStatusRunning {
+			continue
+		}
 		e.markRunnerDown(runID, "runner_disconnected")
 		if e.isCancelling(runID) {
 			if err := e.cancelRunTerminal(ctx, wr, "workflow cancelled while runner disconnected"); err != nil {
@@ -831,6 +866,7 @@ func (e *Engine) executeRunAfter(ctx context.Context, runID, resumeAfterWorkflow
 
 func (e *Engine) executeRunWithCleanup(ctx context.Context, runID string, execute func() error) {
 	defer func() {
+		e.clearPausing(runID)
 		e.unregisterActiveRun(runID)
 		if e.queuePolicy.AutoWhenReady {
 			e.spawn(func() {
@@ -841,7 +877,7 @@ func (e *Engine) executeRunWithCleanup(ctx context.Context, runID string, execut
 		}
 	}()
 	if err := execute(); err != nil {
-		if errors.Is(err, errRunAwaitingHuman) {
+		if errors.Is(err, errRunAwaitingHuman) || errors.Is(err, errRunPaused) {
 			return
 		}
 		if e.isCancelling(runID) {
@@ -978,6 +1014,9 @@ func (e *Engine) executeRunWithOptions(ctx context.Context, runID string, opts e
 		}
 		if e.isCancelling(wr.Run.ID) {
 			return e.cancelRunTerminal(context.Background(), wr, "workflow cancelled after "+runtimeStage.Template.ID)
+		}
+		if e.isPausing(wr.Run.ID) {
+			return e.pauseRunAtBoundary(context.Background(), wr, runtimeStage.Template.ID)
 		}
 		nextID, ok := runtime.Graph.Next(runtimeStage.Template.ID, routingOutcome(runtimeStage.Template, rep))
 		if !ok {

@@ -31,6 +31,7 @@ const (
 
 	RunStatusPending       = "pending"
 	RunStatusRunning       = "running"
+	RunStatusPaused        = "paused"
 	RunStatusCompleted     = "completed"
 	RunStatusFailed        = "failed"
 	RunStatusInvalid       = "invalid"
@@ -80,6 +81,7 @@ const (
 var (
 	ErrWorkflowTemplateInUse       = errors.New("workflow template is used by an active run")
 	ErrWorkflowTemplateNotEditable = errors.New("workflow template is not editable")
+	ErrWorkflowSnapshotStageLocked = errors.New("workflow snapshot stage is locked")
 	ErrProjectMemoryCuratorStage   = errors.New("project memory writes require a memory_update curator stage")
 )
 
@@ -2457,6 +2459,87 @@ func (s *Store) LatestWorkflowTemplateSnapshot(ctx context.Context, runID string
 		return workflow.Template{}, fmt.Errorf("workflow template snapshot is invalid: %w", err)
 	}
 	return template, nil
+}
+
+func (s *Store) ReconcileWorkflowSnapshotStages(ctx context.Context, runID string, template workflow.Template) error {
+	registry := storedWorkflowTemplateRegistry(template)
+	template = workflow.NormalizeTemplateWithRegistry(template, registry)
+	if err := workflow.ValidateTemplateWithRegistry(template, registry); err != nil {
+		return err
+	}
+	wr, err := s.GetWorkflowRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	existingStages, err := s.ListStagesForAttempt(ctx, runID, wr.Attempt.ID)
+	if err != nil {
+		return err
+	}
+	existingByWorkflowID := map[string]Stage{}
+	for _, stage := range existingStages {
+		if stage.WorkflowStageID != "" {
+			existingByWorkflowID[stage.WorkflowStageID] = stage
+		}
+	}
+	now := nowRFC3339()
+	keepStageIDs := map[string]bool{}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin workflow snapshot stage reconciliation: %w", err)
+	}
+	defer rollback(tx)
+	for _, templateStage := range template.Stages {
+		if stage, ok := existingByWorkflowID[templateStage.ID]; ok {
+			keepStageIDs[stage.ID] = true
+			stageType := stage.StageType
+			adapter := stage.Adapter
+			if stage.Status == StageStatusPending {
+				stageType = templateStage.Type
+				adapter = defaultStageAdapter(templateStage)
+			} else if stage.StageType != templateStage.Type {
+				return fmt.Errorf("%w: workflow stage %q cannot change type after it started", ErrWorkflowSnapshotStageLocked, templateStage.ID)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE stages SET workflow_stage_id = ?, stage_type = ?, adapter = ?, updated_at = ? WHERE id = ?`, templateStage.ID, stageType, adapter, now, stage.ID); err != nil {
+				return fmt.Errorf("update workflow snapshot stage %s: %w", templateStage.ID, err)
+			}
+			continue
+		}
+		stage := Stage{
+			ID:              ids.New("stage"),
+			ProjectID:       wr.Run.ProjectID,
+			RunID:           wr.Run.ID,
+			TaskID:          wr.Task.ID,
+			AttemptID:       wr.Attempt.ID,
+			WorkflowStageID: templateStage.ID,
+			StageType:       templateStage.Type,
+			Adapter:         defaultStageAdapter(templateStage),
+			Status:          StageStatusPending,
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		}
+		keepStageIDs[stage.ID] = true
+		if _, err := tx.ExecContext(ctx, `INSERT INTO stages(id, project_id, run_id, task_id, attempt_id, workflow_stage_id, stage_type, adapter, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, stage.ID, stage.ProjectID, stage.RunID, stage.TaskID, stage.AttemptID, stage.WorkflowStageID, stage.StageType, stage.Adapter, stage.Status, stage.CreatedAt, stage.UpdatedAt); err != nil {
+			return fmt.Errorf("insert workflow snapshot stage %s: %w", templateStage.ID, err)
+		}
+	}
+	for _, stage := range existingStages {
+		if keepStageIDs[stage.ID] {
+			continue
+		}
+		if stage.Status != StageStatusPending {
+			return fmt.Errorf("%w: workflow stage %q cannot be removed after it started", ErrWorkflowSnapshotStageLocked, stage.WorkflowStageID)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM stages WHERE id = ?`, stage.ID); err != nil {
+			return fmt.Errorf("delete workflow snapshot stage %s: %w", stage.WorkflowStageID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit workflow snapshot stage reconciliation: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) UpsertRunner(ctx context.Context, runnerID, status string, capabilities any) error {

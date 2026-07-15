@@ -1871,6 +1871,119 @@ func TestHandleStartQueuedRunConflictMappings(t *testing.T) {
 	}
 }
 
+func TestHandlePauseResumeAndRunWorkflowSnapshotRoutes(t *testing.T) {
+	ctx := context.Background()
+	st := openRouteTestStore(t)
+	template := routeWorkflowSnapshotTemplate("route_snapshot_template")
+	if err := st.CreateWorkflowTemplate(ctx, template); err != nil {
+		t.Fatalf("create workflow template: %v", err)
+	}
+	wr, err := st.CreateWorkflowRunForProjectInput(ctx, store.DefaultProjectID, contract.TaskInput{Idea: "paused route", RefinementLevel: contract.RefinementLevelDirect, WorkflowTemplateID: template.ID})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := st.SaveWorkflowSnapshot(ctx, wr.Run.ID, map[string]any{"workflow_template_snapshot": template}); err != nil {
+		t.Fatalf("save workflow snapshot: %v", err)
+	}
+	if err := st.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusRunning); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	controller := &fakeRunController{state: defaultRouteQueueState()}
+	pauseCalled := false
+	controller.requestPauseFunc = func(_ context.Context, runID string, actor event.Actor) error {
+		if runID != wr.Run.ID {
+			t.Fatalf("RequestPause runID = %q", runID)
+		}
+		if actor.Kind != event.ActorKindOperator {
+			t.Fatalf("RequestPause actor = %#v", actor)
+		}
+		pauseCalled = true
+		return nil
+	}
+	resumeCalled := false
+	controller.resumeRunFunc = func(_ context.Context, runID string) error {
+		if runID != wr.Run.ID {
+			t.Fatalf("ResumeRun runID = %q", runID)
+		}
+		resumeCalled = true
+		return nil
+	}
+	var updated workflow.Template
+	controller.updateRunWorkflowSnapshotFunc = func(_ context.Context, runID string, template workflow.Template, actor event.Actor) error {
+		if runID != wr.Run.ID {
+			t.Fatalf("UpdateRunWorkflowSnapshot runID = %q", runID)
+		}
+		if actor.Kind != event.ActorKindOperator {
+			t.Fatalf("UpdateRunWorkflowSnapshot actor = %#v", actor)
+		}
+		updated = template
+		return nil
+	}
+
+	srv := newRouteTestServer(t, st, controller)
+	cookie, csrf := getCSRFToken(t, srv)
+	rec := postForm(t, srv, "/projects/default/runs/"+wr.Run.ID+"/pause", cookie, url.Values{"_csrf": {csrf}})
+	if rec.Code != http.StatusSeeOther || !pauseCalled {
+		t.Fatalf("POST pause status/called = %d/%t body=%s", rec.Code, pauseCalled, rec.Body.String())
+	}
+	if err := st.UpdateRunStatus(ctx, wr.Run.ID, store.RunStatusPaused); err != nil {
+		t.Fatalf("mark paused: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/projects/default/runs/"+wr.Run.ID+"/workflow", nil)
+	req.AddCookie(cookie)
+	srv.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET workflow status = %d want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	assertContains(t, rec.Body.String(), "Customize run workflow")
+	form := workflowSnapshotRouteForm(csrf, template)
+	form.Set("instructions_implementation", "edited while paused")
+	rec = postForm(t, srv, "/projects/default/runs/"+wr.Run.ID+"/workflow", cookie, form)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST workflow status = %d want %d body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
+	}
+	if updated.ID == "" || updated.Stages[1].Instructions != "edited while paused" {
+		t.Fatalf("updated template = %+v", updated)
+	}
+	rec = postForm(t, srv, "/projects/default/runs/"+wr.Run.ID+"/resume", cookie, url.Values{"_csrf": {csrf}})
+	if rec.Code != http.StatusSeeOther || !resumeCalled {
+		t.Fatalf("POST resume status/called = %d/%t body=%s", rec.Code, resumeCalled, rec.Body.String())
+	}
+}
+
+func routeWorkflowSnapshotTemplate(id string) workflow.Template {
+	template := workflow.Template{
+		SchemaVersion: workflow.SchemaVersion,
+		ID:            id,
+		Name:          id,
+		Editable:      true,
+		Stages: []workflow.StageTemplate{
+			{ID: "idea_refinement", Type: workflow.StageTypeIdeaRefinement, Label: "Idea refinement", Actor: workflow.ActorHarness},
+			{ID: "implementation", Type: workflow.StageTypeImplementation, Label: "Implementation", Actor: workflow.ActorAgent, ProfileID: agentregistry.ProfilePiHeadlessWorker},
+			{ID: "stop_report", Type: workflow.StageTypeStopReport, Label: "Stop/report", Actor: workflow.ActorHarness},
+		},
+		Settings: map[string]any{"pr_behavior": "none"},
+	}
+	template.Edges = workflow.DeriveTemplateEdges(template)
+	return workflow.NormalizeTemplate(template)
+}
+
+func workflowSnapshotRouteForm(csrf string, template workflow.Template) url.Values {
+	form := url.Values{
+		"_csrf":       {csrf},
+		"name":        {template.Name},
+		"description": {template.Description},
+		"pr_behavior": {"none"},
+		"stage_id":    {},
+	}
+	for i, stage := range template.Stages {
+		form["stage_id"] = append(form["stage_id"], stage.ID)
+		addWorkflowStageForm(form, stage.ID, stage.Type, stage.Actor, i+1, stage.Instructions, stage.ProfileID, stage.Target)
+	}
+	return form
+}
+
 func TestHandleIndexRendersQueueStateAndManualStartAffordance(t *testing.T) {
 	ctx := context.Background()
 	st := openRouteTestStore(t)
@@ -1972,6 +2085,9 @@ type fakeRunController struct {
 	submitConversationMessageFunc func(context.Context, string, string) (store.Message, error)
 	startQueuedRunFunc            func(context.Context, string) error
 	cancelRunFunc                 func(context.Context, string) error
+	requestPauseFunc              func(context.Context, string, event.Actor) error
+	resumeRunFunc                 func(context.Context, string) error
+	updateRunWorkflowSnapshotFunc func(context.Context, string, workflow.Template, event.Actor) error
 	reRunStageFunc                func(context.Context, string, string, event.Actor) (store.Attempt, error)
 	humanReviewFunc               func(context.Context, string, string, orchestrator.HumanReviewSubmission) (report.Report, error)
 }
@@ -2019,6 +2135,27 @@ func (f *fakeRunController) CancelRun(ctx context.Context, runID string) error {
 		return f.cancelRunFunc(ctx, runID)
 	}
 	return errors.New("unexpected CancelRun call")
+}
+
+func (f *fakeRunController) RequestPause(ctx context.Context, runID string, actor event.Actor) error {
+	if f.requestPauseFunc != nil {
+		return f.requestPauseFunc(ctx, runID, actor)
+	}
+	return errors.New("unexpected RequestPause call")
+}
+
+func (f *fakeRunController) ResumeRun(ctx context.Context, runID string) error {
+	if f.resumeRunFunc != nil {
+		return f.resumeRunFunc(ctx, runID)
+	}
+	return errors.New("unexpected ResumeRun call")
+}
+
+func (f *fakeRunController) UpdateRunWorkflowSnapshot(ctx context.Context, runID string, template workflow.Template, actor event.Actor) error {
+	if f.updateRunWorkflowSnapshotFunc != nil {
+		return f.updateRunWorkflowSnapshotFunc(ctx, runID, template, actor)
+	}
+	return errors.New("unexpected UpdateRunWorkflowSnapshot call")
 }
 
 func (f *fakeRunController) ReRunStage(ctx context.Context, runID, stageID string, actor event.Actor) (store.Attempt, error) {
