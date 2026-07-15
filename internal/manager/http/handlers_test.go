@@ -701,7 +701,7 @@ func TestAgentProfileEditorRejectsDeletingProfileReferencedByTemplate(t *testing
 	}
 }
 
-func TestAgentProfileEditorRejectsGlobalDeleteWhenDiffPinnedProjectOverrideLosesInheritedField(t *testing.T) {
+func TestAgentProfileEditorConfirmsAndRebasesDiffPinnedProjectOverridesOnGlobalDelete(t *testing.T) {
 	ctx := context.Background()
 	st := openRouteTestStore(t)
 	srv := newRouteTestServer(t, st, &fakeRunController{state: defaultRouteQueueState()})
@@ -710,7 +710,9 @@ func TestAgentProfileEditorRejectsGlobalDeleteWhenDiffPinnedProjectOverrideLoses
 		t.Fatalf("ensure other project: %v", err)
 	}
 
-	globalRec := postForm(t, srv, "/settings/agent-profiles", cookie, agentProfileForm(csrf, "layered_builder", "Global layered builder", "implementation", "global-layered-model", "global persona", "global instructions", "implementation"))
+	globalForm := agentProfileForm(csrf, "layered_builder", "Global layered builder", "implementation", "global-layered-model", "global persona", "global instructions", "implementation")
+	globalForm.Set("default_profile", "1")
+	globalRec := postForm(t, srv, "/settings/agent-profiles", cookie, globalForm)
 	if globalRec.Code != http.StatusAccepted {
 		t.Fatalf("POST global profile status = %d want %d body=%s", globalRec.Code, http.StatusAccepted, globalRec.Body.String())
 	}
@@ -759,40 +761,92 @@ func TestAgentProfileEditorRejectsGlobalDeleteWhenDiffPinnedProjectOverrideLoses
 		t.Fatalf("POST template save with layered profile status = %d want %d body=%s", saveRec.Code, http.StatusSeeOther, saveRec.Body.String())
 	}
 
-	// Interim behavior: #194 will change this to auto-preserve/rebase the
-	// dependent project override so the global delete can be allowed again.
 	deleteGlobalRec := postForm(t, srv, "/settings/agent-profiles/delete", cookie, agentProfileDeleteForm(csrf, "layered_builder"))
-	if deleteGlobalRec.Code != http.StatusBadRequest {
-		t.Fatalf("POST global layered profile delete status = %d want %d body=%s", deleteGlobalRec.Code, http.StatusBadRequest, deleteGlobalRec.Body.String())
+	if deleteGlobalRec.Code != http.StatusOK {
+		t.Fatalf("POST global layered profile delete preview status = %d want %d body=%s", deleteGlobalRec.Code, http.StatusOK, deleteGlobalRec.Body.String())
 	}
-	assertContains(t, deleteGlobalRec.Body.String(), "project: agent profile")
-	assertContains(t, deleteGlobalRec.Body.String(), "layered_builder")
-	assertContains(t, deleteGlobalRec.Body.String(), "must have a role")
+	assertContains(t, deleteGlobalRec.Body.String(), "Confirm global profile deletion")
+	assertContains(t, deleteGlobalRec.Body.String(), "Default project (default)")
+	assertContains(t, deleteGlobalRec.Body.String(), "Other project (other)")
+	assertContains(t, deleteGlobalRec.Body.String(), "pin these project overrides")
+	assertContains(t, deleteGlobalRec.Body.String(), "stop inheriting")
 	globalRegistry, err := st.ResolveGlobalAgentRegistry(ctx)
 	if err != nil {
-		t.Fatalf("resolve global registry after rejected global delete: %v", err)
+		t.Fatalf("resolve global registry after delete preview: %v", err)
 	}
-	globalProfile, ok := agentregistry.ProfileByID(globalRegistry, "layered_builder")
-	if !ok || globalProfile.Model != "global-layered-model" || globalProfile.Role != "implementation" {
-		t.Fatalf("global layered_builder after rejected delete = %+v/%v, want original global profile", globalProfile, ok)
-	}
-	projectRegistry, err := st.ResolveAgentRegistry(ctx, store.DefaultProjectID)
-	if err != nil {
-		t.Fatalf("resolve project registry after rejected global delete: %v", err)
-	}
-	projectProfile, ok := agentregistry.ProfileByID(projectRegistry, "layered_builder")
-	if !ok || projectProfile.Model != "project-layered-model" || projectProfile.Role != "implementation" {
-		t.Fatalf("project profile after rejected global delete = %+v/%v, want project override", projectProfile, ok)
+	if _, ok := agentregistry.ProfileByID(globalRegistry, "layered_builder"); !ok {
+		t.Fatal("delete preview persisted the global profile deletion")
 	}
 	assertLayeredOverride(store.DefaultProjectID, "Project layered builder", "project-layered-model", "project persona", "project instructions")
 	assertLayeredOverride("other", "Other project layered builder", "other-project-model", "other persona", "other instructions")
+
+	confirmForm := agentProfileDeleteForm(csrf, "layered_builder")
+	confirmForm.Set("confirm_rebase", "1")
+	deleteGlobalRec = postForm(t, srv, "/settings/agent-profiles/delete", cookie, confirmForm)
+	if deleteGlobalRec.Code != http.StatusAccepted {
+		t.Fatalf("POST confirmed global layered profile delete status = %d want %d body=%s", deleteGlobalRec.Code, http.StatusAccepted, deleteGlobalRec.Body.String())
+	}
+	globalRegistry, err = st.ResolveGlobalAgentRegistry(ctx)
+	if err != nil {
+		t.Fatalf("resolve global registry after confirmed global delete: %v", err)
+	}
+	if _, ok := agentregistry.ProfileByID(globalRegistry, "layered_builder"); ok {
+		t.Fatal("global layered_builder still resolves after confirmed delete")
+	}
+	globalOverrides, err := st.GetGlobalAgentRegistryOverrides(ctx)
+	if err != nil {
+		t.Fatalf("get global overrides after confirmed global delete: %v", err)
+	}
+	if globalOverrides.DefaultProfileID != nil {
+		t.Fatalf("global default profile override = %v, want nil", *globalOverrides.DefaultProfileID)
+	}
+	assertRebasedOverride := func(projectID, wantName, wantModel, wantPrompt, wantInstructions string) {
+		t.Helper()
+		overrides, err := st.GetProjectAgentRegistryOverrides(ctx, projectID)
+		if err != nil {
+			t.Fatalf("get %s rebased project overrides: %v", projectID, err)
+		}
+		override, ok := overrides.Profiles["layered_builder"]
+		if !ok {
+			t.Fatalf("%s rebased layered_builder override missing: %+v", projectID, overrides.Profiles)
+		}
+		if overrides.DefaultProfileID == nil || *overrides.DefaultProfileID != "layered_builder" {
+			t.Fatalf("%s rebased default profile = %v, want layered_builder", projectID, overrides.DefaultProfileID)
+		}
+		if override.FamilyID == nil || *override.FamilyID != agentregistry.FamilyPi || override.Role == nil || *override.Role != "implementation" {
+			t.Fatalf("%s rebased inherited identity fields = %+v", projectID, override)
+		}
+		if override.Headless == nil || !*override.Headless || override.ContextPolicy == nil || *override.ContextPolicy != "task_contract_only" || override.OutputStyle == nil || *override.OutputStyle != "structured_report" {
+			t.Fatalf("%s rebased inherited execution fields = %+v", projectID, override)
+		}
+		if override.Name == nil || *override.Name != wantName || override.Model == nil || *override.Model != wantModel || override.Prompt == nil || *override.Prompt != wantPrompt || override.DefaultInstructions == nil || *override.DefaultInstructions != wantInstructions {
+			t.Fatalf("%s rebased project fields = %+v", projectID, override)
+		}
+		if len(override.SuggestedStageTypes) != 1 || override.SuggestedStageTypes[0] != "implementation" {
+			t.Fatalf("%s rebased suggested stages = %v, want implementation", projectID, override.SuggestedStageTypes)
+		}
+		assertOnlyProfileOverrideFields(t, override, "family_id", "name", "role", "headless", "prompt", "default_instructions", "model", "context_policy", "output_style", "suggested_stage_types")
+		registry, err := st.ResolveAgentRegistry(ctx, projectID)
+		if err != nil {
+			t.Fatalf("resolve %s registry after confirmed global delete: %v", projectID, err)
+		}
+		profile, ok := agentregistry.ProfileByID(registry, "layered_builder")
+		if !ok || profile.Name != wantName || profile.Model != wantModel || profile.Role != "implementation" {
+			t.Fatalf("%s resolved rebased profile = %+v/%v", projectID, profile, ok)
+		}
+		if registry.DefaultProfileID != "layered_builder" {
+			t.Fatalf("%s resolved default profile = %q, want layered_builder", projectID, registry.DefaultProfileID)
+		}
+	}
+	assertRebasedOverride(store.DefaultProjectID, "Project layered builder", "project-layered-model", "project persona", "project instructions")
+	assertRebasedOverride("other", "Other project layered builder", "other-project-model", "other persona", "other instructions")
 	saved, err := st.GetWorkflowTemplate(ctx, copied.ID)
 	if err != nil {
-		t.Fatalf("get saved template after rejected global delete: %v", err)
+		t.Fatalf("get saved template after confirmed global delete: %v", err)
 	}
 	implementation := saved.Stages[workflowTemplateStageIndex(saved, "implementation")]
 	if implementation.ProfileID != "layered_builder" {
-		t.Fatalf("implementation profile_id after rejected global delete = %q, want layered_builder", implementation.ProfileID)
+		t.Fatalf("implementation profile_id after confirmed global delete = %q, want layered_builder", implementation.ProfileID)
 	}
 }
 
@@ -827,7 +881,9 @@ func TestAgentProfileEditorRejectsGlobalDeleteWhenAnyProjectWouldLoseReferencedP
 		t.Fatalf("POST template save with global-only profile status = %d want %d body=%s", saveRec.Code, http.StatusSeeOther, saveRec.Body.String())
 	}
 
-	deleteGlobalRec := postForm(t, srv, "/settings/agent-profiles/delete", cookie, agentProfileDeleteForm(csrf, "global_only_builder"))
+	confirmForm := agentProfileDeleteForm(csrf, "global_only_builder")
+	confirmForm.Set("confirm_rebase", "1")
+	deleteGlobalRec := postForm(t, srv, "/settings/agent-profiles/delete", cookie, confirmForm)
 	if deleteGlobalRec.Code != http.StatusBadRequest {
 		t.Fatalf("POST global-only profile delete status = %d want %d body=%s", deleteGlobalRec.Code, http.StatusBadRequest, deleteGlobalRec.Body.String())
 	}

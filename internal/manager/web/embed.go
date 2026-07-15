@@ -105,19 +105,25 @@ type ForgeCredentialData struct {
 }
 
 type AgentProfileEditorData struct {
-	Scope            string
-	Title            string
-	Help             string
-	Profiles         []AgentProfileFormData
-	Create           AgentProfileFormData
-	SavePath         string
-	DeletePath       string
-	ClearDefaultPath string
-	DefaultProfileID string
-	CanClearDefault  bool
-	Notice           string
-	Status           string
-	CSRF             string
+	Scope              string
+	Title              string
+	Help               string
+	Profiles           []AgentProfileFormData
+	Create             AgentProfileFormData
+	SavePath           string
+	DeletePath         string
+	ClearDefaultPath   string
+	DefaultProfileID   string
+	CanClearDefault    bool
+	DeleteConfirmation *AgentProfileDeleteConfirmationData
+	Notice             string
+	Status             string
+	CSRF               string
+}
+
+type AgentProfileDeleteConfirmationData struct {
+	ProfileID string
+	Projects  []string
 }
 
 type AgentProfileFormData struct {
