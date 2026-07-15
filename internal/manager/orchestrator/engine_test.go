@@ -204,7 +204,7 @@ func TestNotificationDeliveryIsAsyncAndDoesNotBlockEmit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("emit awaiting human: %v", err)
 		}
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(testWaitTimeout):
 		t.Fatal("emit blocked behind notification delivery")
 	}
 	items, err := st.ListNotifications(ctx, 10)
