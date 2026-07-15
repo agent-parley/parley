@@ -18,9 +18,10 @@ coverage.out
 .DS_Store
 .idea/
 .vscode/
-docs/
-plans/
 
 # Project-local planning scratch files
+# (public docs live in docs/ and are tracked; agent scratch stays in the
+# workspace per the doc-promotion rules)
+plans/
 plan.md
 progress.md
