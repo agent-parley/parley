@@ -131,6 +131,8 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		ConversationIdleTTL:   cfg.Settings.Conversation.IdleWarmHoldTTL,
 		Secrets:               secretService,
 		NotificationSinks:     []orchestrator.NotificationSink{notificationSink, externalNotificationSink},
+
+		ConversationTurnDeadline: *cfg.Settings.Conversation.TurnDeadline,
 	})
 	app := &App{
 		cfg:     cfg,

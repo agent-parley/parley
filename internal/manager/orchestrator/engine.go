@@ -111,6 +111,8 @@ type Engine struct {
 	secrets               *secrets.Service
 	forgeDeliveryClient   ForgeDeliveryClient
 	contextAssembler      *contextpack.Assembler
+
+	conversationTurnDeadline time.Duration
 }
 
 type EngineOptions struct {
@@ -131,6 +133,8 @@ type EngineOptions struct {
 	ConversationIdleTTL   time.Duration
 	ContextAssembler      *contextpack.Assembler
 	NotificationSinks     []NotificationSink
+
+	ConversationTurnDeadline time.Duration
 }
 
 type workerSnapshot struct {
@@ -142,7 +146,7 @@ type workerSnapshot struct {
 }
 
 func NewEngine(st *store.Store, runner Runner, renderer FragmentRenderer, broadcast Broadcaster) *Engine {
-	return NewEngineWithOptions(st, runner, renderer, broadcast, EngineOptions{})
+	return NewEngineWithOptions(st, runner, renderer, broadcast, EngineOptions{ConversationTurnDeadline: 15 * time.Minute})
 }
 
 func defaultQueuePolicy() QueuePolicy {
@@ -245,6 +249,8 @@ func NewEngineWithOptions(st *store.Store, runner Runner, renderer FragmentRende
 		contextAssembler:      contextAssembler,
 		rootCtx:               rootCtx,
 		rootCancel:            rootCancel,
+
+		conversationTurnDeadline: opts.ConversationTurnDeadline,
 	}
 }
 

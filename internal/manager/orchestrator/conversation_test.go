@@ -192,6 +192,234 @@ func TestConversationTurnsForOneConversationAreSerializedFIFO(t *testing.T) {
 	}
 }
 
+func TestConversationTurnDeadlineTimesOutEvictsAndColdStartsQueuedFollowUp(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	project, err := st.EnsureProject(ctx, store.ProjectSpec{ID: store.DefaultProjectID, Name: "Default project", RepositoryPath: t.TempDir()})
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	const deadline = 200 * time.Millisecond
+	runner := &managedConversationRunner{
+		dispatches:    make(chan contract.Dispatch, 2),
+		releases:      make(chan struct{}, 2),
+		replies:       []string{"unused timed-out reply", "follow-up reply"},
+		evictions:     make(chan string, 1),
+		cancellations: make(chan contract.Dispatch, 1),
+		hasDeadlines:  make(chan bool, 2),
+	}
+	recorder := newEventRecorder()
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, recorder, EngineOptions{
+		ConversationAdapter:      "chat-agent",
+		ConversationTurnDeadline: deadline,
+	})
+	registerEngineTeardown(t, engine, st)
+
+	firstMessage, err := engine.SubmitConversationMessage(ctx, project.ID, "hang forever")
+	if err != nil {
+		t.Fatalf("submit first: %v", err)
+	}
+	firstDispatch := receiveDispatch(t, runner.dispatches)
+	if !receiveConversationDeadlineState(t, runner.hasDeadlines) {
+		t.Fatal("first dispatch context has no deadline")
+	}
+	secondMessage, err := engine.SubmitConversationMessage(ctx, project.ID, "try the next turn")
+	if err != nil {
+		t.Fatalf("submit queued follow-up: %v", err)
+	}
+	if cancelled := receiveDispatch(t, runner.cancellations); cancelled.AttemptID != firstDispatch.AttemptID {
+		t.Fatalf("cancelled attempt = %q, want %q", cancelled.AttemptID, firstDispatch.AttemptID)
+	}
+
+	timedOut := waitForConversationEvent(t, recorder, "conversation.turn_timed_out", firstMessage.ID)
+	if timedOut.Data["deadline_seconds"] != deadline.Seconds() || timedOut.Data["queued"] != 1 || timedOut.Data["cold_start"] != true {
+		t.Fatalf("timed-out event data = %#v, want deadline/queue/cold-start metadata", timedOut.Data)
+	}
+	conversation, err := st.EnsureProjectConversation(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	messages := waitForConversationMessages(t, st, conversation.ID, 3)
+	if messages[0].Body != "hang forever" || messages[1].Body != "try the next turn" || messages[2].Role != store.MessageRoleAssistant || messages[2].Body != conversationTurnDeadlineMessage(deadline) {
+		t.Fatalf("messages after timeout = %#v, want intact transcript plus timeout assistant message", messages)
+	}
+	if evicted := receiveEviction(t, runner.evictions); evicted != firstDispatch.WarmSessionKey {
+		t.Fatalf("evicted warm session = %q, want %q", evicted, firstDispatch.WarmSessionKey)
+	}
+	evicted := waitForConversationEvent(t, recorder, "conversation.session_evicted", "")
+	if evicted.Data["reason"] != "turn_deadline" {
+		t.Fatalf("eviction event data = %#v, want turn_deadline reason", evicted.Data)
+	}
+
+	secondDispatch := receiveDispatch(t, runner.dispatches)
+	if secondDispatch.WarmSessionKey != firstDispatch.WarmSessionKey {
+		t.Fatalf("follow-up warm session key = %q, want conversation key %q", secondDispatch.WarmSessionKey, firstDispatch.WarmSessionKey)
+	}
+	if !receiveConversationDeadlineState(t, runner.hasDeadlines) {
+		t.Fatal("queued follow-up dispatch context has no fresh deadline")
+	}
+	runner.releases <- struct{}{}
+	messages = waitForConversationMessages(t, st, conversation.ID, 4)
+	if messages[3].Role != store.MessageRoleAssistant || messages[3].Body != "follow-up reply" {
+		t.Fatalf("messages after follow-up = %#v, want completed assistant reply", messages)
+	}
+	completed := waitForConversationEvent(t, recorder, "conversation.turn_completed", secondMessage.ID)
+	if completed.Data["cold_start"] != true {
+		t.Fatalf("follow-up completion data = %#v, want cold start after timeout eviction", completed.Data)
+	}
+	assertNoConversationEventType(t, recorder, "conversation.turn_cancelled")
+}
+
+func TestConversationUserCancelDuringDeadlinedTurnIsUnchanged(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	project, err := st.EnsureProject(ctx, store.ProjectSpec{ID: store.DefaultProjectID, Name: "Default project", RepositoryPath: t.TempDir()})
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	runner := &cancellableConversationRunner{dispatches: make(chan contract.Dispatch, 1), cancelled: make(chan struct{})}
+	recorder := newEventRecorder()
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, recorder, EngineOptions{
+		ConversationAdapter:      "chat-agent",
+		ConversationTurnDeadline: 5 * time.Second,
+	})
+	registerEngineTeardown(t, engine, st)
+
+	message, err := engine.SubmitConversationMessage(ctx, project.ID, "cancel this")
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	_ = receiveDispatch(t, runner.dispatches)
+	conversation, err := st.EnsureProjectConversation(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	if err := engine.CancelConversationTurn(ctx, conversation.ID); err != nil {
+		t.Fatalf("cancel conversation turn: %v", err)
+	}
+	select {
+	case <-runner.cancelled:
+	case <-time.After(testWaitTimeout):
+		t.Fatal("timed out waiting for user cancellation to reach dispatch")
+	}
+	_ = waitForConversationEvent(t, recorder, "conversation.turn_cancelled", message.ID)
+	messages := waitForConversationMessages(t, st, conversation.ID, 1)
+	if len(messages) != 1 || messages[0].Role != store.MessageRoleUser {
+		t.Fatalf("messages after user cancel = %#v, want only original user message", messages)
+	}
+	assertNoConversationEventType(t, recorder, "conversation.turn_timed_out")
+	assertNoConversationEvictionReason(t, recorder, "turn_deadline")
+}
+
+func TestConversationTurnDeadlineZeroDoesNotArmTimer(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	project, err := st.EnsureProject(ctx, store.ProjectSpec{ID: store.DefaultProjectID, Name: "Default project", RepositoryPath: t.TempDir()})
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	runner := &managedConversationRunner{
+		dispatches:   make(chan contract.Dispatch, 1),
+		releases:     make(chan struct{}, 1),
+		replies:      []string{"completed without a deadline"},
+		hasDeadlines: make(chan bool, 1),
+	}
+	recorder := newEventRecorder()
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, recorder, EngineOptions{
+		ConversationAdapter:      "chat-agent",
+		ConversationTurnDeadline: 0,
+	})
+	registerEngineTeardown(t, engine, st)
+
+	message, err := engine.SubmitConversationMessage(ctx, project.ID, "no timer")
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	_ = receiveDispatch(t, runner.dispatches)
+	if receiveConversationDeadlineState(t, runner.hasDeadlines) {
+		t.Fatal("dispatch context has a deadline when conversation turn deadline is disabled")
+	}
+	runner.releases <- struct{}{}
+	_ = waitForConversationEvent(t, recorder, "conversation.turn_completed", message.ID)
+	assertNoConversationEventType(t, recorder, "conversation.turn_timed_out")
+}
+
+func TestNewEngineDefaultsConversationTurnDeadlineOn(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	engine := NewEngine(st, nil, fakeFragmentRenderer{}, newEventRecorder())
+	registerEngineTeardown(t, engine, st)
+	if engine.conversationTurnDeadline != 15*time.Minute {
+		t.Fatalf("conversation turn deadline = %s, want 15m", engine.conversationTurnDeadline)
+	}
+}
+
+func TestConversationTurnDeadlineMessageUsesConfiguredMinutes(t *testing.T) {
+	const want = "This turn hit the 15-minute execution deadline and was stopped. The conversation is intact - send a message to try again."
+	if got := conversationTurnDeadlineMessage(15 * time.Minute); got != want {
+		t.Fatalf("deadline message = %q, want %q", got, want)
+	}
+}
+
+func TestConversationTurnCompletesBeforeDeadlineAndReleasesTimer(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	project, err := st.EnsureProject(ctx, store.ProjectSpec{ID: store.DefaultProjectID, Name: "Default project", RepositoryPath: t.TempDir()})
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	const deadline = 500 * time.Millisecond
+	runner := &managedConversationRunner{
+		dispatches:   make(chan contract.Dispatch, 1),
+		releases:     make(chan struct{}, 1),
+		replies:      []string{"finished in time"},
+		hasDeadlines: make(chan bool, 1),
+		contexts:     make(chan context.Context, 1),
+	}
+	recorder := newEventRecorder()
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, recorder, EngineOptions{
+		ConversationAdapter:      "chat-agent",
+		ConversationTurnDeadline: deadline,
+	})
+	registerEngineTeardown(t, engine, st)
+
+	message, err := engine.SubmitConversationMessage(ctx, project.ID, "finish near the deadline")
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	_ = receiveDispatch(t, runner.dispatches)
+	if !receiveConversationDeadlineState(t, runner.hasDeadlines) {
+		t.Fatal("dispatch context has no configured deadline")
+	}
+	turnCtx := receiveConversationContext(t, runner.contexts)
+	runner.releases <- struct{}{}
+	_ = waitForConversationEvent(t, recorder, "conversation.turn_completed", message.ID)
+	select {
+	case <-turnCtx.Done():
+	case <-time.After(testWaitTimeout):
+		t.Fatal("completed turn context was not cancelled to release its deadline timer")
+	}
+	if cause := context.Cause(turnCtx); !errors.Is(cause, context.Canceled) {
+		t.Fatalf("completed turn context cause = %v, want context.Canceled", cause)
+	}
+	assertNoConversationEventType(t, recorder, "conversation.turn_timed_out")
+}
+
 func TestConversationBudgetQueuesDifferentConversationUntilActiveTurnFinishes(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
@@ -406,10 +634,15 @@ func TestConversationShutdownCancelsInFlightTurn(t *testing.T) {
 		t.Fatalf("ensure project: %v", err)
 	}
 	runner := &cancellableConversationRunner{dispatches: make(chan contract.Dispatch, 1), cancelled: make(chan struct{})}
-	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, newEventRecorder(), EngineOptions{ConversationAdapter: "chat-agent"})
+	recorder := newEventRecorder()
+	engine := NewEngineWithOptions(st, runner, fakeFragmentRenderer{}, recorder, EngineOptions{
+		ConversationAdapter:      "chat-agent",
+		ConversationTurnDeadline: 5 * time.Second,
+	})
 	defer st.Close()
 
-	if _, err := engine.SubmitConversationMessage(ctx, project.ID, "please think"); err != nil {
+	message, err := engine.SubmitConversationMessage(ctx, project.ID, "please think")
+	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	_ = receiveDispatch(t, runner.dispatches)
@@ -422,6 +655,20 @@ func TestConversationShutdownCancelsInFlightTurn(t *testing.T) {
 	case <-runner.cancelled:
 	case <-time.After(testWaitTimeout):
 		t.Fatal("timed out waiting for conversation dispatch cancellation")
+	}
+	_ = waitForConversationEvent(t, recorder, "conversation.turn_cancelled", message.ID)
+	assertNoConversationEventType(t, recorder, "conversation.turn_timed_out")
+	assertNoConversationEvictionReason(t, recorder, "turn_deadline")
+	conversation, err := st.EnsureProjectConversation(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("ensure conversation: %v", err)
+	}
+	messages, err := st.ListMessagesForConversation(ctx, conversation.ID)
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	if len(messages) != 1 || messages[0].Role != store.MessageRoleUser {
+		t.Fatalf("messages after shutdown = %#v, want no timeout assistant message", messages)
 	}
 }
 
@@ -1265,12 +1512,15 @@ func stringSliceContains(values []string, want string) bool {
 }
 
 type managedConversationRunner struct {
-	dispatches   chan contract.Dispatch
-	releases     chan struct{}
-	replies      []string
-	evictions    chan string
-	evictStarted chan string
-	evictRelease chan struct{}
+	dispatches    chan contract.Dispatch
+	releases      chan struct{}
+	replies       []string
+	evictions     chan string
+	cancellations chan contract.Dispatch
+	hasDeadlines  chan bool
+	contexts      chan context.Context
+	evictStarted  chan string
+	evictRelease  chan struct{}
 
 	mu    sync.Mutex
 	count int
@@ -1281,15 +1531,24 @@ func (r *managedConversationRunner) Dispatch(ctx context.Context, disp contract.
 	idx := r.count
 	r.count++
 	r.mu.Unlock()
+	if r.hasDeadlines != nil {
+		_, hasDeadline := ctx.Deadline()
+		r.hasDeadlines <- hasDeadline
+	}
+	if r.contexts != nil {
+		r.contexts <- ctx
+	}
 	select {
 	case r.dispatches <- disp:
 	case <-ctx.Done():
+		r.recordCancellation(disp)
 		return report.Report{}, ctx.Err()
 	}
 	if r.releases != nil {
 		select {
 		case <-r.releases:
 		case <-ctx.Done():
+			r.recordCancellation(disp)
 			return report.Report{}, ctx.Err()
 		}
 	}
@@ -1310,6 +1569,16 @@ func (r *managedConversationRunner) Dispatch(ctx context.Context, disp contract.
 		Payload:       map[string]any{"reply_markdown": reply},
 		Errors:        []string{},
 	}, nil
+}
+
+func (r *managedConversationRunner) recordCancellation(disp contract.Dispatch) {
+	if r.cancellations == nil {
+		return
+	}
+	select {
+	case r.cancellations <- disp:
+	default:
+	}
 }
 
 func (r *managedConversationRunner) CancelAttempt(context.Context, string, string, string) error {
@@ -1476,6 +1745,65 @@ func firstStageByType(t *testing.T, stages []store.Stage, stageType string) stor
 	}
 	t.Fatalf("stage type %s not found in %#v", stageType, stages)
 	return store.Stage{}
+}
+
+func receiveConversationContext(t *testing.T, ch <-chan context.Context) context.Context {
+	t.Helper()
+	select {
+	case ctx := <-ch:
+		return ctx
+	case <-time.After(testWaitTimeout):
+		t.Fatal("timed out waiting for conversation context")
+		return nil
+	}
+}
+
+func receiveConversationDeadlineState(t *testing.T, ch <-chan bool) bool {
+	t.Helper()
+	select {
+	case hasDeadline := <-ch:
+		return hasDeadline
+	case <-time.After(testWaitTimeout):
+		t.Fatal("timed out waiting for conversation context deadline state")
+		return false
+	}
+}
+
+func waitForConversationEvent(t *testing.T, recorder *eventRecorder, typ, triggerMessageID string) event.Event {
+	t.Helper()
+	var found event.Event
+	recorder.waitUntil(t, func() bool {
+		for _, ev := range recorder.snapshot() {
+			if ev.Type != typ {
+				continue
+			}
+			if triggerMessageID != "" && ev.Data["trigger_message_id"] != triggerMessageID {
+				continue
+			}
+			found = ev
+			return true
+		}
+		return false
+	})
+	return found
+}
+
+func assertNoConversationEventType(t *testing.T, recorder *eventRecorder, typ string) {
+	t.Helper()
+	for _, ev := range recorder.snapshot() {
+		if ev.Type == typ {
+			t.Fatalf("unexpected %s event: %#v", typ, ev)
+		}
+	}
+}
+
+func assertNoConversationEvictionReason(t *testing.T, recorder *eventRecorder, reason string) {
+	t.Helper()
+	for _, ev := range recorder.snapshot() {
+		if ev.Type == "conversation.session_evicted" && ev.Data["reason"] == reason {
+			t.Fatalf("unexpected conversation session eviction with reason %q: %#v", reason, ev)
+		}
+	}
 }
 
 func receiveDispatch(t *testing.T, ch <-chan contract.Dispatch) contract.Dispatch {
