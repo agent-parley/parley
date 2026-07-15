@@ -2,12 +2,15 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/agent-parley/parley/internal/shared/event"
 )
+
+var errConversationTurnDeadline = errors.New("conversation turn execution deadline exceeded")
 
 type ConversationTurnState struct {
 	ConversationID string
@@ -209,7 +212,13 @@ func (e *Engine) reserveConversationTurn() ([]*conversationSession, *reservedCon
 		turn := session.queue[0]
 		session.queue = session.queue[1:]
 		session.running = true
-		turnCtx, cancel := context.WithCancel(e.rootCtx)
+		var turnCtx context.Context
+		var cancel context.CancelFunc
+		if e.conversationTurnDeadline > 0 {
+			turnCtx, cancel = context.WithTimeoutCause(e.rootCtx, e.conversationTurnDeadline, errConversationTurnDeadline)
+		} else {
+			turnCtx, cancel = context.WithCancel(e.rootCtx)
+		}
 		session.cancel = cancel
 		coldStart := !session.warm
 		session.warm = true
@@ -321,7 +330,9 @@ func (e *Engine) persistConversationTurnFailure(ctx context.Context, turn conver
 }
 
 func (e *Engine) finishReservedConversationTurn(work *reservedConversationTurn) {
-	wasCanceled := work.ctx.Err() != nil
+	cause := context.Cause(work.ctx)
+	timedOut := errors.Is(cause, errConversationTurnDeadline)
+	wasCanceled := cause != nil
 	work.cancel()
 	e.conversationMu.Lock()
 	session := work.session
@@ -329,6 +340,14 @@ func (e *Engine) finishReservedConversationTurn(work *reservedConversationTurn) 
 		session.running = false
 	}
 	session.cancel = nil
+	if timedOut {
+		session.warm = false
+		session.idleSince = time.Time{}
+		if session.idleTimer != nil {
+			session.idleTimer.Stop()
+			session.idleTimer = nil
+		}
+	}
 	queued := len(session.queue)
 	if queued > 0 {
 		e.markConversationReadyLocked(session)
@@ -336,6 +355,19 @@ func (e *Engine) finishReservedConversationTurn(work *reservedConversationTurn) 
 		e.scheduleConversationIdleEvictionLocked(session, time.Now().UTC())
 	}
 	e.conversationMu.Unlock()
+
+	if timedOut {
+		background := context.Background()
+		_ = e.emitConversationLifecycleEvent(background, work.turn.projectID, work.turn.conversationID, work.turn.triggerMessageID, "conversation.turn_timed_out", "conversation turn timed out", map[string]any{
+			"deadline_seconds": e.conversationTurnDeadline.Seconds(),
+			"queued":           queued,
+			"cold_start":       work.coldStart,
+		})
+		_, _ = e.persistConversationAssistantMessage(background, work.turn.projectID, work.turn.conversationID, work.turn.triggerMessageID, conversationTurnDeadlineMessage(e.conversationTurnDeadline), event.Actor{Kind: event.ActorKindWorkflowEngine, ID: "manager"}, "conversation turn timed out")
+		e.evictConversationWarmSession(background, session, "turn_deadline")
+		e.scheduleConversationTurns()
+		return
+	}
 
 	typ := "conversation.turn_completed"
 	summary := "conversation turn completed"
@@ -348,6 +380,14 @@ func (e *Engine) finishReservedConversationTurn(work *reservedConversationTurn) 
 		"cold_start": work.coldStart,
 	})
 	e.scheduleConversationTurns()
+}
+
+func conversationTurnDeadlineMessage(deadline time.Duration) string {
+	label := deadline.String()
+	if deadline > 0 && deadline%time.Minute == 0 {
+		label = fmt.Sprintf("%d-minute", deadline/time.Minute)
+	}
+	return fmt.Sprintf("This turn hit the %s execution deadline and was stopped. The conversation is intact - send a message to try again.", label)
 }
 
 func (e *Engine) scheduleConversationIdleEvictionLocked(session *conversationSession, idleSince time.Time) {

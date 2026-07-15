@@ -27,8 +27,9 @@ type QueueSettings struct {
 }
 
 type ConversationSettings struct {
-	Budget          int           `toml:"budget"`
-	IdleWarmHoldTTL time.Duration `toml:"idle_warm_hold_ttl"`
+	Budget          int            `toml:"budget"`
+	IdleWarmHoldTTL time.Duration  `toml:"idle_warm_hold_ttl"`
+	TurnDeadline    *time.Duration `toml:"turn_deadline"`
 }
 
 type LoadOptions struct {
@@ -57,14 +58,23 @@ type fileQueueSettings struct {
 type fileConversationSettings struct {
 	Budget          *int    `toml:"budget"`
 	IdleWarmHoldTTL *string `toml:"idle_warm_hold_ttl"`
+	TurnDeadline    *string `toml:"turn_deadline"`
 }
 
 func Defaults() Settings {
 	return Settings{
-		Queue:         QueueSettings{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 100},
-		Conversation:  ConversationSettings{Budget: 1, IdleWarmHoldTTL: 15 * time.Minute},
+		Queue: QueueSettings{AutoWhenReady: true, MaxConcurrent: 1, BacklogCap: 100},
+		Conversation: ConversationSettings{
+			Budget:          1,
+			IdleWarmHoldTTL: 15 * time.Minute,
+			TurnDeadline:    durationPointer(15 * time.Minute),
+		},
 		AgentRegistry: agentregistry.Defaults(),
 	}
+}
+
+func durationPointer(value time.Duration) *time.Duration {
+	return &value
 }
 
 func IsZero(s Settings) bool {
@@ -94,6 +104,9 @@ func ResolveDefaults(s Settings) Settings {
 		}
 		if s.Conversation.IdleWarmHoldTTL == 0 {
 			s.Conversation.IdleWarmHoldTTL = defaults.Conversation.IdleWarmHoldTTL
+		}
+		if s.Conversation.TurnDeadline == nil {
+			s.Conversation.TurnDeadline = defaults.Conversation.TurnDeadline
 		}
 	}
 	if agentRegistryIsZero(s.AgentRegistry) {
@@ -140,6 +153,12 @@ func Validate(s Settings) error {
 	}
 	if s.Conversation.IdleWarmHoldTTL <= 0 {
 		return fmt.Errorf("conversation.idle_warm_hold_ttl must be positive")
+	}
+	if s.Conversation.TurnDeadline == nil {
+		return fmt.Errorf("conversation.turn_deadline must be configured")
+	}
+	if *s.Conversation.TurnDeadline < 0 {
+		return fmt.Errorf("conversation.turn_deadline must be non-negative")
 	}
 	if err := agentregistry.Validate(s.AgentRegistry); err != nil {
 		return err
@@ -199,6 +218,12 @@ func validateFileSettings(file fileSettings, sourceName, path string) error {
 				return fmt.Errorf("%s settings %s: conversation.idle_warm_hold_ttl must be a positive duration", sourceName, path)
 			}
 		}
+		if file.Conversation.TurnDeadline != nil {
+			deadline, err := time.ParseDuration(strings.TrimSpace(*file.Conversation.TurnDeadline))
+			if err != nil || deadline < 0 {
+				return fmt.Errorf("%s settings %s: conversation.turn_deadline must be a non-negative duration", sourceName, path)
+			}
+		}
 	}
 	return nil
 }
@@ -225,6 +250,13 @@ func merge(dst *Settings, sourceName string, file fileSettings) error {
 				return fmt.Errorf("parse %s settings conversation.idle_warm_hold_ttl: %w", sourceName, err)
 			}
 			dst.Conversation.IdleWarmHoldTTL = ttl
+		}
+		if file.Conversation.TurnDeadline != nil {
+			deadline, err := time.ParseDuration(strings.TrimSpace(*file.Conversation.TurnDeadline))
+			if err != nil {
+				return fmt.Errorf("parse %s settings conversation.turn_deadline: %w", sourceName, err)
+			}
+			dst.Conversation.TurnDeadline = durationPointer(deadline)
 		}
 	}
 	if file.Agents != nil {

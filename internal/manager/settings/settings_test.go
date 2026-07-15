@@ -18,7 +18,7 @@ func TestLoadAbsentFilesUsesDefaults(t *testing.T) {
 	if loaded.Settings.Queue.AutoWhenReady != true || loaded.Settings.Queue.MaxConcurrent != 1 || loaded.Settings.Queue.BacklogCap != 100 {
 		t.Fatalf("settings = %+v, want queue defaults", loaded.Settings)
 	}
-	if loaded.Settings.Conversation.Budget != 1 || loaded.Settings.Conversation.IdleWarmHoldTTL != 15*time.Minute {
+	if loaded.Settings.Conversation.Budget != 1 || loaded.Settings.Conversation.IdleWarmHoldTTL != 15*time.Minute || loaded.Settings.Conversation.TurnDeadline == nil || *loaded.Settings.Conversation.TurnDeadline != 15*time.Minute {
 		t.Fatalf("conversation = %+v, want conversation defaults", loaded.Settings.Conversation)
 	}
 	if len(loaded.Settings.AgentRegistry.Families) != 1 || loaded.Settings.AgentRegistry.Families[0].ID != agentregistry.FamilyPi {
@@ -31,7 +31,7 @@ func TestResolveDefaultsBackfillsProgrammaticPartialSettings(t *testing.T) {
 	if settings.Queue.AutoWhenReady != false || settings.Queue.MaxConcurrent != 2 || settings.Queue.BacklogCap != 10 {
 		t.Fatalf("queue = %+v, want caller-provided queue preserved", settings.Queue)
 	}
-	if settings.Conversation.Budget != 1 || settings.Conversation.IdleWarmHoldTTL != 15*time.Minute {
+	if settings.Conversation.Budget != 1 || settings.Conversation.IdleWarmHoldTTL != 15*time.Minute || settings.Conversation.TurnDeadline == nil || *settings.Conversation.TurnDeadline != 15*time.Minute {
 		t.Fatalf("conversation = %+v, want conversation defaults", settings.Conversation)
 	}
 	if len(settings.AgentRegistry.Families) != 1 || settings.AgentRegistry.Families[0].ID != agentregistry.FamilyPi {
@@ -42,8 +42,19 @@ func TestResolveDefaultsBackfillsProgrammaticPartialSettings(t *testing.T) {
 	if settings.Queue.AutoWhenReady != true || settings.Queue.MaxConcurrent != 1 || settings.Queue.BacklogCap != 100 {
 		t.Fatalf("queue = %+v, want queue defaults when only registry is provided", settings.Queue)
 	}
-	if settings.Conversation.Budget != 1 || settings.Conversation.IdleWarmHoldTTL != 15*time.Minute {
+	if settings.Conversation.Budget != 1 || settings.Conversation.IdleWarmHoldTTL != 15*time.Minute || settings.Conversation.TurnDeadline == nil || *settings.Conversation.TurnDeadline != 15*time.Minute {
 		t.Fatalf("conversation = %+v, want conversation defaults when only registry is provided", settings.Conversation)
+	}
+
+	settings = ResolveDefaults(Settings{Conversation: ConversationSettings{Budget: 2, IdleWarmHoldTTL: 10 * time.Minute}})
+	if settings.Conversation.TurnDeadline == nil || *settings.Conversation.TurnDeadline != 15*time.Minute {
+		t.Fatalf("partial conversation turn deadline = %v, want 15m default", settings.Conversation.TurnDeadline)
+	}
+
+	disabled := time.Duration(0)
+	settings = ResolveDefaults(Settings{Conversation: ConversationSettings{Budget: 1, IdleWarmHoldTTL: 15 * time.Minute, TurnDeadline: &disabled}})
+	if settings.Conversation.TurnDeadline == nil || *settings.Conversation.TurnDeadline != 0 {
+		t.Fatalf("conversation turn deadline = %v, want disabled", settings.Conversation.TurnDeadline)
 	}
 }
 
@@ -51,8 +62,8 @@ func TestLoadProjectOverridesGlobal(t *testing.T) {
 	dir := t.TempDir()
 	globalPath := filepath.Join(dir, "global.toml")
 	projectPath := filepath.Join(dir, "project.toml")
-	writeFile(t, globalPath, "[queue]\nauto_when_ready = false\nmax_concurrent = 2\nbacklog_cap = 10\n\n[conversation]\nbudget = 2\nidle_warm_hold_ttl = \"10m\"\n")
-	writeFile(t, projectPath, "[queue]\nauto_when_ready = true\nbacklog_cap = 25\n\n[conversation]\nidle_warm_hold_ttl = \"30m\"\n")
+	writeFile(t, globalPath, "[queue]\nauto_when_ready = false\nmax_concurrent = 2\nbacklog_cap = 10\n\n[conversation]\nbudget = 2\nidle_warm_hold_ttl = \"10m\"\nturn_deadline = \"20m\"\n")
+	writeFile(t, projectPath, "[queue]\nauto_when_ready = true\nbacklog_cap = 25\n\n[conversation]\nidle_warm_hold_ttl = \"30m\"\nturn_deadline = \"0s\"\n")
 	loaded, err := Load(LoadOptions{GlobalPath: globalPath, ProjectPath: projectPath})
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -62,8 +73,8 @@ func TestLoadProjectOverridesGlobal(t *testing.T) {
 		t.Fatalf("queue = %+v, want project overrides layered on global", queue)
 	}
 	conversation := loaded.Settings.Conversation
-	if conversation.Budget != 2 || conversation.IdleWarmHoldTTL != 30*time.Minute {
-		t.Fatalf("conversation = %+v, want project overrides layered on global", conversation)
+	if conversation.Budget != 2 || conversation.IdleWarmHoldTTL != 30*time.Minute || conversation.TurnDeadline == nil || *conversation.TurnDeadline != 0 {
+		t.Fatalf("conversation = %+v, want project overrides layered on global with deadline disabled", conversation)
 	}
 }
 
@@ -174,6 +185,15 @@ func TestLoadRejectsInvalidConversationPolicy(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "conversation.idle_warm_hold_ttl") {
 		t.Fatalf("error = %q, want ttl validation", err.Error())
+	}
+
+	writeFile(t, path, "[conversation]\nbudget = 1\nidle_warm_hold_ttl = \"15m\"\nturn_deadline = \"-1s\"\n")
+	_, err = Load(LoadOptions{ProjectPath: path})
+	if err == nil {
+		t.Fatal("Load() error = nil, want turn deadline validation failure")
+	}
+	if !strings.Contains(err.Error(), "conversation.turn_deadline") {
+		t.Fatalf("error = %q, want turn deadline validation", err.Error())
 	}
 }
 
